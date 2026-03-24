@@ -56,6 +56,9 @@ DIFF_FEATURES = [
     "diff_def_xrv_delta",
     "diff_matchup_xrv_mean",
     "diff_matchup_xrv_sum",
+    "diff_arsenal_matchup_xrv_mean",
+    "diff_arsenal_matchup_xrv_sum",
+    "diff_bp_arsenal_matchup_xrv_mean",
     "diff_platoon_pct",
     "diff_recent_form",
     "diff_sp_xrv_vs_lineup",
@@ -69,6 +72,8 @@ RAW_FEATURES = [
     "away_sp_n_pitches",
     "home_matchup_n_known",
     "away_matchup_n_known",
+    "home_arsenal_matchup_n_known",
+    "away_arsenal_matchup_n_known",
     # Weather
     "temperature",
     "wind_speed",

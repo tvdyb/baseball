@@ -306,6 +306,7 @@ def build_xrv_for_year(year: int, cv: bool = False):
         "pitch_type", "release_speed", "release_spin_rate",
         "pfx_x", "pfx_z", "plate_x", "plate_z",
         "effective_speed", "release_extension",
+        "release_pos_x", "release_pos_z", "spin_axis",
         "balls", "strikes", "outs_when_up",
         "on_1b", "on_2b", "on_3b",
         "stand", "p_throws",

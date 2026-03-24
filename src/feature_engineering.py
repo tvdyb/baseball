@@ -33,6 +33,39 @@ MODEL_DIR = Path(__file__).resolve().parent.parent / "models"
 FEATURES_DIR = DATA_DIR / "features"
 
 
+def _filter_competitive(df: pd.DataFrame) -> pd.DataFrame:
+    """Filter to pitches in competitive counts."""
+    if "balls" not in df.columns or "strikes" not in df.columns:
+        return df
+    exclude_mask = (
+        ((df["balls"] == 0) & (df["strikes"] == 2)) |
+        ((df["balls"] == 3) & (df["strikes"] == 0))
+    )
+    if "description" in df.columns:
+        exclude_mask = exclude_mask | df["description"].str.contains("intentional", case=False, na=False)
+    return df[~exclude_mask]
+
+
+def _load_hand_models(prefix: str, year: int) -> dict:
+    """Load hand-specific models with fallback to combined model."""
+    models = {}
+    for hand in ["L", "R"]:
+        path = MODEL_DIR / f"{prefix}_{year}_vs{hand}.pkl"
+        if path.exists():
+            with open(path, "rb") as f:
+                models[hand] = pickle.load(f)
+            print(f"  Loaded {prefix} vs {hand}HH from {year}")
+    # Fallback to combined model
+    if not models:
+        old_path = MODEL_DIR / f"{prefix}_{year}.pkl"
+        if old_path.exists():
+            with open(old_path, "rb") as f:
+                combined = pickle.load(f)
+            models = {"L": combined, "R": combined}
+            print(f"  Loaded combined {prefix} from {year}")
+    return models
+
+
 # ──────────────────────────────────────────────────────────────
 # 1. Starting Pitcher Quality
 # ──────────────────────────────────────────────────────────────
@@ -133,6 +166,11 @@ def _precompute_pitcher_bases(
     beta_vmov = float(np.array(map_est["beta_vmov"]))
     beta_locx = float(np.array(map_est["beta_locx"]))
     beta_locz = float(np.array(map_est["beta_locz"]))
+    # New betas with backward compat
+    beta_spin = float(np.array(map_est.get("beta_spin", 0.0)))
+    beta_ext = float(np.array(map_est.get("beta_ext", 0.0)))
+    beta_rel_x = float(np.array(map_est.get("beta_rel_x", 0.0)))
+    beta_rel_z = float(np.array(map_est.get("beta_rel_z", 0.0)))
     ptype_effects = np.array(map_est["ptype_effect"])
     pitcher_effects = np.array(map_est["pitcher_effect"])
 
@@ -143,6 +181,9 @@ def _precompute_pitcher_bases(
     for hand in ["L", "R"]:
         hand_pitches = before[before["stand"] == hand]
         recent = hand_pitches.iloc[-n_pitches:] if len(hand_pitches) > n_pitches else hand_pitches
+
+        # Apply competitive count filter
+        recent = _filter_competitive(recent)
 
         if len(recent) < 50:
             result[hand] = None
@@ -178,6 +219,10 @@ def _precompute_pitcher_bases(
             + beta_vmov * z_vec("pfx_z")
             + beta_locx * z_vec("plate_x")
             + beta_locz * z_vec("plate_z")
+            + beta_spin * z_vec("release_spin_rate")
+            + beta_ext * z_vec("release_extension")
+            + beta_rel_x * z_vec("release_pos_x")
+            + beta_rel_z * z_vec("release_pos_z")
             + ptype_effects[ptype_idx]
             + pitcher_effects[p_idx]
         )
@@ -359,6 +404,9 @@ def _compute_pitcher_arsenal_live(pitcher_df: pd.DataFrame, game_date: str,
     before = _get_before(pitcher_df, game_date)
     recent = before.iloc[-n_pitches:] if len(before) > n_pitches else before
 
+    # Apply competitive count filter
+    recent = _filter_competitive(recent)
+
     if len(recent) < 100:
         return None
 
@@ -383,6 +431,31 @@ def _compute_pitcher_arsenal_live(pitcher_df: pd.DataFrame, game_date: str,
     pt_hmov = recent.groupby("pitch_type")["pfx_x"].mean()
     hmov_range = float(pt_hmov.max() - pt_hmov.min()) if len(pt_hmov) > 1 else 0.0
 
+    # New enriched features
+    break_pitches = recent[recent["pitch_type"].isin(BREAK_TYPES)]
+
+    hard_spin = float(hard_pitches["release_spin_rate"].mean()) if (
+        len(hard_pitches) > 0 and "release_spin_rate" in recent.columns
+    ) else np.nan
+    break_spin = float(break_pitches["release_spin_rate"].mean()) if (
+        len(break_pitches) > 0 and "release_spin_rate" in recent.columns
+    ) else np.nan
+    hard_ivb = float(hard_pitches["pfx_z"].mean()) if len(hard_pitches) > 0 else np.nan
+    hard_ext = float(hard_pitches["release_extension"].mean()) if (
+        len(hard_pitches) > 0 and "release_extension" in recent.columns
+    ) else np.nan
+
+    # Release point spread (arm slot consistency across pitch types)
+    if "release_pos_x" in recent.columns:
+        pt_rel_x = recent.groupby("pitch_type")["release_pos_x"].mean()
+        rel_x_spread = float(pt_rel_x.std()) if len(pt_rel_x) > 1 else 0.0
+    else:
+        rel_x_spread = 0.0
+
+    # Vertical movement range across pitch types
+    pt_vmov = recent.groupby("pitch_type")["pfx_z"].mean()
+    vmov_range = float(pt_vmov.max() - pt_vmov.min()) if len(pt_vmov) > 1 else 0.0
+
     return {
         "hard_velo": hard_velo,
         "hard_pct": hard_pct,
@@ -391,6 +464,12 @@ def _compute_pitcher_arsenal_live(pitcher_df: pd.DataFrame, game_date: str,
         "velo_spread": velo_spread,
         "hmov_range": hmov_range,
         "entropy": entropy,
+        "hard_spin": hard_spin,
+        "break_spin": break_spin,
+        "hard_ivb": hard_ivb,
+        "hard_ext": hard_ext,
+        "rel_x_spread": rel_x_spread,
+        "vmov_range": vmov_range,
     }
 
 
@@ -960,6 +1039,114 @@ def _extract_lineups(xrv_season: pd.DataFrame) -> dict:
     return lineups
 
 
+def _compute_hand_matchup(
+    hand_models: dict,
+    pitcher_df: pd.DataFrame,
+    pitcher_id: int,
+    game_date: str,
+    n_pitches: int,
+    hitter_ids: list[int],
+    hitter_hands: list[str],
+    matchup_fn,
+) -> dict:
+    """
+    Compute matchup using hand-specific models.
+    Each hitter is scored against the model trained on their batting side.
+    """
+    nan_result = {"matchup_xrv_mean": np.nan, "matchup_xrv_sum": np.nan,
+                  "matchup_n_hitters": 0, "matchup_n_known": 0}
+
+    all_xrvs = []
+    total_known = 0
+
+    # Group hitters by hand
+    for hand in ["L", "R"]:
+        model = hand_models.get(hand)
+        if model is None:
+            continue
+        hand_hids = [hid for hid, h in zip(hitter_ids, hitter_hands) if h == hand]
+        hand_hands = [h for h in hitter_hands if h == hand]
+        if not hand_hids:
+            continue
+
+        pitcher_bases = _precompute_pitcher_bases(
+            model, pitcher_df, pitcher_id, game_date, n_pitches)
+        result = matchup_fn(model, pitcher_bases, hand_hids, hand_hands)
+
+        if not np.isnan(result.get("matchup_xrv_mean", np.nan)):
+            # Weight by number of hitters
+            n_h = result["matchup_n_hitters"]
+            if n_h > 0:
+                all_xrvs.extend([result["matchup_xrv_mean"]] * n_h)
+                total_known += result["matchup_n_known"]
+
+    if not all_xrvs:
+        return nan_result
+
+    return {
+        "matchup_xrv_mean": np.mean(all_xrvs),
+        "matchup_xrv_sum": np.sum(all_xrvs),
+        "matchup_n_hitters": len(all_xrvs),
+        "matchup_n_known": total_known,
+    }
+
+
+def _compute_hand_arsenal_matchup(
+    hand_models: dict,
+    pitcher_df: pd.DataFrame,
+    pitcher_id: int,
+    game_date: str,
+    n_pitches: int,
+    hitter_ids: list[int],
+    hitter_hands: list[str],
+) -> dict:
+    """
+    Compute arsenal matchup using hand-specific models.
+    Each hitter is scored against the model trained on their batting side.
+    """
+    nan_result = {"arsenal_matchup_xrv_mean": np.nan, "arsenal_matchup_xrv_sum": np.nan,
+                  "arsenal_matchup_n_hitters": 0, "arsenal_matchup_n_known": 0}
+
+    all_xrvs = []
+    total_known = 0
+
+    arsenal_raw = _compute_pitcher_arsenal_live(pitcher_df, game_date, n_pitches)
+    if arsenal_raw is None:
+        return nan_result
+
+    for hand in ["L", "R"]:
+        model = hand_models.get(hand)
+        if model is None:
+            continue
+        hand_hids = [hid for hid, h in zip(hitter_ids, hitter_hands) if h == hand]
+        hand_hands = [h for h in hitter_hands if h == hand]
+        if not hand_hids:
+            continue
+
+        pitcher_bases = _precompute_pitcher_bases(
+            model, pitcher_df, pitcher_id, game_date, n_pitches)
+        arsenal_z = _standardize_arsenal(arsenal_raw, model["feature_stats"])
+
+        result = compute_arsenal_matchup_xrv(
+            model, pitcher_bases, arsenal_z, hand_hids, hand_hands)
+
+        if not np.isnan(result.get("arsenal_matchup_xrv_mean", np.nan)):
+            n_h = result["arsenal_matchup_n_hitters"]
+            if n_h > 0:
+                all_xrvs.extend([result["arsenal_matchup_xrv_mean"]] * n_h)
+                total_known += result["arsenal_matchup_n_known"]
+
+    if not all_xrvs:
+        return nan_result
+
+    return {
+        "arsenal_matchup_xrv_mean": np.mean(all_xrvs),
+        "arsenal_matchup_xrv_sum": np.sum(all_xrvs),
+        "arsenal_matchup_n_hitters": len(all_xrvs),
+        "arsenal_matchup_n_known": total_known,
+    }
+
+
 def build_game_features(
     target_year: int,
     n_pitcher_pitches: int = 2000,
@@ -1010,23 +1197,17 @@ def build_game_features(
         lineups = _extract_lineups(current_xrv)
         print(f"  Extracted lineups for {len(lineups):,} games")
 
-    # Load matchup model (trained on prior season to avoid lookahead)
-    model_path = MODEL_DIR / f"matchup_model_{target_year - 1}.pkl"
-    model_artifacts = None
-    if model_path.exists():
-        with open(model_path, "rb") as f:
-            model_artifacts = pickle.load(f)
-        print(f"  Loaded matchup model from {target_year - 1}")
+    # Load hand-specific matchup models (trained on prior season to avoid lookahead)
+    matchup_models = _load_hand_models("matchup_model", target_year - 1)
+    if matchup_models:
+        print(f"  Matchup models loaded for hands: {list(matchup_models.keys())}")
     else:
         print(f"  WARNING: No matchup model for {target_year - 1}, skipping matchup features")
 
-    # Load arsenal matchup model (trained on prior season)
-    arsenal_path = MODEL_DIR / f"arsenal_matchup_{target_year - 1}.pkl"
-    arsenal_artifacts = None
-    if arsenal_path.exists():
-        with open(arsenal_path, "rb") as f:
-            arsenal_artifacts = pickle.load(f)
-        print(f"  Loaded arsenal matchup model from {target_year - 1}")
+    # Load hand-specific arsenal matchup models (trained on prior season)
+    arsenal_models = _load_hand_models("arsenal_matchup", target_year - 1)
+    if arsenal_models:
+        print(f"  Arsenal models loaded for hands: {list(arsenal_models.keys())}")
     else:
         print(f"  WARNING: No arsenal model for {target_year - 1}, skipping arsenal matchup features")
 
@@ -1096,19 +1277,20 @@ def build_game_features(
             for k, v in nan_sp.items():
                 row[f"away_{k}"] = v
 
-        # --- Matchup: lineup vs opposing SP (Bayesian model) ---
+        # --- Matchup: lineup vs opposing SP (Bayesian model, hand-specific) ---
         # Home lineup vs away SP, Away lineup vs home SP
         game_lineup = lineups.get(game_pk)
 
-        if model_artifacts and game_lineup and pd.notna(away_sp):
+        if matchup_models and game_lineup and pd.notna(away_sp):
             away_sp_int = int(away_sp)
             home_lu = game_lineup.get("home", [])
             if home_lu and away_sp_int in idx["pitcher"]:
                 hitter_ids = [h[0] for h in home_lu]
                 hitter_hands = [h[1] for h in home_lu]
-                pitcher_bases = _precompute_pitcher_bases(
-                    model_artifacts, idx["pitcher"][away_sp_int], away_sp_int, gdate, n_pitcher_pitches)
-                matchup = compute_matchup_xrv(model_artifacts, pitcher_bases, hitter_ids, hitter_hands)
+                # Use hand-specific models: aggregate across hitter hands
+                matchup = _compute_hand_matchup(
+                    matchup_models, idx["pitcher"][away_sp_int], away_sp_int,
+                    gdate, n_pitcher_pitches, hitter_ids, hitter_hands, compute_matchup_xrv)
                 for k, v in matchup.items():
                     row[f"home_{k}"] = v
                 if not np.isnan(matchup["matchup_xrv_mean"]):
@@ -1120,15 +1302,15 @@ def build_game_features(
             for k, v in nan_matchup.items():
                 row[f"home_{k}"] = v
 
-        if model_artifacts and game_lineup and pd.notna(home_sp):
+        if matchup_models and game_lineup and pd.notna(home_sp):
             home_sp_int = int(home_sp)
             away_lu = game_lineup.get("away", [])
             if away_lu and home_sp_int in idx["pitcher"]:
                 hitter_ids = [h[0] for h in away_lu]
                 hitter_hands = [h[1] for h in away_lu]
-                pitcher_bases = _precompute_pitcher_bases(
-                    model_artifacts, idx["pitcher"][home_sp_int], home_sp_int, gdate, n_pitcher_pitches)
-                matchup = compute_matchup_xrv(model_artifacts, pitcher_bases, hitter_ids, hitter_hands)
+                matchup = _compute_hand_matchup(
+                    matchup_models, idx["pitcher"][home_sp_int], home_sp_int,
+                    gdate, n_pitcher_pitches, hitter_ids, hitter_hands, compute_matchup_xrv)
                 for k, v in matchup.items():
                     row[f"away_{k}"] = v
             else:
@@ -1138,31 +1320,21 @@ def build_game_features(
             for k, v in nan_matchup.items():
                 row[f"away_{k}"] = v
 
-        # --- Arsenal Matchup: lineup vs opposing SP (arsenal model) ---
+        # --- Arsenal Matchup: lineup vs opposing SP (arsenal model, hand-specific) ---
         nan_arsenal = {"arsenal_matchup_xrv_mean": np.nan, "arsenal_matchup_xrv_sum": np.nan,
                        "arsenal_matchup_n_hitters": 0, "arsenal_matchup_n_known": 0}
 
-        if arsenal_artifacts and game_lineup and pd.notna(away_sp):
+        if arsenal_models and game_lineup and pd.notna(away_sp):
             away_sp_int = int(away_sp)
             home_lu = game_lineup.get("home", [])
             if home_lu and away_sp_int in idx["pitcher"]:
                 hitter_ids = [h[0] for h in home_lu]
                 hitter_hands = [h[1] for h in home_lu]
-                # Compute pitcher bases using arsenal model's parameters
-                arsenal_pitcher_bases = _precompute_pitcher_bases(
-                    arsenal_artifacts, idx["pitcher"][away_sp_int], away_sp_int, gdate, n_pitcher_pitches)
-                # Compute arsenal profile for this pitcher
-                arsenal_raw = _compute_pitcher_arsenal_live(
-                    idx["pitcher"][away_sp_int], gdate, n_pitcher_pitches)
-                if arsenal_raw and arsenal_pitcher_bases:
-                    arsenal_z = _standardize_arsenal(arsenal_raw, arsenal_artifacts["feature_stats"])
-                    a_matchup = compute_arsenal_matchup_xrv(
-                        arsenal_artifacts, arsenal_pitcher_bases, arsenal_z, hitter_ids, hitter_hands)
-                    for k, v in a_matchup.items():
-                        row[f"home_{k}"] = v
-                else:
-                    for k, v in nan_arsenal.items():
-                        row[f"home_{k}"] = v
+                a_matchup = _compute_hand_arsenal_matchup(
+                    arsenal_models, idx["pitcher"][away_sp_int], away_sp_int,
+                    gdate, n_pitcher_pitches, hitter_ids, hitter_hands)
+                for k, v in a_matchup.items():
+                    row[f"home_{k}"] = v
             else:
                 for k, v in nan_arsenal.items():
                     row[f"home_{k}"] = v
@@ -1170,25 +1342,17 @@ def build_game_features(
             for k, v in nan_arsenal.items():
                 row[f"home_{k}"] = v
 
-        if arsenal_artifacts and game_lineup and pd.notna(home_sp):
+        if arsenal_models and game_lineup and pd.notna(home_sp):
             home_sp_int = int(home_sp)
             away_lu = game_lineup.get("away", [])
             if away_lu and home_sp_int in idx["pitcher"]:
                 hitter_ids = [h[0] for h in away_lu]
                 hitter_hands = [h[1] for h in away_lu]
-                arsenal_pitcher_bases = _precompute_pitcher_bases(
-                    arsenal_artifacts, idx["pitcher"][home_sp_int], home_sp_int, gdate, n_pitcher_pitches)
-                arsenal_raw = _compute_pitcher_arsenal_live(
-                    idx["pitcher"][home_sp_int], gdate, n_pitcher_pitches)
-                if arsenal_raw and arsenal_pitcher_bases:
-                    arsenal_z = _standardize_arsenal(arsenal_raw, arsenal_artifacts["feature_stats"])
-                    a_matchup = compute_arsenal_matchup_xrv(
-                        arsenal_artifacts, arsenal_pitcher_bases, arsenal_z, hitter_ids, hitter_hands)
-                    for k, v in a_matchup.items():
-                        row[f"away_{k}"] = v
-                else:
-                    for k, v in nan_arsenal.items():
-                        row[f"away_{k}"] = v
+                a_matchup = _compute_hand_arsenal_matchup(
+                    arsenal_models, idx["pitcher"][home_sp_int], home_sp_int,
+                    gdate, n_pitcher_pitches, hitter_ids, hitter_hands)
+                for k, v in a_matchup.items():
+                    row[f"away_{k}"] = v
             else:
                 for k, v in nan_arsenal.items():
                     row[f"away_{k}"] = v
@@ -1315,15 +1479,18 @@ def build_game_features(
             row["away_sp_xrv_vs_lineup"] = np.nan
             row["home_sp_xrv_vs_lineup"] = np.nan
 
-        # --- Bullpen matchup (Bayesian model) ---
-        if model_artifacts and game_lineup:
+        # --- Bullpen matchup (Bayesian model, hand-specific) ---
+        # For bullpen matchup, use the "L" model for all hitters as a reasonable default
+        # (bullpen relievers face mixed lineups; using combined or first-available model)
+        bp_matchup_artifacts = matchup_models.get("L") or matchup_models.get("R") if matchup_models else None
+        if bp_matchup_artifacts and game_lineup:
             # Home bullpen vs away lineup
             away_lu = game_lineup.get("away", [])
             if away_lu:
                 away_hitter_ids = [h[0] for h in away_lu]
                 away_hitter_hands = [h[1] for h in away_lu]
                 bp_m = compute_bullpen_matchup_xrv(
-                    model_artifacts, idx, home_team, gdate,
+                    bp_matchup_artifacts, idx, home_team, gdate,
                     away_hitter_ids, away_hitter_hands)
                 for k, v in bp_m.items():
                     row[f"home_{k}"] = v
@@ -1337,7 +1504,7 @@ def build_game_features(
                 home_hitter_ids = [h[0] for h in home_lu]
                 home_hitter_hands = [h[1] for h in home_lu]
                 bp_m = compute_bullpen_matchup_xrv(
-                    model_artifacts, idx, away_team, gdate,
+                    bp_matchup_artifacts, idx, away_team, gdate,
                     home_hitter_ids, home_hitter_hands)
                 for k, v in bp_m.items():
                     row[f"away_{k}"] = v
@@ -1350,12 +1517,13 @@ def build_game_features(
             row["away_bp_matchup_xrv_mean"] = np.nan
             row["away_bp_matchup_n_relievers"] = 0
 
-        # --- Bullpen arsenal matchup ---
-        if arsenal_artifacts and game_lineup:
+        # --- Bullpen arsenal matchup (hand-specific) ---
+        bp_arsenal_artifacts = arsenal_models.get("L") or arsenal_models.get("R") if arsenal_models else None
+        if bp_arsenal_artifacts and game_lineup:
             away_lu = game_lineup.get("away", [])
             if away_lu:
                 bp_a = compute_bullpen_arsenal_matchup_xrv(
-                    arsenal_artifacts, idx, home_team, gdate,
+                    bp_arsenal_artifacts, idx, home_team, gdate,
                     [h[0] for h in away_lu], [h[1] for h in away_lu])
                 for k, v in bp_a.items():
                     row[f"home_{k}"] = v
@@ -1366,7 +1534,7 @@ def build_game_features(
             home_lu = game_lineup.get("home", [])
             if home_lu:
                 bp_a = compute_bullpen_arsenal_matchup_xrv(
-                    arsenal_artifacts, idx, away_team, gdate,
+                    bp_arsenal_artifacts, idx, away_team, gdate,
                     [h[0] for h in home_lu], [h[1] for h in home_lu])
                 for k, v in bp_a.items():
                     row[f"away_{k}"] = v

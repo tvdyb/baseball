@@ -7,9 +7,9 @@ faced hundreds of pitchers with similar arsenals. Instead of estimating
 sparse pitcher-hitter matchup effects (most with <20 pitches), we learn
 how each hitter responds to pitcher ARSENAL PROFILES.
 
-We characterize each pitcher's arsenal along ~6 dimensions (fastball velo,
-breaking ball usage, movement profile, etc.), then model each hitter's
-sensitivity to these dimensions with hierarchical shrinkage.
+We characterize each pitcher's arsenal along 13 dimensions (fastball velo,
+breaking ball usage, movement profile, spin, extension, etc.), then model
+each hitter's sensitivity to these dimensions with hierarchical shrinkage.
 
 Model:
   xrv ~ Normal(μ, σ²)
@@ -23,13 +23,13 @@ Model:
 
   hitter_arsenal_β[h, k] ~ Normal(μ_arsenal_k, σ_arsenal_k)
 
-The arsenal interaction replaces the old matchup_effect[pitcher, hitter] term.
-Instead of ~100K sparse matchup parameters, we have n_hitters × n_arsenal_features
-(~4K × 6 = 24K) parameters that generalize to unseen matchups.
+Inference: ADVI (default), --map (fast debug), --sample (full MCMC).
+Models are split by batter handedness (vs LHH and vs RHH separately).
 
 Usage:
     python src/arsenal_matchup_model.py --season 2024
-    python src/arsenal_matchup_model.py --season 2024 --sample  # full MCMC
+    python src/arsenal_matchup_model.py --season 2024 --map      # fast debug
+    python src/arsenal_matchup_model.py --season 2024 --sample   # full MCMC
 """
 
 import argparse
@@ -47,6 +47,32 @@ MODEL_DIR = Path(__file__).resolve().parent.parent / "models"
 HARD_TYPES = {"FF", "SI", "FC"}
 BREAK_TYPES = {"SL", "CU", "KC", "SV", "ST", "SW"}
 OFFSPEED_TYPES = {"CH", "FS"}
+
+ARSENAL_FEATURES = [
+    "hard_velo", "hard_pct", "break_pct", "offspeed_pct",
+    "velo_spread", "hmov_range", "entropy",
+    # Enriched:
+    "hard_spin",      # avg spin rate on fastballs
+    "break_spin",     # avg spin rate on breaking balls
+    "hard_ivb",       # avg induced vertical break on fastballs (pfx_z)
+    "hard_ext",       # avg extension on fastballs
+    "rel_x_spread",   # std dev of release_pos_x across pitch types (arm slot consistency)
+    "vmov_range",     # range of avg pfx_z across pitch types (vertical separation)
+]
+N_ARSENAL = len(ARSENAL_FEATURES)
+
+
+def _filter_competitive(df: pd.DataFrame) -> pd.DataFrame:
+    """Filter to pitches in competitive counts."""
+    if "balls" not in df.columns or "strikes" not in df.columns:
+        return df
+    exclude_mask = (
+        ((df["balls"] == 0) & (df["strikes"] == 2)) |
+        ((df["balls"] == 3) & (df["strikes"] == 0))
+    )
+    if "description" in df.columns:
+        exclude_mask = exclude_mask | df["description"].str.contains("intentional", case=False, na=False)
+    return df[~exclude_mask]
 
 
 def load_season_xrv(year: int) -> pd.DataFrame:
@@ -66,15 +92,7 @@ def load_season_xrv(year: int) -> pd.DataFrame:
 def compute_arsenal_profiles(df: pd.DataFrame) -> pd.DataFrame:
     """
     Compute arsenal profile for each pitcher from their season data.
-
-    Features:
-      hard_velo      - avg fastball velocity
-      hard_pct       - % fastballs (FF/SI/FC)
-      break_pct      - % breaking balls (SL/CU/KC/SV/ST/SW)
-      offspeed_pct   - % offspeed (CH/FS)
-      velo_spread    - velocity range (max pitch type avg - min pitch type avg)
-      hmov_range     - horizontal movement range across pitch types
-      entropy        - pitch mix entropy (Shannon)
+    13 features capturing velocity, pitch mix, movement, spin, extension, and deception.
     """
     profiles = []
 
@@ -83,7 +101,6 @@ def compute_arsenal_profiles(df: pd.DataFrame) -> pd.DataFrame:
         if n < 200:
             continue
 
-        # Pitch type distribution
         pt_counts = grp["pitch_type"].value_counts()
         pt_pcts = pt_counts / n
 
@@ -91,22 +108,35 @@ def compute_arsenal_profiles(df: pd.DataFrame) -> pd.DataFrame:
         break_pct = sum(pt_pcts.get(t, 0) for t in BREAK_TYPES)
         offspeed_pct = sum(pt_pcts.get(t, 0) for t in OFFSPEED_TYPES)
 
-        # Entropy
         pcts = pt_pcts.values
         pcts = pcts[pcts > 0]
         entropy = -np.sum(pcts * np.log2(pcts))
 
-        # Avg fastball velocity
         hard_pitches = grp[grp["pitch_type"].isin(HARD_TYPES)]
+        break_pitches = grp[grp["pitch_type"].isin(BREAK_TYPES)]
+
         hard_velo = hard_pitches["release_speed"].mean() if len(hard_pitches) > 0 else np.nan
 
-        # Velocity spread: avg velo per pitch type, then max - min
         pt_velos = grp.groupby("pitch_type")["release_speed"].mean()
         velo_spread = pt_velos.max() - pt_velos.min() if len(pt_velos) > 1 else 0.0
 
-        # Horizontal movement range
         pt_hmov = grp.groupby("pitch_type")["pfx_x"].mean()
         hmov_range = pt_hmov.max() - pt_hmov.min() if len(pt_hmov) > 1 else 0.0
+
+        # New features
+        hard_spin = hard_pitches["release_spin_rate"].mean() if (len(hard_pitches) > 0 and "release_spin_rate" in grp.columns) else np.nan
+        break_spin = break_pitches["release_spin_rate"].mean() if (len(break_pitches) > 0 and "release_spin_rate" in grp.columns) else np.nan
+        hard_ivb = hard_pitches["pfx_z"].mean() if len(hard_pitches) > 0 else np.nan
+        hard_ext = hard_pitches["release_extension"].mean() if (len(hard_pitches) > 0 and "release_extension" in grp.columns) else np.nan
+
+        if "release_pos_x" in grp.columns:
+            pt_rel_x = grp.groupby("pitch_type")["release_pos_x"].mean()
+            rel_x_spread = pt_rel_x.std() if len(pt_rel_x) > 1 else 0.0
+        else:
+            rel_x_spread = 0.0
+
+        pt_vmov = grp.groupby("pitch_type")["pfx_z"].mean()
+        vmov_range = pt_vmov.max() - pt_vmov.min() if len(pt_vmov) > 1 else 0.0
 
         profiles.append({
             "pitcher": pitcher_id,
@@ -117,6 +147,12 @@ def compute_arsenal_profiles(df: pd.DataFrame) -> pd.DataFrame:
             "velo_spread": velo_spread,
             "hmov_range": hmov_range,
             "entropy": entropy,
+            "hard_spin": hard_spin,
+            "break_spin": break_spin,
+            "hard_ivb": hard_ivb,
+            "hard_ext": hard_ext,
+            "rel_x_spread": rel_x_spread,
+            "vmov_range": vmov_range,
             "n_pitches": n,
         })
 
@@ -132,9 +168,16 @@ def prepare_data(
     arsenal_profiles: pd.DataFrame,
     min_pitcher_pitches: int = 500,
     min_hitter_pa: int = 100,
+    stand: str = None,
 ) -> tuple[pd.DataFrame, dict]:
     """Prepare data with arsenal features attached to each pitch."""
     df = df.dropna(subset=["xrv"]).copy()
+
+    if stand:
+        df = df[df["stand"] == stand]
+
+    # Filter competitive counts
+    df = _filter_competitive(df)
 
     # Filter to common pitch types
     common_types = df["pitch_type"].value_counts()
@@ -151,8 +194,7 @@ def prepare_data(
     df = df[df["batter"].isin(valid_hitters)]
 
     # Merge arsenal profiles onto pitch data
-    arsenal_cols = ["pitcher", "hard_velo", "hard_pct", "break_pct",
-                    "offspeed_pct", "velo_spread", "hmov_range", "entropy"]
+    arsenal_cols = ["pitcher"] + [f for f in ARSENAL_FEATURES if f in arsenal_profiles.columns]
     df = df.merge(
         arsenal_profiles[arsenal_cols],
         on="pitcher",
@@ -178,9 +220,9 @@ def prepare_data(
     print(f"  Total pitches: {len(df):,}")
 
     # Standardize continuous features
-    feature_cols = ["release_speed", "pfx_x", "pfx_z", "plate_x", "plate_z"]
-    arsenal_feature_cols = ["hard_velo", "hard_pct", "break_pct",
-                           "offspeed_pct", "velo_spread", "hmov_range", "entropy"]
+    feature_cols = ["release_speed", "pfx_x", "pfx_z", "plate_x", "plate_z",
+                    "release_spin_rate", "release_extension", "release_pos_x", "release_pos_z"]
+    arsenal_feature_cols = [f for f in ARSENAL_FEATURES]
     all_std_cols = feature_cols + arsenal_feature_cols
 
     feature_stats = {}
@@ -188,11 +230,12 @@ def prepare_data(
         if col in df.columns:
             mean = df[col].mean()
             std = df[col].std()
-            if std > 0:
+            if pd.notna(std) and std > 0:
                 df[f"{col}_z"] = (df[col] - mean) / std
             else:
                 df[f"{col}_z"] = 0.0
-            feature_stats[col] = {"mean": float(mean), "std": float(std)}
+            feature_stats[col] = {"mean": float(mean) if pd.notna(mean) else 0.0,
+                                  "std": float(std) if pd.notna(std) else 1.0}
 
     mappings = {
         "pitcher_map": pitcher_map,
@@ -210,22 +253,14 @@ def prepare_data(
 # 3. Bayesian Model
 # ──────────────────────────────────────────────────────────────
 
-ARSENAL_FEATURES = ["hard_velo", "hard_pct", "break_pct",
-                    "offspeed_pct", "velo_spread", "hmov_range", "entropy"]
-N_ARSENAL = len(ARSENAL_FEATURES)
-
-
-def build_model(df: pd.DataFrame, sample: bool = False):
+def build_model(df: pd.DataFrame, sample: bool = False, use_map: bool = False):
     """
     Build hierarchical model with arsenal interactions.
 
-    Key difference from matchup_model.py: instead of
-        matchup_effect[pitcher_i, hitter_j]  (sparse, ~100K params)
-    we have:
-        Σ_k hitter_arsenal_β[hitter_j, k] × arsenal_z[pitcher_i, k]  (dense, ~4K×7 params)
-
-    Each hitter learns how they respond to each arsenal dimension,
-    shrunk toward the population average response.
+    Inference methods:
+      - ADVI (default): variational inference, proper posterior means
+      - MAP (--map): fast but crushes variance components
+      - MCMC (--sample): gold standard, slowest
     """
     n_pitchers = df["pitcher_idx"].nunique()
     n_hitters = df["hitter_idx"].nunique()
@@ -243,22 +278,37 @@ def build_model(df: pd.DataFrame, sample: bool = False):
     ptype_idx = df["ptype_idx"].values.astype(int)
 
     # Pitch-level features (standardized)
-    speed_z = df["release_speed_z"].values.astype(np.float64) if "release_speed_z" in df.columns else np.zeros(len(df))
-    hmov_z = df["pfx_x_z"].values.astype(np.float64) if "pfx_x_z" in df.columns else np.zeros(len(df))
-    vmov_z = df["pfx_z_z"].values.astype(np.float64) if "pfx_z_z" in df.columns else np.zeros(len(df))
-    locx_z = df["plate_x_z"].values.astype(np.float64) if "plate_x_z" in df.columns else np.zeros(len(df))
-    locz_z = df["plate_z_z"].values.astype(np.float64) if "plate_z_z" in df.columns else np.zeros(len(df))
+    def _get_z(col_name):
+        z_col = f"{col_name}_z"
+        if z_col in df.columns:
+            arr = df[z_col].values.astype(np.float64)
+        else:
+            arr = np.zeros(len(df))
+        arr[np.isnan(arr)] = 0.0
+        return arr
+
+    speed_z = _get_z("release_speed")
+    hmov_z = _get_z("pfx_x")
+    vmov_z = _get_z("pfx_z")
+    locx_z = _get_z("plate_x")
+    locz_z = _get_z("plate_z")
+    spin_z = _get_z("release_spin_rate")
+    ext_z = _get_z("release_extension")
+    rel_x_z = _get_z("release_pos_x")
+    rel_z_z = _get_z("release_pos_z")
     count_diff = (df["balls"].fillna(0) - df["strikes"].fillna(0)).values.astype(np.float64)
 
     # Arsenal features (standardized, pitcher-level but repeated per pitch)
-    arsenal_matrix = np.column_stack([
-        df[f"{feat}_z"].values.astype(np.float64) for feat in ARSENAL_FEATURES
-    ])
-
-    # Fill NaN
-    for arr in [speed_z, hmov_z, vmov_z, locx_z, locz_z]:
+    arsenal_arrays = []
+    for feat in ARSENAL_FEATURES:
+        z_col = f"{feat}_z"
+        if z_col in df.columns:
+            arr = df[z_col].values.astype(np.float64)
+        else:
+            arr = np.zeros(len(df))
         arr[np.isnan(arr)] = 0.0
-    arsenal_matrix[np.isnan(arsenal_matrix)] = 0.0
+        arsenal_arrays.append(arr)
+    arsenal_matrix = np.column_stack(arsenal_arrays)
 
     with pm.Model() as model:
         # === Population-level pitch effects ===
@@ -269,6 +319,10 @@ def build_model(df: pd.DataFrame, sample: bool = False):
         beta_locx = pm.Normal("beta_locx", mu=0, sigma=0.05)
         beta_locz = pm.Normal("beta_locz", mu=0, sigma=0.05)
         beta_count = pm.Normal("beta_count", mu=0, sigma=0.05)
+        beta_spin = pm.Normal("beta_spin", mu=0, sigma=0.05)
+        beta_ext = pm.Normal("beta_ext", mu=0, sigma=0.05)
+        beta_rel_x = pm.Normal("beta_rel_x", mu=0, sigma=0.05)
+        beta_rel_z = pm.Normal("beta_rel_z", mu=0, sigma=0.05)
 
         # Pitch type effects
         sigma_ptype = pm.HalfNormal("sigma_ptype", sigma=0.05)
@@ -292,21 +346,17 @@ def build_model(df: pd.DataFrame, sample: bool = False):
             shape=(n_hitters, n_ptypes),
         )
 
-        # === NEW: Hitter × arsenal interaction ===
-        # Population-level arsenal response (how does avg hitter respond to arsenal features)
+        # === Hitter × arsenal interaction ===
         mu_arsenal = pm.Normal("mu_arsenal", mu=0, sigma=0.03, shape=N_ARSENAL)
         sigma_arsenal = pm.HalfNormal("sigma_arsenal", sigma=0.02, shape=N_ARSENAL)
-
-        # Hitter-specific arsenal sensitivities (shrunk toward population)
         hitter_arsenal_beta = pm.Normal(
             "hitter_arsenal_beta",
-            mu=mu_arsenal,          # each hitter shrunk toward population response
+            mu=mu_arsenal,
             sigma=sigma_arsenal,
             shape=(n_hitters, N_ARSENAL),
         )
 
         # === Linear predictor ===
-        # Pitch-level effects
         mu_pitch = (
             intercept
             + beta_speed * speed_z
@@ -315,14 +365,16 @@ def build_model(df: pd.DataFrame, sample: bool = False):
             + beta_locx * locx_z
             + beta_locz * locz_z
             + beta_count * count_diff
+            + beta_spin * spin_z
+            + beta_ext * ext_z
+            + beta_rel_x * rel_x_z
+            + beta_rel_z * rel_z_z
             + ptype_effect[ptype_idx]
             + pitcher_effect[pitcher_idx]
             + hitter_effect[hitter_idx]
             + hitter_ptype_effect[hitter_idx, ptype_idx]
         )
 
-        # Arsenal interaction: for each pitch, dot product of
-        # this hitter's arsenal sensitivities with this pitcher's arsenal profile
         arsenal_interaction = pm.math.sum(
             hitter_arsenal_beta[hitter_idx] * arsenal_matrix,
             axis=1,
@@ -335,7 +387,7 @@ def build_model(df: pd.DataFrame, sample: bool = False):
         obs = pm.Normal("obs", mu=mu_total, sigma=sigma_obs, observed=xrv)
 
     total_params = (n_pitchers + n_hitters + n_hitters * n_ptypes
-                    + n_hitters * N_ARSENAL + N_ARSENAL * 2 + 10)
+                    + n_hitters * N_ARSENAL + N_ARSENAL * 2 + 14)
     print(f"    Total parameters: ~{total_params:,}")
 
     if sample:
@@ -346,10 +398,23 @@ def build_model(df: pd.DataFrame, sample: bool = False):
                 target_accept=0.9, return_inferencedata=True,
             )
         return model, trace
-    else:
-        print("\n  Finding MAP estimate...")
+    elif use_map:
+        print("\n  Finding MAP estimate (fast debug mode)...")
         with model:
             map_estimate = pm.find_MAP(maxeval=15000)
+        return model, map_estimate
+    else:
+        print("\n  Running ADVI (variational inference)...")
+        with model:
+            approx = pm.fit(
+                n=30000,
+                method="advi",
+                callbacks=[pm.callbacks.CheckParametersConvergence(diff="absolute", tolerance=1e-4)],
+            )
+            trace = approx.sample(1000)
+            map_estimate = {}
+            for var_name in trace.posterior.data_vars:
+                map_estimate[var_name] = trace.posterior[var_name].mean(dim=["chain", "draw"]).values
         return model, map_estimate
 
 
@@ -367,9 +432,6 @@ def predict_hitter_vs_arsenal(
     """
     Predict xRV for a hitter against a pitcher characterized by
     their pitch bases and arsenal profile.
-
-    pitcher_bases: precomputed from _precompute_pitcher_bases_arsenal()
-    pitcher_arsenal_z: standardized arsenal feature vector (length N_ARSENAL)
     """
     hitter_effects = np.array(map_estimate["hitter_effect"])
     hitter_ptype_effects = np.array(map_estimate["hitter_ptype_effect"])
@@ -382,16 +444,12 @@ def predict_hitter_vs_arsenal(
         h_ptype = hitter_ptype_effects[h_idx]
         h_arsenal = hitter_arsenal_betas[h_idx]
     else:
-        # Unknown hitter: use population average
         h_effect = 0.0
         h_ptype = np.zeros(hitter_ptype_effects.shape[1])
         h_arsenal = mu_arsenal
 
-    # Arsenal interaction: dot product of hitter's sensitivities × pitcher's arsenal
     arsenal_bonus = np.dot(h_arsenal, pitcher_arsenal_z)
 
-    # Average across pitcher's recent pitches (pitch_base already includes
-    # intercept + pitch features + pitcher_effect + ptype_effect)
     hand = list(pitcher_bases.keys())[0] if pitcher_bases else None
     if hand is None or pitcher_bases.get(hand) is None:
         return 0.0
@@ -406,13 +464,14 @@ def predict_hitter_vs_arsenal(
 # 5. Save / Load
 # ──────────────────────────────────────────────────────────────
 
-def save_artifacts(year, map_estimate, mappings, is_map=True):
+def save_artifacts(year, map_estimate, mappings, is_map=True, hand=None):
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
     artifacts = {
         "year": year,
         "model_type": "arsenal",
         "arsenal_features": ARSENAL_FEATURES,
+        "hand": hand,
         **mappings,
     }
 
@@ -425,7 +484,8 @@ def save_artifacts(year, map_estimate, mappings, is_map=True):
                 map_clean[k] = np.array(v)
         artifacts["map_estimate"] = map_clean
 
-    out_path = MODEL_DIR / f"arsenal_matchup_{year}.pkl"
+    suffix = f"_vs{hand}" if hand else ""
+    out_path = MODEL_DIR / f"arsenal_matchup_{year}{suffix}.pkl"
     with open(out_path, "wb") as f:
         pickle.dump(artifacts, f)
     print(f"  Saved to {out_path}")
@@ -435,7 +495,8 @@ def save_artifacts(year, map_estimate, mappings, is_map=True):
 def main():
     parser = argparse.ArgumentParser(description="Arsenal-based Matchup Model")
     parser.add_argument("--season", type=int, required=True)
-    parser.add_argument("--sample", action="store_true")
+    parser.add_argument("--sample", action="store_true", help="Full MCMC sampling (slow)")
+    parser.add_argument("--map", action="store_true", help="Use MAP instead of ADVI (faster but worse)")
     parser.add_argument("--min-pitcher-pitches", type=int, default=500)
     parser.add_argument("--min-hitter-pa", type=int, default=100)
     parser.add_argument("--subsample", type=int, default=0)
@@ -445,37 +506,46 @@ def main():
     df = load_season_xrv(args.season)
     print(f"  {len(df):,} pitches loaded")
 
-    print(f"\nComputing pitcher arsenal profiles...")
-    arsenal_profiles = compute_arsenal_profiles(df)
-    print(f"  {len(arsenal_profiles)} pitcher profiles computed")
+    for hand in ["L", "R"]:
+        print(f"\n{'='*60}")
+        print(f"Training arsenal model vs {hand}HH")
+        print(f"{'='*60}")
 
-    # Show arsenal stats
-    for col in ARSENAL_FEATURES:
-        if col in arsenal_profiles.columns:
-            print(f"    {col}: mean={arsenal_profiles[col].mean():.2f}, "
-                  f"std={arsenal_profiles[col].std():.2f}")
+        df_hand = df[df["stand"] == hand]
+        print(f"  {len(df_hand):,} pitches vs {hand}HH")
 
-    print(f"\nPreparing data...")
-    df_prep, mappings = prepare_data(
-        df, arsenal_profiles,
-        min_pitcher_pitches=args.min_pitcher_pitches,
-        min_hitter_pa=args.min_hitter_pa,
-    )
+        print(f"\nComputing pitcher arsenal profiles (vs {hand}HH)...")
+        arsenal_profiles = compute_arsenal_profiles(df_hand)
+        print(f"  {len(arsenal_profiles)} pitcher profiles computed")
 
-    if args.subsample > 0 and args.subsample < len(df_prep):
-        print(f"\n  Subsampling to {args.subsample:,} pitches")
-        df_prep = df_prep.sample(n=args.subsample, random_state=42)
+        for col in ARSENAL_FEATURES:
+            if col in arsenal_profiles.columns:
+                print(f"    {col}: mean={arsenal_profiles[col].mean():.2f}, "
+                      f"std={arsenal_profiles[col].std():.2f}")
 
-    print(f"\nFitting model...")
-    model, result = build_model(df_prep, sample=args.sample)
+        print(f"\nPreparing data...")
+        df_prep, mappings = prepare_data(
+            df_hand, arsenal_profiles,
+            min_pitcher_pitches=args.min_pitcher_pitches,
+            min_hitter_pa=args.min_hitter_pa,
+            stand=hand,
+        )
 
-    is_map = not args.sample
-    save_artifacts(args.season, result, mappings, is_map=is_map)
+        if args.subsample > 0 and args.subsample < len(df_prep):
+            print(f"\n  Subsampling to {args.subsample:,} pitches")
+            df_prep = df_prep.sample(n=args.subsample, random_state=42)
 
-    if is_map:
-        print(f"\n  Key MAP estimates:")
+        print(f"\nFitting model...")
+        model, result = build_model(df_prep, sample=args.sample, use_map=args.map)
+
+        is_map = not args.sample  # both MAP and ADVI produce dict format
+        save_artifacts(args.season, result, mappings, is_map=is_map, hand=hand)
+
+        # Print diagnostics
+        print(f"\n  Key estimates:")
         for param in ["intercept", "beta_speed", "beta_hmov", "beta_vmov",
-                       "beta_locx", "beta_locz", "beta_count"]:
+                       "beta_locx", "beta_locz", "beta_count",
+                       "beta_spin", "beta_ext", "beta_rel_x", "beta_rel_z"]:
             if param in result:
                 print(f"    {param}: {float(np.array(result[param])):.6f}")
 
@@ -484,32 +554,19 @@ def main():
             if param in result:
                 print(f"    {param}: {float(np.array(result[param])):.6f}")
 
-        # Arsenal interaction parameters
-        mu_arsenal = np.array(result["mu_arsenal"])
-        sigma_arsenal = np.array(result["sigma_arsenal"])
-        print(f"\n  Arsenal population effects (μ_arsenal):")
-        for feat, mu, sig in zip(ARSENAL_FEATURES, mu_arsenal, sigma_arsenal):
-            print(f"    {feat:>15}: μ={mu:+.6f}  σ={sig:.6f}")
+        if "mu_arsenal" in result:
+            mu_arsenal = np.array(result["mu_arsenal"])
+            sigma_arsenal = np.array(result["sigma_arsenal"])
+            print(f"\n  Arsenal population effects (μ_arsenal):")
+            for feat, mu, sig in zip(ARSENAL_FEATURES, mu_arsenal, sigma_arsenal):
+                print(f"    {feat:>15}: μ={mu:+.6f}  σ={sig:.6f}")
 
-        # Hitter arsenal variance — how much do hitters differ in sensitivity?
-        hitter_arsenal = np.array(result["hitter_arsenal_beta"])
-        print(f"\n  Hitter arsenal sensitivity spread (std across hitters):")
-        for i, feat in enumerate(ARSENAL_FEATURES):
-            std = hitter_arsenal[:, i].std()
-            print(f"    {feat:>15}: {std:.6f}")
-
-        # Top/bottom pitchers
-        pitcher_effects = np.array(result["pitcher_effect"])
-        pitcher_ids = mappings["pitcher_ids"]
-        if len(pitcher_ids) > 0:
-            top_p = np.argsort(pitcher_effects)[:5]
-            bot_p = np.argsort(pitcher_effects)[-5:]
-            print(f"\n  Best pitchers (lowest xRV):")
-            for i in top_p:
-                print(f"    {pitcher_ids[i]}: {pitcher_effects[i]:.6f}")
-            print(f"  Worst pitchers:")
-            for i in bot_p:
-                print(f"    {pitcher_ids[i]}: {pitcher_effects[i]:.6f}")
+        if "hitter_arsenal_beta" in result:
+            hitter_arsenal = np.array(result["hitter_arsenal_beta"])
+            print(f"\n  Hitter arsenal sensitivity spread (std across hitters):")
+            for i, feat in enumerate(ARSENAL_FEATURES):
+                std = hitter_arsenal[:, i].std()
+                print(f"    {feat:>15}: {std:.6f}")
 
     print("\nDone.")
 

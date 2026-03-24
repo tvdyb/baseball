@@ -32,7 +32,10 @@ from feature_engineering import (
     _preindex_xrv, _get_before, _sp_features_fast, _bp_features_fast,
     _hit_features_fast, _def_features_fast, _precompute_pitcher_bases,
     compute_matchup_xrv, compute_bullpen_matchup_xrv, compute_park_factors,
-    _recent_winpct,
+    _recent_winpct, _load_hand_models, _compute_hand_matchup,
+    _compute_hand_arsenal_matchup, compute_arsenal_matchup_xrv,
+    compute_bullpen_arsenal_matchup_xrv, _compute_pitcher_arsenal_live,
+    _standardize_arsenal, _filter_competitive,
 )
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
@@ -60,6 +63,9 @@ DIFF_FEATURES = [
     "diff_def_xrv_delta",
     "diff_matchup_xrv_mean",
     "diff_matchup_xrv_sum",
+    "diff_arsenal_matchup_xrv_mean",
+    "diff_arsenal_matchup_xrv_sum",
+    "diff_bp_arsenal_matchup_xrv_mean",
     "diff_platoon_pct",
     "diff_recent_form",
     "diff_sp_xrv_vs_lineup",
@@ -73,6 +79,8 @@ RAW_FEATURES = [
     "away_sp_n_pitches",
     "home_matchup_n_known",
     "away_matchup_n_known",
+    "home_arsenal_matchup_n_known",
+    "away_arsenal_matchup_n_known",
     "temperature",
     "wind_speed",
     "is_dome",
@@ -275,13 +283,15 @@ def build_live_features(
     print("  Pre-indexing xRV data...")
     idx = _preindex_xrv(xrv)
 
-    # Load matchup model (from prior season)
-    model_path = MODEL_DIR / f"matchup_model_{year - 1}.pkl"
-    model_artifacts = None
-    if model_path.exists():
-        with open(model_path, "rb") as f:
-            model_artifacts = pickle.load(f)
-        print(f"  Loaded matchup model from {year - 1}")
+    # Load hand-specific matchup models (from prior season)
+    matchup_models = _load_hand_models("matchup_model", year - 1)
+    if matchup_models:
+        print(f"  Matchup models loaded for hands: {list(matchup_models.keys())}")
+
+    # Load hand-specific arsenal matchup models (from prior season)
+    arsenal_models = _load_hand_models("arsenal_matchup", year - 1)
+    if arsenal_models:
+        print(f"  Arsenal models loaded for hands: {list(arsenal_models.keys())}")
 
     # Park factors from prior season
     prior_xrv_path = XRV_DIR / f"statcast_xrv_{year - 1}.parquet"
@@ -347,19 +357,35 @@ def build_live_features(
         # --- Fetch lineup for matchup features ---
         lineup = fetch_lineup(client, game_pk)
 
-        # --- SP matchup: lineup vs opposing SP ---
+        # --- SP matchup: lineup vs opposing SP (hand-specific) ---
+        nan_arsenal = {"arsenal_matchup_xrv_mean": np.nan, "arsenal_matchup_xrv_sum": np.nan,
+                       "arsenal_matchup_n_hitters": 0, "arsenal_matchup_n_known": 0}
+
         for atk_side, def_sp, def_side in [("home", away_sp, "away"), ("away", home_sp, "home")]:
             lu = lineup.get(atk_side, [])
-            if model_artifacts and lu and def_sp and int(def_sp) in idx["pitcher"]:
+            if matchup_models and lu and def_sp and int(def_sp) in idx["pitcher"]:
                 hitter_ids = [h[0] for h in lu]
                 hitter_hands = [h[1] for h in lu]
-                pitcher_bases = _precompute_pitcher_bases(
-                    model_artifacts, idx["pitcher"][int(def_sp)], int(def_sp), gdate, 2000)
-                matchup = compute_matchup_xrv(model_artifacts, pitcher_bases, hitter_ids, hitter_hands)
+                matchup = _compute_hand_matchup(
+                    matchup_models, idx["pitcher"][int(def_sp)], int(def_sp),
+                    gdate, 2000, hitter_ids, hitter_hands, compute_matchup_xrv)
                 for k, v in matchup.items():
                     row[f"{atk_side}_{k}"] = v
             else:
                 for k, v in nan_matchup.items():
+                    row[f"{atk_side}_{k}"] = v
+
+            # Arsenal matchup
+            if arsenal_models and lu and def_sp and int(def_sp) in idx["pitcher"]:
+                hitter_ids = [h[0] for h in lu]
+                hitter_hands = [h[1] for h in lu]
+                a_matchup = _compute_hand_arsenal_matchup(
+                    arsenal_models, idx["pitcher"][int(def_sp)], int(def_sp),
+                    gdate, 2000, hitter_ids, hitter_hands)
+                for k, v in a_matchup.items():
+                    row[f"{atk_side}_{k}"] = v
+            else:
+                for k, v in nan_arsenal.items():
                     row[f"{atk_side}_{k}"] = v
 
         # --- Bullpen features ---
@@ -373,8 +399,10 @@ def build_live_features(
                 for k in ["bp_xrv_mean", "bp_xrv_std", "bp_recent_ip", "bp_fatigue_score"]:
                     row[f"{side}_{k}"] = np.nan
 
-        # --- Bullpen matchup ---
-        if model_artifacts:
+        # --- Bullpen matchup (hand-specific) ---
+        bp_matchup_artifacts = matchup_models.get("L") or matchup_models.get("R") if matchup_models else None
+        bp_arsenal_artifacts = arsenal_models.get("L") or arsenal_models.get("R") if arsenal_models else None
+        if bp_matchup_artifacts:
             for def_side, atk_side in [("home", "away"), ("away", "home")]:
                 def_team = home_team if def_side == "home" else away_team
                 lu = lineup.get(atk_side, [])
@@ -382,7 +410,7 @@ def build_live_features(
                     hids = [h[0] for h in lu]
                     hhands = [h[1] for h in lu]
                     bp_m = compute_bullpen_matchup_xrv(
-                        model_artifacts, idx, def_team, gdate, hids, hhands)
+                        bp_matchup_artifacts, idx, def_team, gdate, hids, hhands)
                     for k, v in bp_m.items():
                         row[f"{def_side}_{k}"] = v
                 else:
@@ -392,6 +420,25 @@ def build_live_features(
             for side in ["home", "away"]:
                 row[f"{side}_bp_matchup_xrv_mean"] = np.nan
                 row[f"{side}_bp_matchup_n_relievers"] = 0
+
+        # --- Bullpen arsenal matchup ---
+        if bp_arsenal_artifacts:
+            for def_side, atk_side in [("home", "away"), ("away", "home")]:
+                def_team = home_team if def_side == "home" else away_team
+                lu = lineup.get(atk_side, [])
+                if lu:
+                    bp_a = compute_bullpen_arsenal_matchup_xrv(
+                        bp_arsenal_artifacts, idx, def_team, gdate,
+                        [h[0] for h in lu], [h[1] for h in lu])
+                    for k, v in bp_a.items():
+                        row[f"{def_side}_{k}"] = v
+                else:
+                    row[f"{def_side}_bp_arsenal_matchup_xrv_mean"] = np.nan
+                    row[f"{def_side}_bp_arsenal_matchup_n_relievers"] = 0
+        else:
+            for side in ["home", "away"]:
+                row[f"{side}_bp_arsenal_matchup_xrv_mean"] = np.nan
+                row[f"{side}_bp_arsenal_matchup_n_relievers"] = 0
 
         # --- Team hitting ---
         for side in ["home", "away"]:
@@ -503,6 +550,8 @@ def build_live_features(
         ("hit_xrv_mean", 1), ("hit_xrv_contact", 1), ("hit_k_rate", -1),
         ("def_xrv_delta", -1),
         ("matchup_xrv_mean", 1), ("matchup_xrv_sum", 1),
+        ("arsenal_matchup_xrv_mean", 1), ("arsenal_matchup_xrv_sum", 1),
+        ("bp_arsenal_matchup_xrv_mean", -1),
         ("platoon_pct", 1), ("recent_form", 1),
     ]
     for col, sign in diff_cols:
