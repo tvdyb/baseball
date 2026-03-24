@@ -1,0 +1,8 @@
+data/
+models/
+notebooks/
+__pycache__/
+*.pyc
+.DS_Store
+*.egg-info/
+.env
