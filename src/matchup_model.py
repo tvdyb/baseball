@@ -351,11 +351,20 @@ def main():
     parser.add_argument("--min-pitcher-pitches", type=int, default=500)
     parser.add_argument("--min-hitter-pa", type=int, default=100)
     parser.add_argument("--subsample", type=int, default=0)
+    parser.add_argument("--pool-seasons", type=int, nargs="+", default=None,
+                        help="Pool multiple seasons (e.g. --pool-seasons 2022 2023)")
     args = parser.parse_args()
 
-    print(f"Loading xRV data for {args.season}...")
-    df = load_season_xrv(args.season)
-    print(f"  {len(df):,} pitches loaded")
+    seasons = args.pool_seasons or [args.season]
+    frames = []
+    for yr in seasons:
+        print(f"Loading xRV data for {yr}...")
+        yr_df = load_season_xrv(yr)
+        print(f"  {len(yr_df):,} pitches loaded")
+        frames.append(yr_df)
+    df = pd.concat(frames, ignore_index=True)
+    if len(seasons) > 1:
+        print(f"  Pooled: {len(df):,} pitches across {seasons}")
 
     for hand in ["L", "R"]:
         print(f"\n{'='*60}")

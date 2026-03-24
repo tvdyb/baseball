@@ -70,6 +70,7 @@ DIFF_FEATURES = [
     "diff_sp_velo_trend",
     "diff_sp_spin_trend",
     "diff_sp_xrv_trend",
+    "diff_sp_transition_entropy",
     # OAA defense
     "diff_oaa_rate",
     # Team strength prior
@@ -127,6 +128,7 @@ def train_ensemble(train_df: pd.DataFrame):
 
     # XGB
     xgb_model = None
+    w_lr = 0.5  # default blend weight
     if HAS_XGB:
         dtrain = xgb.DMatrix(X, label=y)
         params = {
@@ -143,10 +145,24 @@ def train_ensemble(train_df: pd.DataFrame):
         }
         xgb_model = xgb.train(params, dtrain, num_boost_round=100)
 
-    return lr, scaler, xgb_model, available
+        # Learn optimal blend weight on training data
+        from scipy.optimize import minimize_scalar
+        lr_probs = lr.predict_proba(X_lr)[:, 1]
+        xgb_probs = xgb_model.predict(dtrain)
+
+        def blend_loss(w):
+            blended = w * lr_probs + (1 - w) * xgb_probs
+            blended = np.clip(blended, 1e-6, 1 - 1e-6)
+            return log_loss(y, blended)
+
+        opt = minimize_scalar(blend_loss, bounds=(0.1, 0.9), method="bounded")
+        w_lr = opt.x
+        print(f"  Learned ensemble weight: LR={w_lr:.2f}, XGB={1-w_lr:.2f}")
+
+    return lr, scaler, xgb_model, available, w_lr
 
 
-def predict_games(lr, scaler, xgb_model, features, games_df: pd.DataFrame) -> pd.DataFrame:
+def predict_games(lr, scaler, xgb_model, features, games_df: pd.DataFrame, w_lr: float = 0.5) -> pd.DataFrame:
     """Generate predictions for a set of games."""
     available = [f for f in features if f in games_df.columns]
     X = games_df[available].copy()
@@ -159,7 +175,7 @@ def predict_games(lr, scaler, xgb_model, features, games_df: pd.DataFrame) -> pd
     if xgb_model and HAS_XGB:
         dtest = xgb.DMatrix(X)
         xgb_probs = xgb_model.predict(dtest)
-        ensemble_probs = 0.5 * lr_probs + 0.5 * xgb_probs
+        ensemble_probs = w_lr * lr_probs + (1 - w_lr) * xgb_probs
     else:
         xgb_probs = lr_probs
         ensemble_probs = lr_probs
@@ -580,6 +596,7 @@ def build_live_features(
         ("platoon_pct", 1), ("recent_form", 1),
         # New features
         ("sp_velo_trend", -1), ("sp_spin_trend", -1), ("sp_xrv_trend", -1),
+        ("sp_transition_entropy", -1),
         ("oaa_rate", 1), ("team_prior", 1),
     ]
     for col, sign in diff_cols:
@@ -612,7 +629,7 @@ def predict_date(target_date: str):
     print("\nTraining model on historical data...")
     train_df = load_training_data()
     print(f"  {len(train_df):,} training games")
-    lr, scaler, xgb_model, features = train_ensemble(train_df)
+    lr, scaler, xgb_model, features, w_lr = train_ensemble(train_df)
 
     # Fetch today's games
     print(f"\nFetching games for {target_date}...")
@@ -629,7 +646,7 @@ def predict_date(target_date: str):
         features_df = build_live_features(games, target_date, client)
 
     # Generate predictions
-    results = predict_games(lr, scaler, xgb_model, features, features_df)
+    results = predict_games(lr, scaler, xgb_model, features, features_df, w_lr)
 
     # Merge SP names back in
     if "home_sp_name" in features_df.columns:
@@ -683,7 +700,7 @@ def backtest_season(year: int):
     train_df = load_training_data(exclude_year=year)
     print(f"  Training on {len(train_df):,} games from prior seasons")
 
-    lr, scaler, xgb_model, features = train_ensemble(train_df)
+    lr, scaler, xgb_model, features, w_lr = train_ensemble(train_df)
 
     test_path = FEATURES_DIR / f"game_features_{year}.parquet"
     if not test_path.exists():
@@ -693,7 +710,7 @@ def backtest_season(year: int):
     test_df["season"] = year
     print(f"  Predicting {len(test_df)} games")
 
-    results = predict_games(lr, scaler, xgb_model, features, test_df)
+    results = predict_games(lr, scaler, xgb_model, features, test_df, w_lr)
 
     # Evaluate
     y_true = results["home_win"].values

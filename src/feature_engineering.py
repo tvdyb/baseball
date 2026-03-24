@@ -928,6 +928,21 @@ def _sp_features_fast(pitcher_df: pd.DataFrame, game_date: str, n_pitches: int) 
         sp_overperf = np.nan
         sp_overperf_recent = np.nan
 
+    # --- Change 7: Transition entropy (pitch sequencing unpredictability) ---
+    if len(recent) >= 100 and "pitch_type" in recent.columns:
+        pt_seq = recent["pitch_type"].values
+        transitions = {}
+        for a, b in zip(pt_seq[:-1], pt_seq[1:]):
+            transitions.setdefault(a, []).append(b)
+        entropies = []
+        for from_pt, to_pts in transitions.items():
+            counts = pd.Series(to_pts).value_counts(normalize=True).values
+            counts = counts[counts > 0]
+            entropies.append(-float(np.sum(counts * np.log2(counts))))
+        sp_transition_entropy = float(np.mean(entropies)) if entropies else 0.0
+    else:
+        sp_transition_entropy = np.nan
+
     # --- Change 2: SP stuff trend (short vs long window) ---
     recent_short = before.iloc[-300:] if len(before) > 300 else before
     if len(recent_short) >= 100:
@@ -962,6 +977,7 @@ def _sp_features_fast(pitcher_df: pd.DataFrame, game_date: str, n_pitches: int) 
         "sp_xrv_trend": sp_xrv_trend,       # positive = getting worse recently
         "sp_home_xrv": sp_home_xrv,         # xRV when pitching at home
         "sp_away_xrv": sp_away_xrv,         # xRV when pitching on the road
+        "sp_transition_entropy": sp_transition_entropy,  # pitch sequencing unpredictability
     }
 
 
@@ -1805,6 +1821,7 @@ def build_game_features(
         ("sp_velo_trend", -1),      # velo increasing = better for pitcher
         ("sp_spin_trend", -1),      # spin increasing = better for pitcher
         ("sp_xrv_trend", -1),       # xRV trending up = worse for pitcher
+        ("sp_transition_entropy", -1),  # higher entropy = more unpredictable = better for pitcher
         # New: OAA defense
         ("oaa_rate", 1),            # higher OAA = better defense
         # New: team strength prior

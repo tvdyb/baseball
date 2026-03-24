@@ -64,6 +64,7 @@ DIFF_FEATURES = [
     "diff_sp_velo_trend",
     "diff_sp_spin_trend",
     "diff_sp_xrv_trend",
+    "diff_sp_transition_entropy",
     # OAA defense
     "diff_oaa_rate",
     # Team strength prior
@@ -359,9 +360,25 @@ def walk_forward_evaluation(all_years: list[int], min_train_years: int = 2):
             result["xgb_auc"] = roc_auc_score(y_test, xgb_probs)
             result["xgb_brier"] = brier_score_loss(y_test, xgb_probs)
 
-        # Ensemble
+        # Ensemble — learn optimal blend via CV on training data
         if lr_probs is not None and xgb_probs is not None:
-            ens_probs = 0.5 * lr_probs + 0.5 * xgb_probs
+            # Fit blend weight on training predictions
+            from scipy.optimize import minimize_scalar
+            X_train_s = lr_scaler.transform(X_train_lr.fillna(0))
+            lr_train_probs = lr_model.predict_proba(X_train_s)[:, 1]
+            dtrain_xgb = xgb.DMatrix(X_train_xgb) if xgb_model else None
+            xgb_train_probs = xgb_model.predict(dtrain_xgb) if xgb_model else lr_train_probs
+
+            def blend_loss(w):
+                blended = w * lr_train_probs + (1 - w) * xgb_train_probs
+                blended = np.clip(blended, 1e-6, 1 - 1e-6)
+                return log_loss(y_train, blended)
+
+            opt = minimize_scalar(blend_loss, bounds=(0.1, 0.9), method="bounded")
+            w_lr = opt.x
+            print(f"\n  Learned ensemble weight: LR={w_lr:.2f}, XGB={1-w_lr:.2f}")
+
+            ens_probs = w_lr * lr_probs + (1 - w_lr) * xgb_probs
             result["ens_log_loss"] = log_loss(y_test, ens_probs)
             result["ens_auc"] = roc_auc_score(y_test, ens_probs)
             result["ens_brier"] = brier_score_loss(y_test, ens_probs)
