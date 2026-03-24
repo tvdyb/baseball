@@ -23,27 +23,14 @@ from datetime import timedelta
 import numpy as np
 import pandas as pd
 
-from arsenal_matchup_model import ARSENAL_FEATURES, HARD_TYPES, BREAK_TYPES, OFFSPEED_TYPES
+from arsenal_matchup_model import ARSENAL_FEATURES
+from utils import (
+    DATA_DIR, XRV_DIR, GAMES_DIR, WEATHER_DIR, MODEL_DIR, FEATURES_DIR, OAA_DIR,
+    HARD_TYPES, BREAK_TYPES, OFFSPEED_TYPES, filter_competitive,
+)
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-XRV_DIR = DATA_DIR / "xrv"
-GAMES_DIR = DATA_DIR / "games"
-WEATHER_DIR = DATA_DIR / "weather"
-MODEL_DIR = Path(__file__).resolve().parent.parent / "models"
-FEATURES_DIR = DATA_DIR / "features"
-
-
-def _filter_competitive(df: pd.DataFrame) -> pd.DataFrame:
-    """Filter to pitches in competitive counts."""
-    if "balls" not in df.columns or "strikes" not in df.columns:
-        return df
-    exclude_mask = (
-        ((df["balls"] == 0) & (df["strikes"] == 2)) |
-        ((df["balls"] == 3) & (df["strikes"] == 0))
-    )
-    if "description" in df.columns:
-        exclude_mask = exclude_mask | df["description"].str.contains("intentional", case=False, na=False)
-    return df[~exclude_mask]
+# Backward-compat alias for internal callers
+_filter_competitive = filter_competitive
 
 
 def _load_hand_models(prefix: str, year: int) -> dict:
@@ -447,8 +434,8 @@ def _compute_pitcher_arsenal_live(pitcher_df: pd.DataFrame, game_date: str,
 
     # Release point spread (arm slot consistency across pitch types)
     if "release_pos_x" in recent.columns:
-        pt_rel_x = recent.groupby("pitch_type")["release_pos_x"].mean()
-        rel_x_spread = float(pt_rel_x.std()) if len(pt_rel_x) > 1 else 0.0
+        pt_rel_x = recent.groupby("pitch_type")["release_pos_x"].mean().dropna()
+        rel_x_spread = float(pt_rel_x.std()) if len(pt_rel_x) > 1 and pd.notna(pt_rel_x.std()) else 0.0
     else:
         rel_x_spread = 0.0
 
@@ -534,7 +521,13 @@ def compute_arsenal_matchup_xrv(
             h_arsenal = mu_arsenal
 
         # Arsenal interaction: how this hitter responds to this pitcher's arsenal type
-        arsenal_bonus = np.dot(h_arsenal, pitcher_arsenal_z)
+        # Handle dimension mismatch between old (7-feature) and new (13-feature) models
+        n_model = len(h_arsenal)
+        if n_model != len(pitcher_arsenal_z):
+            arsenal_z_trimmed = pitcher_arsenal_z[:n_model]
+        else:
+            arsenal_z_trimmed = pitcher_arsenal_z
+        arsenal_bonus = np.dot(h_arsenal, arsenal_z_trimmed)
 
         hitter_preds = pitch_base + h_effect + h_ptype + arsenal_bonus
         hitter_xrvs.append(float(np.mean(hitter_preds)))
@@ -795,19 +788,22 @@ def compute_defense_features(
 # 6. Park Factor (static per home_team / season)
 # ──────────────────────────────────────────────────────────────
 
-def compute_park_factors(xrv_df: pd.DataFrame, season: int) -> dict[str, float]:
+def compute_park_factors(xrv_df: pd.DataFrame, season: int,
+                         shrinkage_n: int = 20000) -> dict[str, float]:
     """
     Compute park factor as ratio of xRV at this park vs league average.
-    Uses all pitches at each park from the PRIOR season to avoid lookahead.
+    Uses Bayesian shrinkage: parks with fewer pitches are pulled toward 1.0.
+    shrinkage_n = number of pitches needed for full weight on park estimate.
     """
-    # Group by home_team (= park)
-    park_xrv = xrv_df.groupby("home_team")["xrv"].mean()
+    park_stats = xrv_df.groupby("home_team")["xrv"].agg(["mean", "count"])
     league_avg = xrv_df["xrv"].mean()
 
     factors = {}
-    for team, mean_xrv in park_xrv.items():
-        # Park factor > 1 = hitter friendly, < 1 = pitcher friendly
-        factors[team] = mean_xrv / league_avg if league_avg != 0 else 1.0
+    for team, row in park_stats.iterrows():
+        n = row["count"]
+        weight = n / (n + shrinkage_n)
+        shrunk_mean = weight * row["mean"] + (1 - weight) * league_avg
+        factors[team] = shrunk_mean / league_avg if league_avg != 0 else 1.0
 
     return factors
 
@@ -892,23 +888,33 @@ def _sp_features_fast(pitcher_df: pd.DataFrame, game_date: str, n_pitches: int) 
     xrv_vs_L = vs_L["xrv"].mean() if len(vs_L) >= 20 else xrv_mean
     xrv_vs_R = vs_R["xrv"].mean() if len(vs_R) >= 20 else xrv_mean
 
-    # Days since last appearance (rest)
+    # Days since last appearance (rest), capped at 14
     game_dates = recent["game_date"].unique()
     if len(game_dates) >= 1:
         last_date = game_dates[-1]  # sorted ascending
         rest_days = (pd.Timestamp(game_date) - pd.Timestamp(last_date)).days
+        rest_days = min(rest_days, 14)  # cap: anything over 14 = fully rested / season start
     else:
         rest_days = np.nan
 
+    # --- Change 4: Home/away SP split ---
+    # Home pitcher pitches when inning_topbot == "Top", away when "Bot"
+    if "inning_topbot" in recent.columns:
+        home_pitches = recent[recent["inning_topbot"] == "Top"]
+        away_pitches = recent[recent["inning_topbot"] == "Bot"]
+        sp_home_xrv = home_pitches["xrv"].mean() if len(home_pitches) >= 30 else xrv_mean
+        sp_away_xrv = away_pitches["xrv"].mean() if len(away_pitches) >= 30 else xrv_mean
+    else:
+        sp_home_xrv = xrv_mean
+        sp_away_xrv = xrv_mean
+
     # Overperformance residual: actual outcome vs expected (xRV)
     # Negative = pitcher consistently beats their stuff (deception, sequencing, tunneling)
-    # This captures the "occlusion" — skills not in the statcast pitch characteristics
     if "delta_run_exp" in recent.columns:
         residuals = recent["delta_run_exp"] - recent["xrv"]
         resid_valid = residuals.dropna()
         if len(resid_valid) >= 100:
             sp_overperf = resid_valid.mean()
-            # Also compute it on recent starts only (last ~500 pitches) for trend
             recent_500 = before.iloc[-500:] if len(before) > 500 else before
             if "delta_run_exp" in recent_500.columns:
                 resid_recent = (recent_500["delta_run_exp"] - recent_500["xrv"]).dropna()
@@ -922,32 +928,68 @@ def _sp_features_fast(pitcher_df: pd.DataFrame, game_date: str, n_pitches: int) 
         sp_overperf = np.nan
         sp_overperf_recent = np.nan
 
+    # --- Change 2: SP stuff trend (short vs long window) ---
+    recent_short = before.iloc[-300:] if len(before) > 300 else before
+    if len(recent_short) >= 100:
+        short_xrv = recent_short["xrv"].mean()
+        short_fb = recent_short[recent_short["pitch_type"].isin(["FF", "SI", "FC"])]
+        short_velo = short_fb["release_speed"].mean() if len(short_fb) > 0 else np.nan
+        long_spin = recent.loc[fb_mask, "release_spin_rate"].mean() if (
+            fb_mask.any() and "release_spin_rate" in recent.columns
+        ) else np.nan
+        short_spin = short_fb["release_spin_rate"].mean() if (
+            len(short_fb) > 0 and "release_spin_rate" in recent_short.columns
+        ) else np.nan
+
+        sp_velo_trend = short_velo - avg_velo if not (np.isnan(short_velo) or np.isnan(avg_velo)) else np.nan
+        sp_spin_trend = short_spin - long_spin if not (np.isnan(short_spin) or np.isnan(long_spin)) else np.nan
+        sp_xrv_trend = short_xrv - xrv_mean  # positive = getting worse recently
+    else:
+        sp_velo_trend = np.nan
+        sp_spin_trend = np.nan
+        sp_xrv_trend = np.nan
+
     return {
         "sp_xrv_mean": xrv_mean, "sp_xrv_std": xrv_std, "sp_n_pitches": len(recent),
         "sp_k_rate": k_rate, "sp_bb_rate": bb_rate, "sp_avg_velo": avg_velo,
         "sp_pitch_mix_entropy": entropy,
         "sp_xrv_vs_L": xrv_vs_L, "sp_xrv_vs_R": xrv_vs_R,
         "sp_rest_days": rest_days,
-        "sp_overperf": sp_overperf,             # rolling residual over full window
-        "sp_overperf_recent": sp_overperf_recent,  # recent trend (last ~500 pitches)
+        "sp_overperf": sp_overperf,
+        "sp_overperf_recent": sp_overperf_recent,
+        "sp_velo_trend": sp_velo_trend,     # positive = velo increasing recently
+        "sp_spin_trend": sp_spin_trend,     # positive = spin increasing recently
+        "sp_xrv_trend": sp_xrv_trend,       # positive = getting worse recently
+        "sp_home_xrv": sp_home_xrv,         # xRV when pitching at home
+        "sp_away_xrv": sp_away_xrv,         # xRV when pitching on the road
     }
 
 
 def _bp_features_fast(team_pitches: pd.DataFrame, game_date: str,
-                       lookback_days: int = 30, rest_days: int = 3) -> dict:
+                       lookback_days: int = 30, rest_days: int = 3,
+                       fallback_games: int = 15) -> dict:
     """Compute bullpen features from pre-indexed team pitching data."""
+    nan_result = {"bp_xrv_mean": np.nan, "bp_xrv_std": np.nan,
+                  "bp_recent_ip": np.nan, "bp_fatigue_score": np.nan}
     before = _get_before(team_pitches, game_date)
     if len(before) == 0:
-        return {"bp_xrv_mean": np.nan, "bp_xrv_std": np.nan,
-                "bp_recent_ip": np.nan, "bp_fatigue_score": np.nan}
+        return nan_result
 
     cutoff = (pd.Timestamp(game_date) - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
     rest_cutoff = (pd.Timestamp(game_date) - timedelta(days=rest_days)).strftime("%Y-%m-%d")
     recent = before[before["game_date"] >= cutoff]
 
+    # Fallback: if calendar window is too thin, use last N games
+    if len(recent) < 50:
+        game_pks = before["game_pk"].unique()
+        if len(game_pks) > fallback_games:
+            recent_games = game_pks[-fallback_games:]
+            recent = before[before["game_pk"].isin(set(recent_games))]
+        else:
+            recent = before
+
     if len(recent) == 0:
-        return {"bp_xrv_mean": np.nan, "bp_xrv_std": np.nan,
-                "bp_recent_ip": np.nan, "bp_fatigue_score": np.nan}
+        return nan_result
 
     # Find starters (first pitcher in each game)
     starters = recent.groupby("game_pk").first()["pitcher"].values
@@ -973,11 +1015,20 @@ def _bp_features_fast(team_pitches: pd.DataFrame, game_date: str,
 
 
 def _hit_features_fast(team_batting: pd.DataFrame, game_date: str,
-                        lookback_days: int = 30) -> dict:
+                        lookback_days: int = 30, fallback_games: int = 15) -> dict:
     """Compute team hitting features from pre-indexed data."""
     before = _get_before(team_batting, game_date)
     cutoff = (pd.Timestamp(game_date) - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
     recent = before[before["game_date"] >= cutoff]
+
+    # Fallback: if calendar window is too thin, use last N games
+    if len(recent) < 50:
+        game_pks = before["game_pk"].unique()
+        if len(game_pks) > fallback_games:
+            recent_games = game_pks[-fallback_games:]
+            recent = before[before["game_pk"].isin(set(recent_games))]
+        else:
+            recent = before
 
     if len(recent) == 0:
         return {"hit_xrv_mean": np.nan, "hit_xrv_contact": np.nan, "hit_k_rate": np.nan}
@@ -992,13 +1043,23 @@ def _hit_features_fast(team_batting: pd.DataFrame, game_date: str,
 
 
 def _def_features_fast(team_pitches: pd.DataFrame, game_date: str,
-                        lookback_days: int = 60) -> dict:
+                        lookback_days: int = 60, fallback_games: int = 25) -> dict:
     """Compute defense features from pre-indexed team pitching data."""
     before = _get_before(team_pitches, game_date)
     cutoff = (pd.Timestamp(game_date) - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
     recent = before[(before["game_date"] >= cutoff) & (before["type"] == "X")]
 
+    # Fallback: if calendar window has too few BIP, use last N games
     if len(recent) < 100:
+        contact = before[before["type"] == "X"]
+        game_pks = contact["game_pk"].unique()
+        if len(game_pks) > fallback_games:
+            recent_games = game_pks[-fallback_games:]
+            recent = contact[contact["game_pk"].isin(set(recent_games))]
+        else:
+            recent = contact
+
+    if len(recent) < 50:
         return {"def_xrv_delta": np.nan}
 
     return {"def_xrv_delta": (recent["delta_run_exp"] - recent["xrv"]).mean()}
@@ -1147,6 +1208,106 @@ def _compute_hand_arsenal_matchup(
     }
 
 
+def _load_team_oaa(season: int) -> dict[str, float]:
+    """
+    Load per-player OAA from scrape_oaa.py output and aggregate to team-level OAA rate.
+    Uses fielder_3..fielder_9 from statcast to map players to teams.
+    Returns {team_abbr: total_oaa_per_player} for the given season.
+    """
+    oaa_path = OAA_DIR / "oaa_all.parquet"
+    if not oaa_path.exists():
+        return {}
+    oaa = pd.read_parquet(oaa_path)
+    oaa = oaa[oaa["season"] == season]
+    if len(oaa) == 0:
+        return {}
+
+    # Aggregate per-player OAA across positions
+    player_oaa = oaa.groupby("player_id")["oaa"].sum()
+
+    # Map players to teams via statcast fielder columns
+    statcast_path = DATA_DIR / "statcast" / f"statcast_{season}.parquet"
+    if not statcast_path.exists():
+        # Try subdirectory format
+        stat_dir = DATA_DIR / "statcast" / str(season)
+        if stat_dir.exists():
+            frames = []
+            for f in sorted(stat_dir.glob("*.parquet")):
+                cols = ["home_team", "away_team", "inning_topbot"] + [f"fielder_{i}" for i in range(3, 10)]
+                try:
+                    frames.append(pd.read_parquet(f, columns=cols))
+                except Exception:
+                    pass
+            if frames:
+                stat_df = pd.concat(frames, ignore_index=True)
+            else:
+                return {}
+        else:
+            return {}
+    else:
+        cols = ["home_team", "away_team", "inning_topbot"] + [f"fielder_{i}" for i in range(3, 10)]
+        stat_df = pd.read_parquet(statcast_path, columns=cols)
+
+    # Determine fielding team: home when top of inning, away when bottom
+    stat_df["fielding_team"] = np.where(
+        stat_df["inning_topbot"] == "Top", stat_df["home_team"], stat_df["away_team"])
+
+    # For each fielder position, find most common team assignment
+    player_team = {}
+    for pos in range(3, 10):
+        col = f"fielder_{pos}"
+        if col in stat_df.columns:
+            pt = stat_df.groupby(col)["fielding_team"].agg(lambda x: x.mode().iloc[0] if len(x) > 0 else None)
+            for pid, team in pt.items():
+                if pd.notna(pid) and team:
+                    player_team[int(pid)] = team
+
+    # Aggregate OAA by team
+    team_oaa = {}
+    team_counts = {}
+    for pid, oaa_val in player_oaa.items():
+        team = player_team.get(int(pid))
+        if team:
+            team_oaa[team] = team_oaa.get(team, 0) + oaa_val
+            team_counts[team] = team_counts.get(team, 0) + 1
+
+    # Return average OAA per player on roster
+    result = {}
+    for team in team_oaa:
+        if team_counts[team] > 0:
+            result[team] = team_oaa[team] / team_counts[team]
+    return result
+
+
+def _compute_team_priors(prior_year: int) -> dict[str, float]:
+    """
+    Compute preseason team strength prior from prior season win%.
+    Returns {team_abbr: win_pct} centered at 0.5.
+    """
+    games_path = GAMES_DIR / f"games_{prior_year}.parquet"
+    if not games_path.exists():
+        return {}
+    games = pd.read_parquet(games_path)
+    games = games[games["game_type"] == "R"]
+
+    team_wins = {}
+    team_games = {}
+    for _, g in games.iterrows():
+        ht = g["home_team_abbr"]
+        at = g["away_team_abbr"]
+        hw = g["home_win"]
+        team_wins[ht] = team_wins.get(ht, 0) + hw
+        team_games[ht] = team_games.get(ht, 0) + 1
+        team_wins[at] = team_wins.get(at, 0) + (1 - hw)
+        team_games[at] = team_games.get(at, 0) + 1
+
+    priors = {}
+    for team in team_wins:
+        if team_games[team] > 0:
+            priors[team] = team_wins[team] / team_games[team]
+    return priors
+
+
 def build_game_features(
     target_year: int,
     n_pitcher_pitches: int = 2000,
@@ -1230,6 +1391,18 @@ def build_game_features(
         print(f"  Weather data for {len(weather_map)} games")
     else:
         print(f"  WARNING: No weather data for {target_year}")
+
+    # Load team OAA from prior season (no lookahead)
+    team_oaa = _load_team_oaa(target_year - 1)
+    if team_oaa:
+        print(f"  Team OAA from {target_year - 1}: {len(team_oaa)} teams")
+    else:
+        print(f"  WARNING: No OAA data for {target_year - 1}")
+
+    # Compute team priors from prior season win%
+    team_priors = _compute_team_priors(target_year - 1)
+    if team_priors:
+        print(f"  Team priors from {target_year - 1}: {len(team_priors)} teams")
 
     # Build features for each game
     feature_rows = []
@@ -1408,6 +1581,14 @@ def build_game_features(
                 row[f"away_{k}"] = v
         else:
             row["away_def_xrv_delta"] = np.nan
+
+        # --- OAA defense (from prior season) ---
+        row["home_oaa_rate"] = team_oaa.get(home_team, 0.0)
+        row["away_oaa_rate"] = team_oaa.get(away_team, 0.0)
+
+        # --- Team strength prior (from prior season win%) ---
+        row["home_team_prior"] = team_priors.get(home_team, 0.5)
+        row["away_team_prior"] = team_priors.get(away_team, 0.5)
 
         # --- Park factor ---
         row["park_factor"] = park_factors.get(home_team, 1.0)
@@ -1620,6 +1801,14 @@ def build_game_features(
         ("matchup_xrv_sum", 1),
         ("platoon_pct", 1),         # more platoon advantage = better
         ("recent_form", 1),         # higher win% = better
+        # New: SP trend features
+        ("sp_velo_trend", -1),      # velo increasing = better for pitcher
+        ("sp_spin_trend", -1),      # spin increasing = better for pitcher
+        ("sp_xrv_trend", -1),       # xRV trending up = worse for pitcher
+        # New: OAA defense
+        ("oaa_rate", 1),            # higher OAA = better defense
+        # New: team strength prior
+        ("team_prior", 1),          # higher prior win% = stronger team
     ]
     for col, sign in diff_cols:
         home_col = f"home_{col}"
@@ -1633,6 +1822,12 @@ def build_game_features(
     if "home_sp_xrv_vs_lineup" in features_df.columns and "away_sp_xrv_vs_lineup" in features_df.columns:
         features_df["diff_sp_xrv_vs_lineup"] = -(
             features_df["home_sp_xrv_vs_lineup"] - features_df["away_sp_xrv_vs_lineup"]
+        )
+
+    # Context-aware SP xRV: home SP uses their home split, away SP uses road split
+    if "home_sp_home_xrv" in features_df.columns and "away_sp_away_xrv" in features_df.columns:
+        features_df["diff_sp_context_xrv"] = -(
+            features_df["home_sp_home_xrv"] - features_df["away_sp_away_xrv"]
         )
 
     # Save

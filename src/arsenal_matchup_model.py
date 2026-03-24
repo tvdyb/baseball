@@ -40,13 +40,11 @@ import numpy as np
 import pandas as pd
 import pymc as pm
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-XRV_DIR = DATA_DIR / "xrv"
-MODEL_DIR = Path(__file__).resolve().parent.parent / "models"
-
-HARD_TYPES = {"FF", "SI", "FC"}
-BREAK_TYPES = {"SL", "CU", "KC", "SV", "ST", "SW"}
-OFFSPEED_TYPES = {"CH", "FS"}
+from utils import (
+    DATA_DIR, XRV_DIR, MODEL_DIR,
+    HARD_TYPES, BREAK_TYPES, OFFSPEED_TYPES,
+    filter_competitive as _filter_competitive,
+)
 
 ARSENAL_FEATURES = [
     "hard_velo", "hard_pct", "break_pct", "offspeed_pct",
@@ -60,19 +58,6 @@ ARSENAL_FEATURES = [
     "vmov_range",     # range of avg pfx_z across pitch types (vertical separation)
 ]
 N_ARSENAL = len(ARSENAL_FEATURES)
-
-
-def _filter_competitive(df: pd.DataFrame) -> pd.DataFrame:
-    """Filter to pitches in competitive counts."""
-    if "balls" not in df.columns or "strikes" not in df.columns:
-        return df
-    exclude_mask = (
-        ((df["balls"] == 0) & (df["strikes"] == 2)) |
-        ((df["balls"] == 3) & (df["strikes"] == 0))
-    )
-    if "description" in df.columns:
-        exclude_mask = exclude_mask | df["description"].str.contains("intentional", case=False, na=False)
-    return df[~exclude_mask]
 
 
 def load_season_xrv(year: int) -> pd.DataFrame:

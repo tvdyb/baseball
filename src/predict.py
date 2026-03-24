@@ -36,13 +36,10 @@ from feature_engineering import (
     _compute_hand_arsenal_matchup, compute_arsenal_matchup_xrv,
     compute_bullpen_arsenal_matchup_xrv, _compute_pitcher_arsenal_live,
     _standardize_arsenal, _filter_competitive,
+    _load_team_oaa, _compute_team_priors,
 )
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-XRV_DIR = DATA_DIR / "xrv"
-GAMES_DIR = DATA_DIR / "games"
-FEATURES_DIR = DATA_DIR / "features"
-MODEL_DIR = Path(__file__).resolve().parent.parent / "models"
+from utils import DATA_DIR, XRV_DIR, GAMES_DIR, FEATURES_DIR, MODEL_DIR, OAA_DIR
 MLB_API = "https://statsapi.mlb.com/api/v1"
 
 # Same feature set as win_model.py
@@ -69,6 +66,16 @@ DIFF_FEATURES = [
     "diff_platoon_pct",
     "diff_recent_form",
     "diff_sp_xrv_vs_lineup",
+    # SP trend features
+    "diff_sp_velo_trend",
+    "diff_sp_spin_trend",
+    "diff_sp_xrv_trend",
+    # OAA defense
+    "diff_oaa_rate",
+    # Team strength prior
+    "diff_team_prior",
+    # Context-aware SP xRV
+    "diff_sp_context_xrv",
 ]
 
 RAW_FEATURES = [
@@ -301,6 +308,16 @@ def build_live_features(
     else:
         park_factors = {}
 
+    # Load team OAA from prior season
+    team_oaa = _load_team_oaa(year - 1)
+    if team_oaa:
+        print(f"  Team OAA from {year - 1}: {len(team_oaa)} teams")
+
+    # Compute team priors from prior season win%
+    team_priors = _compute_team_priors(year - 1)
+    if team_priors:
+        print(f"  Team priors from {year - 1}: {len(team_priors)} teams")
+
     # Compute recent form from game results
     games_path = GAMES_DIR / f"games_{year}.parquet"
     team_history = {}
@@ -461,6 +478,14 @@ def build_live_features(
             else:
                 row[f"{side}_def_xrv_delta"] = np.nan
 
+        # --- OAA defense ---
+        row["home_oaa_rate"] = team_oaa.get(home_team, 0.0)
+        row["away_oaa_rate"] = team_oaa.get(away_team, 0.0)
+
+        # --- Team strength prior ---
+        row["home_team_prior"] = team_priors.get(home_team, 0.5)
+        row["away_team_prior"] = team_priors.get(away_team, 0.5)
+
         # --- Park factor ---
         row["park_factor"] = park_factors.get(home_team, 1.0)
 
@@ -553,6 +578,9 @@ def build_live_features(
         ("arsenal_matchup_xrv_mean", 1), ("arsenal_matchup_xrv_sum", 1),
         ("bp_arsenal_matchup_xrv_mean", -1),
         ("platoon_pct", 1), ("recent_form", 1),
+        # New features
+        ("sp_velo_trend", -1), ("sp_spin_trend", -1), ("sp_xrv_trend", -1),
+        ("oaa_rate", 1), ("team_prior", 1),
     ]
     for col, sign in diff_cols:
         hc = f"home_{col}"
@@ -563,6 +591,12 @@ def build_live_features(
     if "home_sp_xrv_vs_lineup" in features_df.columns and "away_sp_xrv_vs_lineup" in features_df.columns:
         features_df["diff_sp_xrv_vs_lineup"] = -(
             features_df["home_sp_xrv_vs_lineup"] - features_df["away_sp_xrv_vs_lineup"]
+        )
+
+    # Context-aware SP xRV: home SP uses home split, away SP uses away split
+    if "home_sp_home_xrv" in features_df.columns and "away_sp_away_xrv" in features_df.columns:
+        features_df["diff_sp_context_xrv"] = -(
+            features_df["home_sp_home_xrv"] - features_df["away_sp_away_xrv"]
         )
 
     return features_df

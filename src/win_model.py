@@ -33,9 +33,7 @@ try:
 except ImportError:
     HAS_XGB = False
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-FEATURES_DIR = DATA_DIR / "features"
-MODEL_DIR = Path(__file__).resolve().parent.parent / "models"
+from utils import DATA_DIR, FEATURES_DIR, MODEL_DIR
 
 
 # Features to use (differentials are cleaner for the model)
@@ -62,6 +60,16 @@ DIFF_FEATURES = [
     "diff_platoon_pct",
     "diff_recent_form",
     "diff_sp_xrv_vs_lineup",
+    # SP trend features
+    "diff_sp_velo_trend",
+    "diff_sp_spin_trend",
+    "diff_sp_xrv_trend",
+    # OAA defense
+    "diff_oaa_rate",
+    # Team strength prior
+    "diff_team_prior",
+    # Context-aware SP xRV (home split for home SP, away split for away SP)
+    "diff_sp_context_xrv",
 ]
 
 RAW_FEATURES = [
