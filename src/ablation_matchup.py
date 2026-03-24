@@ -80,6 +80,23 @@ WEATHER_FEATURES = [
     "wind_in",
 ]
 
+# New feature groups
+TREND_FEATURES = [
+    "diff_sp_velo_trend",
+    "diff_sp_spin_trend",
+    "diff_sp_xrv_trend",
+    "diff_sp_transition_entropy",
+]
+
+DEFENSE_FEATURES = [
+    "diff_oaa_rate",
+]
+
+PRIOR_FEATURES = [
+    "diff_team_prior",
+    "diff_sp_context_xrv",
+]
+
 
 def load_features(years):
     frames = []
@@ -145,6 +162,8 @@ def main():
 
     STUFF_PLATOON = BASE_FEATURES + STUFF_FEATURES + PLATOON_FEATURES
 
+    ALL_NEW = TREND_FEATURES + DEFENSE_FEATURES + PRIOR_FEATURES
+
     configs = [
         ("1. Base (hitting/defense/form)",      BASE_FEATURES),
         ("2. + Stuff grade",                    BASE_FEATURES + STUFF_FEATURES),
@@ -152,7 +171,8 @@ def main():
         ("4. + Old matchup",                    STUFF_PLATOON + OLD_MATCHUP_FEATURES),
         ("5. + Arsenal matchup (new)",          STUFF_PLATOON + ARSENAL_MATCHUP_FEATURES),
         ("6. + Old + Arsenal (both)",           STUFF_PLATOON + OLD_MATCHUP_FEATURES + ARSENAL_MATCHUP_FEATURES),
-        ("7. Full (+ weather)",                 STUFF_PLATOON + OLD_MATCHUP_FEATURES + ARSENAL_MATCHUP_FEATURES + WEATHER_FEATURES),
+        ("7. + Weather",                        STUFF_PLATOON + OLD_MATCHUP_FEATURES + ARSENAL_MATCHUP_FEATURES + WEATHER_FEATURES),
+        ("8. + Trends/OAA/Priors",              STUFF_PLATOON + OLD_MATCHUP_FEATURES + ARSENAL_MATCHUP_FEATURES + WEATHER_FEATURES + ALL_NEW),
     ]
 
     print(f"\n{'Model':<40} {'Feats':>5} {'Avg AUC':>8} {'Avg LL':>8} {'vs Base':>10} {'vs Stuff':>10}")

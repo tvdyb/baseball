@@ -324,14 +324,117 @@ def build_xrv_for_year(year: int, cv: bool = False):
     return model, model_type
 
 
+def build_xrv_pooled(seasons: list[int], cv: bool = False):
+    """
+    Train a single contact model on pooled seasons, then apply to each season.
+    More training data = better contact model, especially for rare batted ball types.
+    """
+    print(f"\n{'='*60}")
+    print(f"Building pooled xRV model across {seasons}")
+    print(f"{'='*60}")
+
+    # Load all seasons
+    all_dfs = {}
+    for year in sorted(seasons):
+        df = load_and_prepare(year)
+        if df.empty:
+            continue
+        all_dfs[year] = df
+        print(f"  {year}: {len(df):,} pitches")
+
+    if not all_dfs:
+        print("  No data loaded!")
+        return
+
+    # Pool contact data for training
+    pooled_contact_frames = []
+    for year, df in all_dfs.items():
+        X, y, features, cat_features = prepare_contact_features(df)
+        contact = pd.concat([X, y], axis=1)
+        pooled_contact_frames.append(contact)
+
+    pooled = pd.concat(pooled_contact_frames, ignore_index=True)
+    X_pooled = pooled[["launch_speed", "launch_angle", "spray_angle", "sprint_speed", "park"]]
+    y_pooled = pooled["delta_run_exp"]
+    features = ["launch_speed", "launch_angle", "spray_angle", "sprint_speed"]
+    cat_features = ["park"]
+
+    # Ensure park is categorical
+    X_pooled = X_pooled.copy()
+    X_pooled["park"] = X_pooled["park"].astype("category")
+
+    print(f"  Pooled contact events: {len(X_pooled):,}")
+
+    if cv:
+        print("  Running 5-fold CV on pooled data...")
+        rmse, r2 = cross_validate(X_pooled, y_pooled, features, cat_features)
+        print(f"  Pooled CV RMSE: {rmse:.4f}, R²: {r2:.4f}")
+
+    # Train pooled model
+    print("  Training pooled contact xRV model...")
+    model, model_type = train_xrv_model(X_pooled, y_pooled, features, cat_features)
+    print(f"  Model type: {model_type}")
+
+    # Apply to each season
+    for year, df in all_dfs.items():
+        print(f"\n  Applying pooled model to {year}...")
+        df["xrv"] = df["delta_run_exp"].copy()
+
+        contact_mask = (df["type"] == "X") & df["launch_speed"].notna() & df["launch_angle"].notna()
+        contact_rows = df.loc[contact_mask].copy()
+
+        if len(contact_rows) > 0:
+            league_avg_sprint = df.loc[contact_mask, "sprint_speed"].median()
+            if pd.isna(league_avg_sprint):
+                league_avg_sprint = 27.0
+            contact_rows["sprint_speed"] = contact_rows["sprint_speed"].fillna(league_avg_sprint)
+            contact_rows["park"] = contact_rows["park"].astype("category")
+
+            X_contact = contact_rows[features + cat_features]
+            preds = predict_xrv(model, model_type, X_contact, features, cat_features)
+            df.loc[contact_mask, "xrv"] = preds
+
+        non_null = df["xrv"].notna().sum()
+        print(f"    xRV assigned: {non_null:,}/{len(df):,}")
+
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        out_path = OUTPUT_DIR / f"statcast_xrv_{year}.parquet"
+        keep_cols = [
+            "game_pk", "game_date", "season", "at_bat_number", "pitch_number",
+            "pitcher", "batter", "home_team", "away_team",
+            "inning", "inning_topbot",
+            "pitch_type", "release_speed", "release_spin_rate",
+            "pfx_x", "pfx_z", "plate_x", "plate_z",
+            "effective_speed", "release_extension",
+            "release_pos_x", "release_pos_z", "spin_axis",
+            "balls", "strikes", "outs_when_up",
+            "on_1b", "on_2b", "on_3b",
+            "stand", "p_throws",
+            "type", "description", "events",
+            "launch_speed", "launch_angle", "spray_angle",
+            "sprint_speed", "park",
+            "bb_type", "zone",
+            "delta_run_exp", "xrv",
+            "game_type",
+        ]
+        keep_cols = [c for c in keep_cols if c in df.columns]
+        df[keep_cols].to_parquet(out_path, index=False)
+        print(f"    Saved to {out_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Build xRV model")
     parser.add_argument("--seasons", type=int, nargs="+", default=list(range(2017, 2026)))
     parser.add_argument("--cv", action="store_true", help="Run cross-validation")
+    parser.add_argument("--pool", action="store_true",
+                        help="Train a single model on all seasons combined (better for rare events)")
     args = parser.parse_args()
 
-    for year in sorted(args.seasons):
-        build_xrv_for_year(year, cv=args.cv)
+    if args.pool:
+        build_xrv_pooled(args.seasons, cv=args.cv)
+    else:
+        for year in sorted(args.seasons):
+            build_xrv_for_year(year, cv=args.cv)
 
     print(f"\n{'='*60}")
     print("Done building xRV for all seasons.")
