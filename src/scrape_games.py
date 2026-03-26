@@ -84,6 +84,7 @@ def parse_game(g: dict) -> dict | None:
     return {
         "game_pk": g.get("gamePk"),
         "game_date": g.get("officialDate", g.get("gameDate", "")[:10]),
+        "game_datetime": g.get("gameDate", ""),  # ISO datetime with timezone
         "game_type": g.get("gameType", ""),
         "season": g.get("seasonDisplay", ""),
         "status": status,

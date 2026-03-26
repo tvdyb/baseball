@@ -4,7 +4,8 @@ Scrape Kalshi MLB game market data for backtesting.
 
 Fetches:
   1. All settled KXMLBGAME markets (team, result, volume)
-  2. Pre-game closing prices via previous_price_dollars + candlestick fallback
+  2. Pre-game closing prices using actual first-pitch timestamps
+     from games parquet + candlestick endpoint
 
 Usage:
     python src/scrape_kalshi.py --year 2025
@@ -21,6 +22,7 @@ import pandas as pd
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 KALSHI_DIR = DATA_DIR / "kalshi"
+GAMES_DIR = DATA_DIR / "games"
 API_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 
 # Kalshi team abbreviations → our abbreviations
@@ -40,7 +42,6 @@ MONTH_MAP = {
     "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
 }
 
-# All known Kalshi team abbreviations (2-3 chars)
 KNOWN_TEAMS = set(TEAM_MAP.keys())
 
 
@@ -50,23 +51,19 @@ def parse_event_ticker(event_ticker: str) -> dict | None:
     if len(parts) < 2:
         return None
 
-    code = parts[1]  # e.g. "25AUG26DETATH" or "26MAR252005NYYSF"
+    code = parts[1]
 
-    # Extract: 2-digit year, 3-letter month, then the rest
     m = re.match(r"(\d{2})([A-Z]{3})(.+)", code)
     if not m:
         return None
 
     year = 2000 + int(m.group(1))
     month = MONTH_MAP.get(m.group(2))
-    remainder = m.group(3)  # e.g. "26DETATH" or "252005NYYSF"
+    remainder = m.group(3)
 
     if not month:
         return None
 
-    # Try to parse day + optional time + teams
-    # Day is 1-2 digits, then optional 4-digit time (HHMM), then team codes
-    best = None
     for day_len in [2, 1]:
         if len(remainder) < day_len:
             continue
@@ -79,40 +76,34 @@ def parse_event_ticker(event_ticker: str) -> dict | None:
 
         rest = remainder[day_len:]
 
-        # Try with 4-digit time prefix
         for time_len in [4, 0]:
             if time_len > 0 and len(rest) >= time_len and rest[:time_len].isdigit():
                 team_str = rest[time_len:]
             elif time_len == 0:
-                # Skip if rest starts with digits (it's probably a time code)
                 if rest and rest[0].isdigit():
                     continue
                 team_str = rest
             else:
                 continue
 
-            # Parse teams from team_str
             away_team, home_team = _parse_teams(team_str)
             if away_team and home_team:
                 try:
                     game_date = f"{year}-{month:02d}-{day:02d}"
-                    # Validate date
                     datetime(year, month, day)
-                    best = {
+                    return {
                         "game_date": game_date,
                         "away_team": away_team,
                         "home_team": home_team,
                     }
-                    return best
                 except ValueError:
                     continue
 
-    return best
+    return None
 
 
 def _parse_teams(team_str: str) -> tuple[str | None, str | None]:
     """Parse 'DETATH' or 'NYYSF' into (away, home) abbreviations."""
-    # Try all splits: away_len in [2, 3], home is the rest
     for away_len in [3, 2]:
         if len(team_str) < away_len + 2:
             continue
@@ -177,7 +168,6 @@ def group_markets_by_event(markets: list[dict], year: int) -> dict:
                 "markets": {},
             }
 
-        # Figure out which team this market is for
         ticker_suffix = m["ticker"].split("-")[-1]
         team = TEAM_MAP.get(ticker_suffix, ticker_suffix)
 
@@ -195,18 +185,47 @@ def group_markets_by_event(markets: list[dict], year: int) -> dict:
     return events
 
 
+def load_game_start_times(year: int) -> dict:
+    """Load actual first-pitch timestamps from games parquet.
+
+    Returns dict mapping (game_date, home_team, away_team) → unix timestamp.
+    """
+    games_path = GAMES_DIR / f"games_{year}.parquet"
+    if not games_path.exists():
+        print(f"  WARNING: {games_path} not found — will use fallback timing")
+        return {}
+
+    df = pd.read_parquet(games_path)
+    df["game_date"] = df["game_date"].astype(str)
+
+    start_times = {}
+    for _, row in df.iterrows():
+        gdt = row.get("game_datetime", "")
+        if not gdt:
+            continue
+        try:
+            dt = datetime.fromisoformat(gdt.replace("Z", "+00:00"))
+            key = (row["game_date"], row["home_team_abbr"], row["away_team_abbr"])
+            start_times[key] = dt.timestamp()
+        except (ValueError, TypeError):
+            continue
+
+    print(f"  Loaded {len(start_times)} game start times from {games_path}")
+    return start_times
+
+
 def fetch_pregame_price_candle(
     client: httpx.Client,
     ticker: str,
     open_time: str,
     close_time: str,
+    game_start_ts: float,
 ) -> float | None:
     """Fetch the pre-game closing price using candlesticks.
 
-    Strategies (in order):
-    1. Last candle with reasonable price before game-time region
-    2. Walk backwards to find last stable price
-    3. Any candle with reasonable price
+    Uses the actual game start timestamp to find the last candle with a
+    reasonable price (0.08-0.92) that ends BEFORE first pitch.
+    No fallback strategies — if there's no pre-game price, return None.
     """
     try:
         close_dt = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
@@ -229,8 +248,6 @@ def fetch_pregame_price_candle(
         if not candles:
             return None
 
-        close_ts = close_dt.timestamp()
-
         # Collect candles with valid prices
         valid = []
         for c in candles:
@@ -238,35 +255,20 @@ def fetch_pregame_price_candle(
             close_p = price_data.get("close_dollars")
             if close_p is None:
                 continue
-            close_p = float(close_p)
-            vol = float(c.get("volume_fp") or 0)
-            valid.append((c["end_period_ts"], close_p, vol))
+            valid.append((c["end_period_ts"], float(close_p)))
 
         if not valid:
             return None
 
-        # Strategy 1: Find candles in the pre-game window
-        # Game starts ~3-4h before market close
-        game_start_ts = close_ts - 3.5 * 3600
-
-        # Get last reasonable price before game start
+        # Find last candle that ends before game start (with 5-min buffer)
+        # and has a reasonable price (0.08-0.92)
+        cutoff_ts = game_start_ts + 300  # 5-minute buffer
         pre_game = [
-            (ts, p, v) for ts, p, v in valid
-            if ts <= game_start_ts + 1800 and 0.08 <= p <= 0.92
+            (ts, p) for ts, p in valid
+            if ts <= cutoff_ts and 0.08 <= p <= 0.92
         ]
         if pre_game:
-            return pre_game[-1][1]  # last one (closest to game start)
-
-        # Strategy 2: Walk backwards from end, find last "stable" price
-        # (before in-game moves push to extremes)
-        for ts, p, v in reversed(valid):
-            if 0.10 <= p <= 0.90:
-                return p
-
-        # Strategy 3: Any reasonable price
-        for ts, p, v in valid:
-            if 0.05 <= p <= 0.95:
-                return p
+            return pre_game[-1][1]  # last one (closest to first pitch)
 
         return None
 
@@ -274,57 +276,96 @@ def fetch_pregame_price_candle(
         return None
 
 
-def fetch_all_pregame_prices(events: dict) -> dict:
+def fetch_all_pregame_prices(
+    events: dict, game_start_times: dict
+) -> dict:
     """Fetch pre-game prices for all events.
 
-    Uses previous_price_dollars first, falls back to candlestick extraction.
+    Uses previous_price_dollars first (validated against game start time),
+    then falls back to candlestick extraction using actual first-pitch times.
     """
-    # First pass: use previous_price_dollars where available
     results = {}
     need_candles = []
+    no_start_time = 0
+    prev_price_used = 0
+    prev_price_stale = 0
 
     for event_ticker, event in events.items():
         home_team = event["home_team"]
+        away_team = event["away_team"]
+        game_date = event["game_date"]
         home_market = event["markets"].get(home_team)
 
         if not home_market:
             continue
 
+        # Look up actual game start time
+        gst_key = (game_date, home_team, away_team)
+        game_start_ts = game_start_times.get(gst_key)
+
+        if game_start_ts is None:
+            no_start_time += 1
+            # Can't validate previous_price or anchor candles without start time
+            # Skip this game
+            continue
+
+        # Try previous_price_dollars, but validate it's not stale
         prev_price = home_market.get("previous_price")
-        if prev_price is not None:
+        close_time = home_market.get("close_time", "")
+        if prev_price is not None and close_time:
             prev_price = float(prev_price)
             if 0.05 <= prev_price <= 0.95:
-                results[event_ticker] = prev_price
-                continue
+                # Validate: market close_time should be within ~6h of game start
+                try:
+                    close_dt = datetime.fromisoformat(
+                        close_time.replace("Z", "+00:00")
+                    )
+                    hours_diff = abs(close_dt.timestamp() - game_start_ts) / 3600
+                    if hours_diff <= 6:
+                        results[event_ticker] = prev_price
+                        prev_price_used += 1
+                        continue
+                    else:
+                        prev_price_stale += 1
+                except (ValueError, TypeError):
+                    pass
 
         # Need candlestick fallback
         if home_market.get("open_time") and home_market.get("close_time"):
-            need_candles.append((event_ticker, home_market))
+            need_candles.append((event_ticker, home_market, game_start_ts))
 
-    print(f"    {len(results)} from previous_price_dollars")
+    print(f"    {prev_price_used} from previous_price_dollars")
+    print(f"    {prev_price_stale} previous_price rejected (stale)")
+    print(f"    {no_start_time} skipped (no game start time)")
     print(f"    {len(need_candles)} need candlestick extraction")
 
     if not need_candles:
         return results
 
-    # Second pass: synchronous candlestick extraction
+    # Synchronous candlestick extraction
     candle_found = 0
     with httpx.Client(timeout=15.0) as client:
-        for i, (event_ticker, market) in enumerate(need_candles):
+        for i, (event_ticker, market, game_start_ts) in enumerate(need_candles):
             price = fetch_pregame_price_candle(
                 client,
                 market["ticker"],
                 market["open_time"],
                 market["close_time"],
+                game_start_ts,
             )
             if price is not None:
                 results[event_ticker] = price
                 candle_found += 1
 
             if (i + 1) % 100 == 0 or i + 1 == len(need_candles):
-                print(f"    candles: {i + 1}/{len(need_candles)} ({candle_found} found)")
+                print(
+                    f"    candles: {i + 1}/{len(need_candles)} ({candle_found} found)"
+                )
 
-            time.sleep(0.05)  # rate limit
+            time.sleep(0.05)
+
+    no_price = len(need_candles) - candle_found
+    print(f"    {no_price} games had no pre-game candle price")
 
     return results
 
@@ -383,8 +424,11 @@ def main():
     events = group_markets_by_event(markets, args.year)
     print(f"  {len(events)} games found")
 
+    print(f"\nLoading game start times...")
+    game_start_times = load_game_start_times(args.year)
+
     print(f"\nFetching pre-game prices...")
-    prices = fetch_all_pregame_prices(events)
+    prices = fetch_all_pregame_prices(events, game_start_times)
     print(f"  Got prices for {len(prices)}/{len(events)} games")
 
     print(f"\nBuilding dataset...")
@@ -393,12 +437,11 @@ def main():
     print(f"  Saved {len(df)} games to {output_path}")
 
     if len(df) > 0:
-        print(f"\n  Date range: {df['game_date'].min()} → {df['game_date'].max()}")
+        print(f"\n  Date range: {df['game_date'].min()} -> {df['game_date'].max()}")
         print(f"  Avg Kalshi home prob: {df['kalshi_home_prob'].mean():.3f}")
         print(f"  Home win rate: {df['home_win'].mean():.3f}")
         print(f"  Avg volume/game: ${df['volume'].mean():,.0f}")
 
-        # Monthly breakdown
         df["month"] = df["game_date"].str[:7]
         print(f"\n  By month:")
         for month in sorted(df["month"].unique()):
