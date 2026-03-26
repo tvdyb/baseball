@@ -5,7 +5,7 @@ Scrape Kalshi MLB game market data for backtesting.
 Fetches:
   1. All settled KXMLBGAME markets (team, result, volume)
   2. Pre-game closing prices using actual first-pitch timestamps
-     from games parquet + candlestick endpoint
+     from games parquet + candlestick endpoints (historical + live)
 
 Usage:
     python src/scrape_kalshi.py --year 2025
@@ -13,12 +13,18 @@ Usage:
 
 import argparse
 import re
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
 import pandas as pd
+
+
+def log(msg: str):
+    print(msg)
+    sys.stdout.flush()
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 KALSHI_DIR = DATA_DIR / "kalshi"
@@ -119,7 +125,7 @@ def fetch_all_markets(year: int) -> list[dict]:
     all_markets = []
     cursor = ""
 
-    with httpx.Client(timeout=30.0) as client:
+    with httpx.Client(timeout=60.0) as client:
         while True:
             params = {
                 "series_ticker": "KXMLBGAME",
@@ -129,8 +135,17 @@ def fetch_all_markets(year: int) -> list[dict]:
             if cursor:
                 params["cursor"] = cursor
 
-            resp = client.get(f"{API_BASE}/markets", params=params)
-            resp.raise_for_status()
+            for attempt in range(3):
+                try:
+                    resp = client.get(f"{API_BASE}/markets", params=params)
+                    resp.raise_for_status()
+                    break
+                except (httpx.TimeoutException, httpx.HTTPStatusError):
+                    if attempt < 2:
+                        time.sleep((attempt + 1) * 3)
+                    else:
+                        raise
+
             data = resp.json()
 
             markets = data.get("markets", [])
@@ -143,10 +158,27 @@ def fetch_all_markets(year: int) -> list[dict]:
             if not cursor:
                 break
 
-            time.sleep(0.1)
+            time.sleep(0.3)
 
-    print(f"  Fetched {len(all_markets)} total markets")
+    log(f"  Fetched {len(all_markets)} total markets")
     return all_markets
+
+
+def fetch_historical_cutoff() -> float:
+    """Fetch the archival cutoff timestamp from Kalshi.
+
+    Markets settled before this timestamp are archived and must use
+    the /historical/ endpoint for candlestick data.
+    """
+    with httpx.Client(timeout=15.0) as client:
+        resp = client.get(f"{API_BASE}/historical/cutoff")
+        resp.raise_for_status()
+        data = resp.json()
+
+    ts_str = data["market_settled_ts"]
+    cutoff_dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+    log(f"  Historical cutoff: {ts_str}")
+    return cutoff_dt.timestamp()
 
 
 def group_markets_by_event(markets: list[dict], year: int) -> dict:
@@ -178,8 +210,6 @@ def group_markets_by_event(markets: list[dict], year: int) -> dict:
             "open_interest": float(m.get("open_interest_fp") or 0),
             "open_time": m.get("open_time"),
             "close_time": m.get("close_time"),
-            "previous_price": m.get("previous_price_dollars"),
-            "last_price": m.get("last_price_dollars"),
         }
 
     return events
@@ -192,7 +222,7 @@ def load_game_start_times(year: int) -> dict:
     """
     games_path = GAMES_DIR / f"games_{year}.parquet"
     if not games_path.exists():
-        print(f"  WARNING: {games_path} not found — will use fallback timing")
+        log(f"  WARNING: {games_path} not found — will use fallback timing")
         return {}
 
     df = pd.read_parquet(games_path)
@@ -210,85 +240,257 @@ def load_game_start_times(year: int) -> dict:
         except (ValueError, TypeError):
             continue
 
-    print(f"  Loaded {len(start_times)} game start times from {games_path}")
+    log(f"  Loaded {len(start_times)} game start times from {games_path}")
     return start_times
 
 
-def fetch_pregame_price_candle(
-    client: httpx.Client,
-    ticker: str,
-    open_time: str,
-    close_time: str,
-    game_start_ts: float,
-) -> float | None:
-    """Fetch the pre-game closing price using candlesticks.
+def _extract_candle_close(price_data: dict) -> float | None:
+    """Extract close price from a candlestick, handling both API schemas.
 
-    Uses the actual game start timestamp to find the last candle with a
-    reasonable price (0.08-0.92) that ends BEFORE first pitch.
-    No fallback strategies — if there's no pre-game price, return None.
+    Live endpoint uses: price.close_dollars
+    Historical endpoint uses: price.close
     """
-    try:
-        close_dt = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
-        open_dt = datetime.fromisoformat(open_time.replace("Z", "+00:00"))
+    # Try live schema first, then historical
+    close_p = price_data.get("close_dollars")
+    if close_p is None:
+        close_p = price_data.get("close")
+    if close_p is None:
+        return None
+    return float(close_p)
 
-        start_ts = int(open_dt.timestamp())
-        end_ts = int(close_dt.timestamp())
 
-        resp = client.get(
-            f"{API_BASE}/series/KXMLBGAME/markets/{ticker}/candlesticks",
-            params={
-                "period_interval": 60,
-                "start_ts": start_ts,
-                "end_ts": end_ts,
-            },
-        )
-        resp.raise_for_status()
-        candles = resp.json().get("candlesticks", [])
+def _find_pregame_price(candles: list[dict], game_start_ts: float) -> float | None:
+    """Extract the last pre-game closing price from a list of candles.
 
-        if not candles:
+    Finds the last candle ending before game_start_ts + 5min buffer
+    with a reasonable price (0.08-0.92).
+    """
+    valid = []
+    for c in candles:
+        price_data = c.get("price", {})
+        close_p = _extract_candle_close(price_data)
+        if close_p is None:
+            continue
+        valid.append((c["end_period_ts"], close_p))
+
+    if not valid:
+        return None
+
+    cutoff_ts = game_start_ts + 300  # 5-minute buffer
+    pre_game = [
+        (ts, p) for ts, p in valid
+        if ts <= cutoff_ts and 0.08 <= p <= 0.92
+    ]
+    if pre_game:
+        return pre_game[-1][1]  # last one (closest to first pitch)
+
+    return None
+
+
+def _fetch_candles_with_retry(
+    client: httpx.Client, url: str, params: dict, max_retries: int = 3,
+) -> list[dict] | None:
+    """Fetch candlesticks with retry and exponential backoff.
+
+    Returns list of candles on success, None on permanent failure.
+    """
+    for attempt in range(max_retries):
+        try:
+            resp = client.get(url, params=params)
+            if resp.status_code == 404:
+                return None  # Market not found on this endpoint
+            resp.raise_for_status()
+            return resp.json().get("candlesticks", [])
+        except (httpx.TimeoutException, httpx.HTTPStatusError) as e:
+            if attempt < max_retries - 1:
+                backoff = (attempt + 1) * 2
+                time.sleep(backoff)
+            else:
+                return None
+        except Exception:
             return None
+    return None
 
-        # Collect candles with valid prices
-        valid = []
-        for c in candles:
-            price_data = c.get("price", {})
-            close_p = price_data.get("close_dollars")
-            if close_p is None:
+
+def fetch_pregame_prices_individual(
+    client: httpx.Client,
+    markets_to_fetch: list[tuple[str, dict, float]],
+) -> tuple[dict, dict]:
+    """Fetch pre-game prices for markets via individual candlestick requests.
+
+    Tries historical endpoint first, falls back to live endpoint.
+
+    Returns:
+        (results dict, stats dict)
+    """
+    results = {}
+    stats = {
+        "found_hourly": 0, "found_daily": 0,
+        "no_candles": 0, "no_pregame": 0, "error": 0,
+        "via_historical": 0, "via_live": 0,
+    }
+
+    for i, (event_ticker, market, game_start_ts) in enumerate(markets_to_fetch):
+        ticker = market["ticker"]
+        try:
+            open_dt = datetime.fromisoformat(market["open_time"].replace("Z", "+00:00"))
+            close_dt = datetime.fromisoformat(market["close_time"].replace("Z", "+00:00"))
+            start_ts = int(open_dt.timestamp())
+            end_ts = int(close_dt.timestamp())
+            params = {"period_interval": 60, "start_ts": start_ts, "end_ts": end_ts}
+
+            # Try historical endpoint first
+            candles = _fetch_candles_with_retry(
+                client, f"{API_BASE}/historical/markets/{ticker}/candlesticks", params,
+            )
+            source = "historical"
+
+            # Fall back to live endpoint if historical returns 404 or None
+            if candles is None:
+                candles = _fetch_candles_with_retry(
+                    client, f"{API_BASE}/series/KXMLBGAME/markets/{ticker}/candlesticks", params,
+                )
+                source = "live"
+
+            if candles is None:
+                stats["error"] += 1
+                time.sleep(0.1)
                 continue
-            valid.append((c["end_period_ts"], float(close_p)))
 
-        if not valid:
-            return None
+            price = _find_pregame_price(candles, game_start_ts)
+            if price is not None:
+                results[event_ticker] = price
+                stats["found_hourly"] += 1
+                stats[f"via_{source}"] += 1
+            elif candles:
+                # Had candles but none were pre-game or in range
+                # Try daily candles as fallback for illiquid markets
+                daily_params = {"period_interval": 1440, "start_ts": start_ts, "end_ts": end_ts}
+                if source == "historical":
+                    daily_url = f"{API_BASE}/historical/markets/{ticker}/candlesticks"
+                else:
+                    daily_url = f"{API_BASE}/series/KXMLBGAME/markets/{ticker}/candlesticks"
+                daily = _fetch_candles_with_retry(client, daily_url, daily_params)
+                if daily:
+                    price = _find_pregame_price(daily, game_start_ts)
+                    if price is not None:
+                        results[event_ticker] = price
+                        stats["found_daily"] += 1
+                        stats[f"via_{source}"] += 1
+                    else:
+                        stats["no_pregame"] += 1
+                else:
+                    stats["no_pregame"] += 1
+                time.sleep(0.1)
+            else:
+                stats["no_candles"] += 1
 
-        # Find last candle that ends before game start (with 5-min buffer)
-        # and has a reasonable price (0.08-0.92)
-        cutoff_ts = game_start_ts + 300  # 5-minute buffer
-        pre_game = [
-            (ts, p) for ts, p in valid
-            if ts <= cutoff_ts and 0.08 <= p <= 0.92
-        ]
-        if pre_game:
-            return pre_game[-1][1]  # last one (closest to first pitch)
+        except Exception:
+            stats["error"] += 1
 
-        return None
+        if (i + 1) % 100 == 0 or i + 1 == len(markets_to_fetch):
+            found = stats["found_hourly"] + stats["found_daily"]
+            log(f"    progress: {i + 1}/{len(markets_to_fetch)} ({found} found)")
 
-    except Exception:
-        return None
+        time.sleep(0.1)
+
+    return results, stats
+
+
+def fetch_pregame_prices_live_batch(
+    client: httpx.Client,
+    markets_to_fetch: list[tuple[str, dict, float]],
+) -> tuple[dict, dict]:
+    """Fetch pre-game prices for live markets via batch /markets/candlesticks.
+
+    Batches up to 60 tickers per request.
+
+    Returns:
+        (results dict, stats dict)
+    """
+    results = {}
+    stats = {"found_hourly": 0, "found_daily": 0, "no_candles": 0, "no_pregame": 0, "error": 0}
+
+    if not markets_to_fetch:
+        return results, stats
+
+    # Build lookup: ticker -> (event_ticker, game_start_ts, open_ts, end_ts)
+    ticker_info = {}
+    for event_ticker, market, game_start_ts in markets_to_fetch:
+        ticker = market["ticker"]
+        try:
+            open_dt = datetime.fromisoformat(market["open_time"].replace("Z", "+00:00"))
+            close_dt = datetime.fromisoformat(market["close_time"].replace("Z", "+00:00"))
+            ticker_info[ticker] = (event_ticker, game_start_ts, int(open_dt.timestamp()), int(close_dt.timestamp()))
+        except (ValueError, TypeError):
+            stats["error"] += 1
+
+    tickers = list(ticker_info.keys())
+    batch_size = 60
+
+    for batch_start in range(0, len(tickers), batch_size):
+        batch = tickers[batch_start:batch_start + batch_size]
+
+        # Find the overall time range for this batch
+        min_ts = min(ticker_info[t][2] for t in batch)
+        max_ts = max(ticker_info[t][3] for t in batch)
+
+        try:
+            resp = client.get(
+                f"{API_BASE}/markets/candlesticks",
+                params={
+                    "market_tickers": ",".join(batch),
+                    "series_ticker": "KXMLBGAME",
+                    "period_interval": 60,
+                    "start_ts": min_ts,
+                    "end_ts": max_ts,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            # Response: {"markets": [{"market_ticker": "...", "candlesticks": [...]}]}
+            by_ticker = {}
+            for m in data.get("markets", []):
+                by_ticker[m["market_ticker"]] = m.get("candlesticks", [])
+
+            for ticker in batch:
+                event_ticker, game_start_ts, _, _ = ticker_info[ticker]
+                candles = by_ticker.get(ticker, [])
+                if not candles:
+                    stats["no_candles"] += 1
+                    continue
+
+                price = _find_pregame_price(candles, game_start_ts)
+                if price is not None:
+                    results[event_ticker] = price
+                    stats["found_hourly"] += 1
+                else:
+                    stats["no_pregame"] += 1
+
+        except Exception:
+            stats["error"] += len(batch)
+
+        found = stats["found_hourly"] + stats["found_daily"]
+        processed = min(batch_start + batch_size, len(tickers))
+        log(f"    live batch: {processed}/{len(tickers)} ({found} found)")
+        time.sleep(0.2)
+
+    return results, stats
 
 
 def fetch_all_pregame_prices(
-    events: dict, game_start_times: dict
+    events: dict, game_start_times: dict, cutoff_ts: float,
 ) -> dict:
     """Fetch pre-game prices for all events.
 
-    Uses previous_price_dollars first (validated against game start time),
-    then falls back to candlestick extraction using actual first-pitch times.
+    Routes requests to historical or live endpoint based on the archival cutoff.
+    Always uses candlesticks — never previous_price_dollars.
     """
-    results = {}
-    need_candles = []
+    all_markets = []
+    live_markets = []
     no_start_time = 0
-    prev_price_used = 0
-    prev_price_stale = 0
+    no_home_market = 0
 
     for event_ticker, event in events.items():
         home_team = event["home_team"]
@@ -297,6 +499,11 @@ def fetch_all_pregame_prices(
         home_market = event["markets"].get(home_team)
 
         if not home_market:
+            no_home_market += 1
+            continue
+
+        if not home_market.get("open_time") or not home_market.get("close_time"):
+            no_home_market += 1
             continue
 
         # Look up actual game start time
@@ -305,67 +512,71 @@ def fetch_all_pregame_prices(
 
         if game_start_ts is None:
             no_start_time += 1
-            # Can't validate previous_price or anchor candles without start time
-            # Skip this game
             continue
 
-        # Try previous_price_dollars, but validate it's not stale
-        prev_price = home_market.get("previous_price")
-        close_time = home_market.get("close_time", "")
-        if prev_price is not None and close_time:
-            prev_price = float(prev_price)
-            if 0.05 <= prev_price <= 0.95:
-                # Validate: market close_time should be within ~6h of game start
-                try:
-                    close_dt = datetime.fromisoformat(
-                        close_time.replace("Z", "+00:00")
-                    )
-                    hours_diff = abs(close_dt.timestamp() - game_start_ts) / 3600
-                    if hours_diff <= 6:
-                        results[event_ticker] = prev_price
-                        prev_price_used += 1
-                        continue
-                    else:
-                        prev_price_stale += 1
-                except (ValueError, TypeError):
-                    pass
-
-        # Need candlestick fallback
-        if home_market.get("open_time") and home_market.get("close_time"):
-            need_candles.append((event_ticker, home_market, game_start_ts))
-
-    print(f"    {prev_price_used} from previous_price_dollars")
-    print(f"    {prev_price_stale} previous_price rejected (stale)")
-    print(f"    {no_start_time} skipped (no game start time)")
-    print(f"    {len(need_candles)} need candlestick extraction")
-
-    if not need_candles:
-        return results
-
-    # Synchronous candlestick extraction
-    candle_found = 0
-    with httpx.Client(timeout=15.0) as client:
-        for i, (event_ticker, market, game_start_ts) in enumerate(need_candles):
-            price = fetch_pregame_price_candle(
-                client,
-                market["ticker"],
-                market["open_time"],
-                market["close_time"],
-                game_start_ts,
+        # Route to batch (live) or individual (historical/fallback)
+        try:
+            close_dt = datetime.fromisoformat(
+                home_market["close_time"].replace("Z", "+00:00")
             )
-            if price is not None:
-                results[event_ticker] = price
-                candle_found += 1
+            if close_dt.timestamp() >= cutoff_ts:
+                live_markets.append((event_ticker, home_market, game_start_ts))
+            else:
+                all_markets.append((event_ticker, home_market, game_start_ts))
+        except (ValueError, TypeError):
+            no_home_market += 1
 
-            if (i + 1) % 100 == 0 or i + 1 == len(need_candles):
-                print(
-                    f"    candles: {i + 1}/{len(need_candles)} ({candle_found} found)"
+    log(f"    {len(all_markets)} archived markets (individual requests)")
+    log(f"    {len(live_markets)} live markets (batch eligible)")
+    log(f"    {no_start_time} skipped (no game start time)")
+    log(f"    {no_home_market} skipped (no home market/times)")
+
+    results = {}
+
+    with httpx.Client(timeout=30.0) as client:
+        # Fetch archived markets individually (with retry + live fallback)
+        if all_markets:
+            log(f"\n  Fetching archived markets ({len(all_markets)})...")
+            ind_results, ind_stats = fetch_pregame_prices_individual(
+                client, all_markets,
+            )
+            results.update(ind_results)
+            log(f"    → {ind_stats['found_hourly']} hourly, "
+                  f"{ind_stats['found_daily']} daily, "
+                  f"{ind_stats['no_candles']} no candles, "
+                  f"{ind_stats['no_pregame']} no pre-game price, "
+                  f"{ind_stats['error']} errors")
+            log(f"    → {ind_stats['via_historical']} via historical, "
+                  f"{ind_stats['via_live']} via live fallback")
+
+        # Fetch live markets — try batch first, fall back to individual
+        if live_markets:
+            log(f"\n  Fetching live markets ({len(live_markets)})...")
+            live_results, live_stats = fetch_pregame_prices_live_batch(
+                client, live_markets,
+            )
+            results.update(live_results)
+
+            # For any that failed in batch, try individual requests
+            failed = [
+                (et, m, gs) for et, m, gs in live_markets
+                if et not in results
+            ]
+            if failed:
+                log(f"    Batch missed {len(failed)}, trying individual...")
+                ind_results, ind_stats = fetch_pregame_prices_individual(
+                    client, failed,
                 )
+                results.update(ind_results)
+                live_stats["found_hourly"] += ind_stats["found_hourly"]
+                live_stats["found_daily"] += ind_stats["found_daily"]
+                live_stats["error"] = ind_stats["error"]
 
-            time.sleep(0.05)
-
-    no_price = len(need_candles) - candle_found
-    print(f"    {no_price} games had no pre-game candle price")
+            log(f"    → {live_stats['found_hourly']} hourly, "
+                  f"{live_stats['found_daily']} daily, "
+                  f"{live_stats['no_candles']} no candles, "
+                  f"{live_stats['no_pregame']} no pre-game price, "
+                  f"{live_stats['error']} errors")
 
     return results
 
@@ -417,36 +628,46 @@ def main():
     KALSHI_DIR.mkdir(parents=True, exist_ok=True)
     output_path = KALSHI_DIR / f"kalshi_mlb_{args.year}.parquet"
 
-    print(f"\nFetching Kalshi MLB markets for {args.year}...")
+    log(f"\nFetching Kalshi MLB markets for {args.year}...")
     markets = fetch_all_markets(args.year)
 
-    print(f"\nGrouping by event...")
-    events = group_markets_by_event(markets, args.year)
-    print(f"  {len(events)} games found")
+    log(f"\nFetching historical cutoff...")
+    cutoff_ts = fetch_historical_cutoff()
 
-    print(f"\nLoading game start times...")
+    log(f"\nGrouping by event...")
+    events = group_markets_by_event(markets, args.year)
+    log(f"  {len(events)} games found")
+
+    log(f"\nLoading game start times...")
     game_start_times = load_game_start_times(args.year)
 
-    print(f"\nFetching pre-game prices...")
-    prices = fetch_all_pregame_prices(events, game_start_times)
-    print(f"  Got prices for {len(prices)}/{len(events)} games")
+    log(f"\nFetching pre-game prices...")
+    prices = fetch_all_pregame_prices(events, game_start_times, cutoff_ts)
+    log(f"\n  Got prices for {len(prices)}/{len(events)} games")
 
-    print(f"\nBuilding dataset...")
+    log(f"\nBuilding dataset...")
     df = build_dataset(events, prices)
     df.to_parquet(output_path, index=False)
-    print(f"  Saved {len(df)} games to {output_path}")
+    log(f"  Saved {len(df)} games to {output_path}")
 
     if len(df) > 0:
-        print(f"\n  Date range: {df['game_date'].min()} -> {df['game_date'].max()}")
-        print(f"  Avg Kalshi home prob: {df['kalshi_home_prob'].mean():.3f}")
-        print(f"  Home win rate: {df['home_win'].mean():.3f}")
-        print(f"  Avg volume/game: ${df['volume'].mean():,.0f}")
+        log(f"\n  Date range: {df['game_date'].min()} -> {df['game_date'].max()}")
+        log(f"  Avg Kalshi home prob: {df['kalshi_home_prob'].mean():.3f}")
+        log(f"  Home win rate: {df['home_win'].mean():.3f}")
+        log(f"  Avg volume/game: ${df['volume'].mean():,.0f}")
+
+        # Price distribution
+        probs = df["kalshi_home_prob"]
+        log(f"\n  Price distribution:")
+        for lo, hi in [(0, 0.3), (0.3, 0.4), (0.4, 0.5), (0.5, 0.6), (0.6, 0.7), (0.7, 1.0)]:
+            n = ((probs >= lo) & (probs < hi)).sum()
+            log(f"    [{lo:.1f}, {hi:.1f}): {n} ({n/len(probs):.1%})")
 
         df["month"] = df["game_date"].str[:7]
-        print(f"\n  By month:")
+        log(f"\n  By month:")
         for month in sorted(df["month"].unique()):
             n = len(df[df["month"] == month])
-            print(f"    {month}: {n}")
+            log(f"    {month}: {n}")
 
 
 if __name__ == "__main__":
