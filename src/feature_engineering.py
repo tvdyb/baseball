@@ -26,7 +26,7 @@ import pandas as pd
 from arsenal_matchup_model import ARSENAL_FEATURES
 from utils import (
     DATA_DIR, XRV_DIR, GAMES_DIR, WEATHER_DIR, MODEL_DIR, FEATURES_DIR, OAA_DIR,
-    HARD_TYPES, BREAK_TYPES, OFFSPEED_TYPES, filter_competitive,
+    ROSTER_DIR, HARD_TYPES, BREAK_TYPES, OFFSPEED_TYPES, filter_competitive,
 )
 
 # Backward-compat alias for internal callers
@@ -1295,6 +1295,51 @@ def _load_team_oaa(season: int) -> dict[str, float]:
     return result
 
 
+def _load_trade_deadline_acquisitions(year: int, idx: dict) -> dict[str, dict]:
+    """
+    Load trade deadline transactions and compute per-team talent acquisition signal.
+    Uses xRV data to assess quality of acquired players.
+    Returns {team_abbr: {"net_acquisitions": int, "acquired_pitcher_xrv": float, "acquired_hitter_xrv": float}}
+    """
+    tx_path = ROSTER_DIR / f"transactions_{year}.parquet"
+    if not tx_path.exists():
+        return {}
+
+    tx = pd.read_parquet(tx_path)
+    # Focus on trade deadline window: June 15 - Aug 1
+    tx = tx[(tx["date"] >= f"{year}-06-15") & (tx["date"] <= f"{year}-08-01")]
+    if len(tx) == 0:
+        return {}
+
+    team_stats = {}
+    for _, row in tx.iterrows():
+        to_team = row["to_team"]
+        from_team = row["from_team"]
+        pid = int(row["player_id"])
+
+        if not to_team:
+            continue
+
+        # Initialize team entries
+        for t in [to_team, from_team]:
+            if t and t not in team_stats:
+                team_stats[t] = {"net_acquisitions": 0, "acquired_pitcher_xrv": 0.0, "acquired_hitter_xrv": 0.0}
+
+        # Count acquisitions/losses
+        team_stats[to_team]["net_acquisitions"] += 1
+        if from_team:
+            team_stats[from_team]["net_acquisitions"] -= 1
+
+        # Assess player quality from prior xRV data
+        if pid in idx.get("pitcher", {}):
+            pitcher_df = idx["pitcher"][pid]
+            if len(pitcher_df) >= 100:
+                xrv = pitcher_df["xrv"].mean()
+                team_stats[to_team]["acquired_pitcher_xrv"] += xrv
+
+    return team_stats
+
+
 def _compute_team_priors(prior_year: int) -> dict[str, float]:
     """
     Compute preseason team strength prior from prior season win%.
@@ -1419,6 +1464,11 @@ def build_game_features(
     team_priors = _compute_team_priors(target_year - 1)
     if team_priors:
         print(f"  Team priors from {target_year - 1}: {len(team_priors)} teams")
+
+    # Load trade deadline acquisitions (current season, only affects games after deadline)
+    trade_stats = _load_trade_deadline_acquisitions(target_year, idx)
+    if trade_stats:
+        print(f"  Trade deadline stats: {len(trade_stats)} teams with transactions")
 
     # Build features for each game
     feature_rows = []
@@ -1605,6 +1655,21 @@ def build_game_features(
         # --- Team strength prior (from prior season win%) ---
         row["home_team_prior"] = team_priors.get(home_team, 0.5)
         row["away_team_prior"] = team_priors.get(away_team, 0.5)
+
+        # --- Trade deadline features (only meaningful after ~Aug 1) ---
+        home_trade = trade_stats.get(home_team, {})
+        away_trade = trade_stats.get(away_team, {})
+        # Only populate for games after the trade deadline window
+        if gdate >= f"{target_year}-08-01" and trade_stats:
+            row["home_trade_net"] = home_trade.get("net_acquisitions", 0)
+            row["away_trade_net"] = away_trade.get("net_acquisitions", 0)
+            row["home_trade_pitcher_xrv"] = home_trade.get("acquired_pitcher_xrv", 0.0)
+            row["away_trade_pitcher_xrv"] = away_trade.get("acquired_pitcher_xrv", 0.0)
+        else:
+            row["home_trade_net"] = 0
+            row["away_trade_net"] = 0
+            row["home_trade_pitcher_xrv"] = 0.0
+            row["away_trade_pitcher_xrv"] = 0.0
 
         # --- Park factor ---
         row["park_factor"] = park_factors.get(home_team, 1.0)
@@ -1826,6 +1891,9 @@ def build_game_features(
         ("oaa_rate", 1),            # higher OAA = better defense
         # New: team strength prior
         ("team_prior", 1),          # higher prior win% = stronger team
+        # New: trade deadline features
+        ("trade_net", 1),           # more acquisitions = stronger
+        ("trade_pitcher_xrv", -1),  # negative xRV = better pitcher acquired
     ]
     for col, sign in diff_cols:
         home_col = f"home_{col}"

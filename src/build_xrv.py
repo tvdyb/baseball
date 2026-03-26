@@ -324,6 +324,122 @@ def build_xrv_for_year(year: int, cv: bool = False):
     return model, model_type
 
 
+def build_xrv_prior_season(seasons: list[int], cv: bool = False):
+    """
+    For each target season Y, train the contact model on all prior seasons [2017..Y-1],
+    then apply to Y. This eliminates lookahead bias in the xRV values.
+    For the earliest season with no prior data, fall back to same-season.
+    """
+    print(f"\n{'='*60}")
+    print(f"Building xRV with prior-season training (no lookahead)")
+    print(f"{'='*60}")
+
+    for target_year in sorted(seasons):
+        # Find available prior seasons
+        train_years = []
+        for y in range(2017, target_year):
+            if (STATCAST_DIR / f"statcast_{y}.parquet").exists():
+                train_years.append(y)
+
+        if not train_years:
+            print(f"\n  No prior data for {target_year}, falling back to same-season")
+            build_xrv_for_year(target_year, cv=cv)
+            continue
+
+        print(f"\n{'='*60}")
+        print(f"  {target_year}: training contact model on {train_years}")
+        print(f"{'='*60}")
+
+        # Pool training data from prior seasons
+        train_contact_frames = []
+        for ty in train_years:
+            df_train = load_and_prepare(ty)
+            if df_train.empty:
+                continue
+            X, y_vals, features, cat_features = prepare_contact_features(df_train)
+            train_contact_frames.append(pd.concat([X, y_vals], axis=1))
+
+        if not train_contact_frames:
+            print(f"  No usable training data, falling back to same-season")
+            build_xrv_for_year(target_year, cv=cv)
+            continue
+
+        pooled_train = pd.concat(train_contact_frames, ignore_index=True)
+        X_train = pooled_train[["launch_speed", "launch_angle", "spray_angle", "sprint_speed", "park"]].copy()
+        y_train = pooled_train["delta_run_exp"]
+        features = ["launch_speed", "launch_angle", "spray_angle", "sprint_speed"]
+        cat_features = ["park"]
+
+        # Ensure park is categorical and collect known categories
+        X_train["park"] = X_train["park"].astype("category")
+        train_park_cats = X_train["park"].cat.categories
+
+        print(f"  Training data: {len(X_train):,} contact events from {train_years}")
+
+        if cv:
+            print("  Running 5-fold CV on training data...")
+            rmse, r2 = cross_validate(X_train, y_train, features, cat_features)
+            print(f"  CV RMSE: {rmse:.4f}, R²: {r2:.4f}")
+
+        # Train model
+        print("  Training contact xRV model...")
+        model, model_type = train_xrv_model(X_train, y_train, features, cat_features)
+
+        # Load target season
+        df_target = load_and_prepare(target_year)
+        if df_target.empty:
+            continue
+
+        print(f"  Applying to {target_year}: {len(df_target):,} pitches")
+
+        # Generate xRV
+        df_target["xrv"] = df_target["delta_run_exp"].copy()
+
+        contact_mask = (df_target["type"] == "X") & df_target["launch_speed"].notna() & df_target["launch_angle"].notna()
+        contact_rows = df_target.loc[contact_mask].copy()
+
+        if len(contact_rows) > 0:
+            league_avg_sprint = df_target.loc[contact_mask, "sprint_speed"].median()
+            if pd.isna(league_avg_sprint):
+                league_avg_sprint = 27.0
+            contact_rows["sprint_speed"] = contact_rows["sprint_speed"].fillna(league_avg_sprint)
+            # Use training categories so codes align; unseen parks get -1
+            contact_rows["park"] = pd.Categorical(contact_rows["park"], categories=train_park_cats)
+
+            X_contact = contact_rows[features + cat_features]
+            preds = predict_xrv(model, model_type, X_contact, features, cat_features)
+            df_target.loc[contact_mask, "xrv"] = preds
+
+        non_null = df_target["xrv"].notna().sum()
+        print(f"  xRV assigned: {non_null:,}/{len(df_target):,}")
+        print(f"  xRV mean: {df_target['xrv'].mean():.6f}")
+
+        # Save
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        out_path = OUTPUT_DIR / f"statcast_xrv_{target_year}.parquet"
+        keep_cols = [
+            "game_pk", "game_date", "season", "at_bat_number", "pitch_number",
+            "pitcher", "batter", "home_team", "away_team",
+            "inning", "inning_topbot",
+            "pitch_type", "release_speed", "release_spin_rate",
+            "pfx_x", "pfx_z", "plate_x", "plate_z",
+            "effective_speed", "release_extension",
+            "release_pos_x", "release_pos_z", "spin_axis",
+            "balls", "strikes", "outs_when_up",
+            "on_1b", "on_2b", "on_3b",
+            "stand", "p_throws",
+            "type", "description", "events",
+            "launch_speed", "launch_angle", "spray_angle",
+            "sprint_speed", "park",
+            "bb_type", "zone",
+            "delta_run_exp", "xrv",
+            "game_type",
+        ]
+        keep_cols = [c for c in keep_cols if c in df_target.columns]
+        df_target[keep_cols].to_parquet(out_path, index=False)
+        print(f"  Saved to {out_path}")
+
+
 def build_xrv_pooled(seasons: list[int], cv: bool = False):
     """
     Train a single contact model on pooled seasons, then apply to each season.
@@ -428,9 +544,13 @@ def main():
     parser.add_argument("--cv", action="store_true", help="Run cross-validation")
     parser.add_argument("--pool", action="store_true",
                         help="Train a single model on all seasons combined (better for rare events)")
+    parser.add_argument("--prior", action="store_true",
+                        help="Train contact model on prior season(s) only — no lookahead bias")
     args = parser.parse_args()
 
-    if args.pool:
+    if args.prior:
+        build_xrv_prior_season(args.seasons, cv=args.cv)
+    elif args.pool:
         build_xrv_pooled(args.seasons, cv=args.cv)
     else:
         for year in sorted(args.seasons):

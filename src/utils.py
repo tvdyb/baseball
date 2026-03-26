@@ -19,6 +19,7 @@ MODEL_DIR = PROJECT_DIR / "models"
 FEATURES_DIR = DATA_DIR / "features"
 STATCAST_DIR = DATA_DIR / "statcast"
 SPRINT_DIR = DATA_DIR / "sprint_speed"
+ROSTER_DIR = DATA_DIR / "rosters"
 
 # ── Pitch type groupings ────────────────────────────────────
 HARD_TYPES = {"FF", "SI", "FC"}

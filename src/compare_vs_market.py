@@ -53,6 +53,7 @@ def train_ensemble(train_df):
     lr.fit(X_lr, y)
 
     xgb_model = None
+    w_lr = 0.5
     if HAS_XGB:
         dtrain = xgb.DMatrix(X, label=y)
         params = {
@@ -63,10 +64,24 @@ def train_ensemble(train_df):
         }
         xgb_model = xgb.train(params, dtrain, num_boost_round=100)
 
-    return lr, scaler, xgb_model, available
+        # Learn optimal blend weight
+        from scipy.optimize import minimize_scalar
+        lr_train_probs = lr.predict_proba(X_lr)[:, 1]
+        xgb_train_probs = xgb_model.predict(dtrain)
+
+        def blend_loss(w):
+            blended = w * lr_train_probs + (1 - w) * xgb_train_probs
+            blended = np.clip(blended, 1e-6, 1 - 1e-6)
+            return log_loss(y, blended)
+
+        opt = minimize_scalar(blend_loss, bounds=(0.1, 0.9), method="bounded")
+        w_lr = opt.x
+        print(f"  Learned blend: LR={w_lr:.2f}, XGB={1-w_lr:.2f}")
+
+    return lr, scaler, xgb_model, available, w_lr
 
 
-def predict(lr, scaler, xgb_model, features, test_df):
+def predict(lr, scaler, xgb_model, features, test_df, w_lr=0.5):
     available = [f for f in features if f in test_df.columns]
     X = test_df[available].copy()
 
@@ -76,7 +91,7 @@ def predict(lr, scaler, xgb_model, features, test_df):
     if xgb_model and HAS_XGB:
         dtest = xgb.DMatrix(X)
         xgb_probs = xgb_model.predict(dtest)
-        ens_probs = 0.5 * lr_probs + 0.5 * xgb_probs
+        ens_probs = w_lr * lr_probs + (1 - w_lr) * xgb_probs
     else:
         xgb_probs = lr_probs
         ens_probs = lr_probs
@@ -184,7 +199,7 @@ def main():
     print(f"  {len(train_df)} training games")
 
     print("\nTraining ensemble model...")
-    lr, scaler, xgb_model, features = train_ensemble(train_df)
+    lr, scaler, xgb_model, features, w_lr = train_ensemble(train_df)
     print(f"  Features used: {len(features)}")
 
     print("\nLoading 2025 test data...")
@@ -192,7 +207,7 @@ def main():
     print(f"  {len(test_df)} test games")
 
     # Generate predictions
-    lr_probs, xgb_probs, ens_probs = predict(lr, scaler, xgb_model, features, test_df)
+    lr_probs, xgb_probs, ens_probs = predict(lr, scaler, xgb_model, features, test_df, w_lr)
     test_df["model_prob"] = ens_probs
     test_df["model_prob_lr"] = lr_probs
     test_df["model_prob_xgb"] = xgb_probs
@@ -216,6 +231,32 @@ def main():
         )
         print(f"\n  Polymarket overlap: {len(merged)} games")
         evaluate_vs_market(merged, "model_prob", "poly_home_prob", "Model vs Polymarket (ENS)")
+
+        # Monthly breakdown
+        merged["month"] = pd.to_datetime(merged["game_date"]).dt.month
+        month_names = {3: "Mar", 4: "Apr", 5: "May", 6: "Jun", 7: "Jul", 8: "Aug", 9: "Sep", 10: "Oct"}
+        print(f"\n{'='*60}")
+        print("  Monthly Breakdown: Model vs Polymarket")
+        print(f"{'='*60}")
+        print(f"  {'Month':<6} {'N':>5} {'Model LL':>10} {'Poly LL':>10} {'Delta':>8} {'Model AUC':>10} {'Poly AUC':>10}")
+        print(f"  {'-'*55}")
+        for month in sorted(merged["month"].unique()):
+            m = merged[merged["month"] == month]
+            y_m = m["home_win"].values
+            mp = np.clip(m["model_prob"].values, 0.01, 0.99)
+            pp = np.clip(m["poly_home_prob"].values, 0.01, 0.99)
+            try:
+                mll = log_loss(y_m, mp)
+                pll = log_loss(y_m, pp)
+            except ValueError:
+                continue
+            try:
+                mauc = roc_auc_score(y_m, mp)
+                pauc = roc_auc_score(y_m, pp)
+            except ValueError:
+                mauc = pauc = float("nan")
+            name = month_names.get(month, str(month))
+            print(f"  {name:<6} {len(m):>5} {mll:>10.4f} {pll:>10.4f} {mll-pll:>+8.4f} {mauc:>10.4f} {pauc:>10.4f}")
     else:
         print("\n  No Polymarket data found")
 

@@ -36,7 +36,7 @@ from feature_engineering import (
     _compute_hand_arsenal_matchup, compute_arsenal_matchup_xrv,
     compute_bullpen_arsenal_matchup_xrv, _compute_pitcher_arsenal_live,
     _standardize_arsenal, _filter_competitive,
-    _load_team_oaa, _compute_team_priors,
+    _load_team_oaa, _compute_team_priors, _load_trade_deadline_acquisitions,
 )
 
 from utils import DATA_DIR, XRV_DIR, GAMES_DIR, FEATURES_DIR, MODEL_DIR, OAA_DIR
@@ -77,6 +77,9 @@ DIFF_FEATURES = [
     "diff_team_prior",
     # Context-aware SP xRV
     "diff_sp_context_xrv",
+    # Trade deadline features
+    "diff_trade_net",
+    "diff_trade_pitcher_xrv",
 ]
 
 RAW_FEATURES = [
@@ -334,6 +337,11 @@ def build_live_features(
     if team_priors:
         print(f"  Team priors from {year - 1}: {len(team_priors)} teams")
 
+    # Load trade deadline acquisitions
+    trade_stats = _load_trade_deadline_acquisitions(year, idx)
+    if trade_stats:
+        print(f"  Trade deadline stats: {len(trade_stats)} teams")
+
     # Compute recent form from game results
     games_path = GAMES_DIR / f"games_{year}.parquet"
     team_history = {}
@@ -502,6 +510,20 @@ def build_live_features(
         row["home_team_prior"] = team_priors.get(home_team, 0.5)
         row["away_team_prior"] = team_priors.get(away_team, 0.5)
 
+        # --- Trade deadline features ---
+        if target_date >= f"{year}-08-01" and trade_stats:
+            home_trade = trade_stats.get(home_team, {})
+            away_trade = trade_stats.get(away_team, {})
+            row["home_trade_net"] = home_trade.get("net_acquisitions", 0)
+            row["away_trade_net"] = away_trade.get("net_acquisitions", 0)
+            row["home_trade_pitcher_xrv"] = home_trade.get("acquired_pitcher_xrv", 0.0)
+            row["away_trade_pitcher_xrv"] = away_trade.get("acquired_pitcher_xrv", 0.0)
+        else:
+            row["home_trade_net"] = 0
+            row["away_trade_net"] = 0
+            row["home_trade_pitcher_xrv"] = 0.0
+            row["away_trade_pitcher_xrv"] = 0.0
+
         # --- Park factor ---
         row["park_factor"] = park_factors.get(home_team, 1.0)
 
@@ -598,6 +620,7 @@ def build_live_features(
         ("sp_velo_trend", -1), ("sp_spin_trend", -1), ("sp_xrv_trend", -1),
         ("sp_transition_entropy", -1),
         ("oaa_rate", 1), ("team_prior", 1),
+        ("trade_net", 1), ("trade_pitcher_xrv", -1),
     ]
     for col, sign in diff_cols:
         hc = f"home_{col}"

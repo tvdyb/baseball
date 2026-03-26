@@ -71,6 +71,9 @@ DIFF_FEATURES = [
     "diff_team_prior",
     # Context-aware SP xRV (home split for home SP, away split for away SP)
     "diff_sp_context_xrv",
+    # Trade deadline features
+    "diff_trade_net",
+    "diff_trade_pitcher_xrv",
 ]
 
 RAW_FEATURES = [
