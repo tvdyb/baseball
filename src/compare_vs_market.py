@@ -33,7 +33,6 @@ ANALYSIS_DIR = DATA_DIR / "analysis"
 
 MONTH_NAMES = {3: "Mar", 4: "Apr", 5: "May", 6: "Jun", 7: "Jul",
                8: "Aug", 9: "Sep", 10: "Oct"}
-VIG_LEVELS = [0, 5, 7, 10]
 EDGE_THRESHOLDS = [0.03, 0.05, 0.07, 0.10]
 
 
@@ -105,56 +104,6 @@ def predict(lr, scaler, xgb_model, features, test_df, w_lr=0.5):
     return lr_probs, xgb_probs, ens_probs
 
 
-# ── Per-bet PnL computation ─────────────────────────────────────────────────
-
-def compute_bet_pnl(edge, model_prob, market_prob, outcome, vig_cents=0):
-    """Compute PnL for a single bet on Kalshi-style $1 binary contracts.
-
-    Kalshi contracts pay $1 if correct, $0 if wrong. You buy at price p.
-    PnL = (1 - p) * 100 on win, -p * 100 on loss (per $100 notional).
-
-    vig_cents: full spread in cents. Execution slippage = vig_cents / 200
-    (half the spread above mid for buying).
-    """
-    half_spread = vig_cents / 200.0  # as a probability
-
-    if edge > 0:
-        # Bet home (buy YES)
-        exec_price = market_prob + half_spread
-        exec_price = min(exec_price, 0.99)
-        won = (outcome == 1)
-    else:
-        # Bet away (buy NO) — NO price = 1 - market_home_prob
-        exec_price = (1 - market_prob) + half_spread
-        exec_price = min(exec_price, 0.99)
-        won = (outcome == 0)
-
-    if won:
-        pnl = (1.0 - exec_price) * 100
-    else:
-        pnl = -exec_price * 100
-    return pnl, exec_price
-
-
-def compute_bet_pnl_pct_fee(edge, model_prob, market_prob, outcome, fee_pct=0.0):
-    """PnL with a flat percentage fee deducted from each trade's notional."""
-    # Zero-vig PnL first
-    if edge > 0:
-        exec_price = market_prob
-        won = (outcome == 1)
-    else:
-        exec_price = (1 - market_prob)
-        won = (outcome == 0)
-
-    if won:
-        gross = (1.0 - exec_price) * 100
-    else:
-        gross = -exec_price * 100
-
-    fee = fee_pct / 100.0 * 100  # fee on $100 notional
-    return gross - fee, exec_price
-
-
 def _sharpe(pnls, bets_per_year=500):
     """Annualized Sharpe ratio from an array of per-bet PnLs."""
     if len(pnls) < 2:
@@ -166,7 +115,17 @@ def _sharpe(pnls, bets_per_year=500):
     return (mean / std) * np.sqrt(min(len(pnls), bets_per_year))
 
 
-# ── Core analysis functions ──────────────────────────────────────────────────
+def _compute_bet_pnl(edge, market_prob, outcome):
+    """Compute PnL for a single flat $100 bet at fair odds (no vig)."""
+    if edge > 0:
+        # Bet home
+        fair_odds = 1 / market_prob
+        return (fair_odds - 1) * 100 if outcome == 1 else -100.0
+    else:
+        # Bet away
+        fair_odds = 1 / (1 - market_prob)
+        return (fair_odds - 1) * 100 if outcome == 0 else -100.0
+
 
 def evaluate_vs_market(results_df, model_col, market_col, label=""):
     """Compare model vs market predictions."""
@@ -222,7 +181,6 @@ def evaluate_vs_market(results_df, model_col, market_col, label=""):
     print(f"    Std edge:  {edge.std():.4f}")
 
     for threshold in EDGE_THRESHOLDS:
-        # Model says home more likely than market
         home_edge = edge >= threshold
         if home_edge.sum() > 0:
             win_rate = y[home_edge].mean()
@@ -231,20 +189,37 @@ def evaluate_vs_market(results_df, model_col, market_col, label=""):
             print(f"\n    Model likes HOME by >={threshold:.0%}: {home_edge.sum()} games")
             print(f"      Actual win rate: {win_rate:.1%} (market implied: {avg_market:.1%}, model: {avg_model:.1%})")
 
-        # Model says away more likely than market
         away_edge = edge <= -threshold
         if away_edge.sum() > 0:
-            # For away edge, home_win=0 is the "correct" bet
             away_win_rate = 1 - y[away_edge].mean()
             avg_market = (1 - market_probs[away_edge]).mean()
             avg_model = (1 - model_probs[away_edge]).mean()
             print(f"    Model likes AWAY by >={threshold:.0%}: {away_edge.sum()} games")
             print(f"      Actual win rate: {away_win_rate:.1%} (market implied: {avg_market:.1%}, model: {avg_model:.1%})")
 
+    # ROI simulation (flat $100 bets)
+    print(f"\n  ROI Simulation (flat $100 bets):")
+    print(f"  {'Edge':>7s} {'Bets':>6s} {'PnL':>10s} {'ROI':>8s} {'Sharpe':>8s} {'WinRate':>8s}")
+    print(f"  {'-'*51}")
+    for min_edge in EDGE_THRESHOLDS:
+        pnls = []
+        for i in range(len(df)):
+            e = edge[i]
+            if abs(e) >= min_edge:
+                pnls.append(_compute_bet_pnl(e, market_probs[i], y[i]))
+        if pnls:
+            total_pnl = sum(pnls)
+            n_bets = len(pnls)
+            roi = total_pnl / (n_bets * 100)
+            sharpe = _sharpe(np.array(pnls))
+            wins = sum(1 for p in pnls if p > 0)
+            wr = wins / n_bets
+            print(f"  {min_edge:>6.0%} {n_bets:>6d} ${total_pnl:>+9.0f} "
+                  f"{roi:>+7.1%} {sharpe:>8.2f} {wr:>7.1%}")
+
 
 def detailed_roi_analysis(df, model_col, market_col, label=""):
-    """Detailed ROI analysis with realistic vig modeling, Sharpe ratios,
-    breakeven edges, and monthly decomposition."""
+    """Monthly ROI breakdown, edge decomposition, and per-bet CSV export."""
     df = df.dropna(subset=[model_col, market_col, "home_win"]).copy()
     if len(df) == 0:
         return
@@ -255,79 +230,15 @@ def detailed_roi_analysis(df, model_col, market_col, label=""):
     edge = model_probs - market_probs
     dates = pd.to_datetime(df["game_date"])
     months = dates.dt.month.values
+    edge_default = 0.05
 
-    # ── Task 1a: Spread-based vig ROI ────────────────────────────────────
+    # ── Monthly ROI table ────────────────────────────────────────────────
     print(f"\n{'='*80}")
-    print(f"  Detailed ROI Analysis: {label}")
-    print(f"{'='*80}")
-
-    print(f"\n  ── Spread-Based Vig (Kalshi-style binary contracts) ──")
-    print(f"  {'Vig':>6s} {'Edge':>7s} {'Bets':>6s} {'PnL':>10s} {'ROI':>8s} {'Sharpe':>8s} {'WinRate':>8s}")
-    print(f"  {'-'*57}")
-
-    for vig in VIG_LEVELS:
-        for min_edge in EDGE_THRESHOLDS:
-            pnls = []
-            for i in range(len(df)):
-                if abs(edge[i]) >= min_edge:
-                    pnl, _ = compute_bet_pnl(edge[i], model_probs[i],
-                                             market_probs[i], y[i], vig)
-                    pnls.append(pnl)
-            if len(pnls) > 0:
-                total_pnl = sum(pnls)
-                n_bets = len(pnls)
-                roi = total_pnl / (n_bets * 100)
-                sharpe = _sharpe(np.array(pnls))
-                wins = sum(1 for p in pnls if p > 0)
-                wr = wins / n_bets
-                print(f"  {vig:>4d}¢ {min_edge:>6.0%} {n_bets:>6d} "
-                      f"${total_pnl:>+9.0f} {roi:>+7.1%} {sharpe:>8.2f} {wr:>7.1%}")
-        print()
-
-    # ── Task 1b: Percentage-based fee ────────────────────────────────────
-    print(f"  ── Percentage Fee Model ──")
-    print(f"  {'Fee%':>6s} {'Edge':>7s} {'Bets':>6s} {'PnL':>10s} {'ROI':>8s} {'Sharpe':>8s}")
-    print(f"  {'-'*49}")
-    for fee_pct in [1.0, 2.0, 3.0]:
-        for min_edge in EDGE_THRESHOLDS:
-            pnls = []
-            for i in range(len(df)):
-                if abs(edge[i]) >= min_edge:
-                    pnl, _ = compute_bet_pnl_pct_fee(edge[i], model_probs[i],
-                                                     market_probs[i], y[i], fee_pct)
-                    pnls.append(pnl)
-            if len(pnls) > 0:
-                total_pnl = sum(pnls)
-                n_bets = len(pnls)
-                roi = total_pnl / (n_bets * 100)
-                sharpe = _sharpe(np.array(pnls))
-                print(f"  {fee_pct:>5.0f}% {min_edge:>6.0%} {n_bets:>6d} "
-                      f"${total_pnl:>+9.0f} {roi:>+7.1%} {sharpe:>8.2f}")
-        print()
-
-    # ── Task 1c: Breakeven edge by vig level ─────────────────────────────
-    print(f"  ── Breakeven Edge (minimum edge to reach PnL >= 0) ──")
-    print(f"  {'Vig':>6s} {'Breakeven':>10s}")
-    print(f"  {'-'*18}")
-    for vig in VIG_LEVELS:
-        be = _find_breakeven_edge(edge, model_probs, market_probs, y, vig)
-        if be is not None:
-            print(f"  {vig:>4d}¢ {be:>9.1%}")
-        else:
-            print(f"  {vig:>4d}¢      n/a")
-
-    # ── Task 2a: Monthly ROI table ───────────────────────────────────────
-    print(f"\n{'='*80}")
-    print(f"  Monthly ROI Breakdown (vig=7¢)")
+    print(f"  Monthly ROI Breakdown: {label}")
     print(f"{'='*80}")
     print(f"  {'Mon':<5s} {'Games':>5s} {'Bets':>5s} {'PnL':>9s} {'ROI':>7s} "
           f"{'Sharpe':>7s} {'WR':>6s} {'MLL':>7s} {'MktLL':>7s} {'Δ':>7s}")
     print(f"  {'-'*73}")
-
-    vig_default = 7
-    edge_default = 0.05
-    best_sharpe = -999
-    best_months = []
 
     for month in sorted(set(months)):
         mask = months == month
@@ -337,25 +248,21 @@ def detailed_roi_analysis(df, model_col, market_col, label=""):
         m_model = model_probs[mask]
         m_market = market_probs[mask]
         m_y = y[mask]
-
-        bet_mask = np.abs(m_edge) >= edge_default
-        n_bets = bet_mask.sum()
         name = MONTH_NAMES.get(month, str(month))
 
-        # Log loss
         try:
             mll = log_loss(m_y, m_model)
             mkll = log_loss(m_y, m_market)
         except ValueError:
             continue
 
+        pnls = []
+        for i in range(len(m_edge)):
+            if abs(m_edge[i]) >= edge_default:
+                pnls.append(_compute_bet_pnl(m_edge[i], m_market[i], m_y[i]))
+
+        n_bets = len(pnls)
         if n_bets > 0:
-            pnls = []
-            for i in range(len(m_edge)):
-                if abs(m_edge[i]) >= edge_default:
-                    pnl, _ = compute_bet_pnl(m_edge[i], m_model[i],
-                                             m_market[i], m_y[i], vig_default)
-                    pnls.append(pnl)
             total_pnl = sum(pnls)
             roi = total_pnl / (n_bets * 100)
             sharpe = _sharpe(np.array(pnls))
@@ -364,47 +271,14 @@ def detailed_roi_analysis(df, model_col, market_col, label=""):
             print(f"  {name:<5s} {mask.sum():>5d} {n_bets:>5d} ${total_pnl:>+8.0f} "
                   f"{roi:>+6.1%} {sharpe:>7.2f} {wr:>5.1%} "
                   f"{mll:>7.4f} {mkll:>7.4f} {mll-mkll:>+7.4f}")
-            if sharpe > best_sharpe:
-                best_sharpe = sharpe
-                best_months = [name]
-            elif abs(sharpe - best_sharpe) < 0.01:
-                best_months.append(name)
         else:
             print(f"  {name:<5s} {mask.sum():>5d} {0:>5d} {'---':>9s} "
                   f"{'---':>7s} {'---':>7s} {'---':>6s} "
                   f"{mll:>7.4f} {mkll:>7.4f} {mll-mkll:>+7.4f}")
 
-    # ── Task 2b: Monthly breakeven edge ──────────────────────────────────
+    # ── Monthly edge decomposition ───────────────────────────────────────
     print(f"\n{'='*80}")
-    print(f"  Monthly Breakeven Edge")
-    print(f"{'='*80}")
-    header = f"  {'Mon':<5s} {'Games':>5s}"
-    for vig in VIG_LEVELS:
-        header += f" {'Vig='+str(vig)+'¢':>8s}"
-    print(header)
-    print(f"  {'-'*(12 + 9*len(VIG_LEVELS))}")
-
-    for month in sorted(set(months)):
-        mask = months == month
-        if mask.sum() < 10:
-            continue
-        name = MONTH_NAMES.get(month, str(month))
-        row = f"  {name:<5s} {mask.sum():>5d}"
-        m_edge = edge[mask]
-        m_model = model_probs[mask]
-        m_market = market_probs[mask]
-        m_y = y[mask]
-        for vig in VIG_LEVELS:
-            be = _find_breakeven_edge(m_edge, m_model, m_market, m_y, vig)
-            if be is not None:
-                row += f" {be:>7.1%}"
-            else:
-                row += f" {'n/a':>7s}"
-        print(row)
-
-    # ── Task 2d: Monthly advantage decomposition ────────────────────────
-    print(f"\n{'='*80}")
-    print(f"  Monthly Edge Decomposition (vig=0)")
+    print(f"  Monthly Edge Decomposition")
     print(f"{'='*80}")
     print(f"  {'Mon':<5s} {'AvgEdge':>8s} {'HomeFav':>8s} {'AwayFav':>8s} "
           f"{'Dog':>8s} {'HitRate':>8s}")
@@ -426,15 +300,15 @@ def detailed_roi_analysis(df, model_col, market_col, label=""):
 
         avg_edge = np.abs(m_edge[bet_mask]).mean()
 
-        # Home favorite bets: edge > 0 and market > 0.5 (home is favorite)
+        # Home favorite bets: edge > 0 and market > 0.5
         hf = (m_edge >= edge_default) & (m_market > 0.5)
         hf_wr = m_y[hf].mean() if hf.sum() > 0 else float("nan")
 
-        # Away favorite bets: edge < 0 and market < 0.5 (away is favorite)
+        # Away favorite bets: edge < 0 and market < 0.5
         af = (m_edge <= -edge_default) & (m_market < 0.5)
         af_wr = (1 - m_y[af]).mean() if af.sum() > 0 else float("nan")
 
-        # Underdog bets: betting against the favorite
+        # Underdog bets
         dog = ((m_edge >= edge_default) & (m_market <= 0.5)) | \
               ((m_edge <= -edge_default) & (m_market >= 0.5))
         dog_wr_vals = []
@@ -445,7 +319,7 @@ def detailed_roi_analysis(df, model_col, market_col, label=""):
                 dog_wr_vals.append(1 - m_y[i])
         dog_wr = np.mean(dog_wr_vals) if dog_wr_vals else float("nan")
 
-        # Overall hit rate at edge threshold
+        # Overall hit rate
         hit = 0
         total = 0
         for i in range(len(m_edge)):
@@ -460,121 +334,35 @@ def detailed_roi_analysis(df, model_col, market_col, label=""):
         print(f"  {name:<5s} {avg_edge:>7.1%} "
               f"{hf_wr:>7.1%} {af_wr:>7.1%} {dog_wr:>7.1%} {hit_rate:>7.1%}")
 
-    # ── Recommended operating parameters ─────────────────────────────────
-    print(f"\n{'='*80}")
-    _print_recommendations(edge, model_probs, market_probs, y, months)
+    # ── Per-bet CSV ──────────────────────────────────────────────────────
+    _write_pnl_csv(df, model_probs, market_probs, edge, y, label)
 
 
-def _find_breakeven_edge(edge, model_probs, market_probs, y, vig_cents):
-    """Binary search for minimum edge threshold where cumulative PnL >= 0."""
-    for thresh_x10 in range(0, 151):  # 0.0% to 15.0% in 0.1% steps
-        thresh = thresh_x10 / 1000.0
-        total = 0.0
-        n = 0
-        for i in range(len(edge)):
-            if abs(edge[i]) >= thresh:
-                pnl, _ = compute_bet_pnl(edge[i], model_probs[i],
-                                         market_probs[i], y[i], vig_cents)
-                total += pnl
-                n += 1
-        if n > 0 and total >= 0:
-            return thresh
-    return None
-
-
-def _print_recommendations(edge, model_probs, market_probs, y, months):
-    """Print recommended operating parameters based on backtest."""
-    print(f"  Recommended Operating Parameters")
-    print(f"{'='*80}")
-
-    best_combo = None
-    best_sharpe = -999
-
-    for vig in [5, 7]:
-        for min_edge in EDGE_THRESHOLDS:
-            for month_range in [(4, 10), (4, 8), (5, 9)]:
-                month_mask = (months >= month_range[0]) & (months <= month_range[1])
-                pnls = []
-                for i in range(len(edge)):
-                    if month_mask[i] and abs(edge[i]) >= min_edge:
-                        pnl, _ = compute_bet_pnl(edge[i], model_probs[i],
-                                                 market_probs[i], y[i], vig)
-                        pnls.append(pnl)
-                if len(pnls) >= 20:
-                    sharpe = _sharpe(np.array(pnls))
-                    roi = sum(pnls) / (len(pnls) * 100)
-                    if sharpe > best_sharpe:
-                        best_sharpe = sharpe
-                        best_combo = {
-                            "months": month_range,
-                            "edge": min_edge,
-                            "vig": vig,
-                            "n_bets": len(pnls),
-                            "roi": roi,
-                            "sharpe": sharpe,
-                            "pnl": sum(pnls),
-                        }
-
-    if best_combo:
-        m = best_combo
-        m0 = MONTH_NAMES.get(m["months"][0], str(m["months"][0]))
-        m1 = MONTH_NAMES.get(m["months"][1], str(m["months"][1]))
-        print(f"  Months: {m0}-{m1}, Edge >= {m['edge']:.0%}, "
-              f"Vig = {m['vig']}¢")
-        print(f"  Backtest: {m['n_bets']} bets, PnL=${m['pnl']:+.0f}, "
-              f"ROI={m['roi']:+.1%}, Sharpe={m['sharpe']:.2f}")
-    else:
-        print("  Insufficient data for recommendations")
-
-
-# ── CSV export ───────────────────────────────────────────────────────────────
-
-def write_monthly_pnl_csv(df, model_col, market_col, label=""):
+def _write_pnl_csv(df, model_probs, market_probs, edge, y, label):
     """Dump per-bet results to CSV for external analysis / equity curve plotting."""
-    df = df.dropna(subset=[model_col, market_col, "home_win"]).copy()
-    if len(df) == 0:
-        return
-
-    model_probs = np.clip(df[model_col].values, 0.01, 0.99)
-    market_probs = np.clip(df[market_col].values, 0.01, 0.99)
-    y = df["home_win"].values
-    edge = model_probs - market_probs
-
     ANALYSIS_DIR.mkdir(parents=True, exist_ok=True)
 
     rows = []
-    cumulative = {v: 0.0 for v in VIG_LEVELS}
-
+    cumulative = 0.0
     for i in range(len(df)):
-        if abs(edge[i]) < 0.03:  # minimum edge to record
+        if abs(edge[i]) < 0.03:
             continue
-
         bet_side = "home" if edge[i] > 0 else "away"
         result = int((edge[i] > 0 and y[i] == 1) or (edge[i] < 0 and y[i] == 0))
-
-        for vig in VIG_LEVELS:
-            pnl, exec_price = compute_bet_pnl(edge[i], model_probs[i],
-                                              market_probs[i], y[i], vig)
-            pnl_no_vig, _ = compute_bet_pnl(edge[i], model_probs[i],
-                                            market_probs[i], y[i], 0)
-            cumulative[vig] += pnl
-
-            row_data = {
-                "game_date": df.iloc[i].get("game_date", ""),
-                "home_team": df.iloc[i].get("home_team", ""),
-                "away_team": df.iloc[i].get("away_team", ""),
-                "model_prob": model_probs[i],
-                "market_prob": market_probs[i],
-                "edge": edge[i],
-                "bet_side": bet_side,
-                "vig_cents": vig,
-                "execution_price": exec_price,
-                "result": result,
-                "pnl_no_vig": pnl_no_vig,
-                "pnl_with_vig": pnl,
-                "cumulative_pnl": cumulative[vig],
-            }
-            rows.append(row_data)
+        pnl = _compute_bet_pnl(edge[i], market_probs[i], y[i])
+        cumulative += pnl
+        rows.append({
+            "game_date": df.iloc[i].get("game_date", ""),
+            "home_team": df.iloc[i].get("home_team", ""),
+            "away_team": df.iloc[i].get("away_team", ""),
+            "model_prob": model_probs[i],
+            "market_prob": market_probs[i],
+            "edge": edge[i],
+            "bet_side": bet_side,
+            "result": result,
+            "pnl": pnl,
+            "cumulative_pnl": cumulative,
+        })
 
     out = pd.DataFrame(rows)
     safe_label = label.lower().replace(" ", "_").replace("(", "").replace(")", "")
@@ -616,7 +404,6 @@ def main():
     poly_path = DATA_DIR / "polymarket" / "poly_mlb_2025_matched.parquet"
     if poly_path.exists():
         poly = pd.read_parquet(poly_path)
-        # Merge on game_pk
         merged = test_df.merge(
             poly[["game_pk", "poly_home_prob"]].drop_duplicates("game_pk"),
             on="game_pk", how="inner"
@@ -624,7 +411,6 @@ def main():
         print(f"\n  Polymarket overlap: {len(merged)} games")
         evaluate_vs_market(merged, "model_prob", "poly_home_prob", "Model vs Polymarket (ENS)")
         detailed_roi_analysis(merged, "model_prob", "poly_home_prob", "Model vs Polymarket")
-        write_monthly_pnl_csv(merged, "model_prob", "poly_home_prob", "polymarket")
     else:
         print("\n  No Polymarket data found")
 
@@ -633,7 +419,6 @@ def main():
     if kalshi_path.exists():
         kalshi = pd.read_parquet(kalshi_path)
         kalshi["game_date"] = kalshi["game_date"].astype(str)
-        # Merge on game_date + teams
         test_df["game_date_str"] = test_df["game_date"].astype(str)
         merged_k = test_df.merge(
             kalshi[["game_date", "home_team", "away_team", "kalshi_home_prob"]].drop_duplicates(),
@@ -646,7 +431,6 @@ def main():
         if len(merged_k) > 0:
             evaluate_vs_market(merged_k, "model_prob", "kalshi_home_prob", "Model vs Kalshi (ENS)")
             detailed_roi_analysis(merged_k, "model_prob", "kalshi_home_prob", "Model vs Kalshi")
-            write_monthly_pnl_csv(merged_k, "model_prob", "kalshi_home_prob", "kalshi")
     else:
         print("\n  No Kalshi data found")
 
