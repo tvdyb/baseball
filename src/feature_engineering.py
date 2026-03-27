@@ -17,6 +17,8 @@ Every feature uses only data available BEFORE the game starts.
 
 import argparse
 import pickle
+import re
+import unicodedata
 from pathlib import Path
 from datetime import timedelta
 
@@ -1371,6 +1373,38 @@ def _compute_team_priors(prior_year: int) -> dict[str, float]:
 
 PROJECTIONS_DIR = DATA_DIR / "projections"
 
+# Hardcoded Opening Day dates to avoid relying on games parquet min date
+OPENING_DAY = {
+    2017: "2017-04-02", 2018: "2018-03-29", 2019: "2019-03-20",
+    2020: "2020-07-23", 2021: "2021-04-01", 2022: "2022-04-07",
+    2023: "2023-03-30", 2024: "2024-03-20", 2025: "2025-03-18",
+    2026: "2026-03-26",
+}
+
+_SUFFIX_RE = re.compile(r'\s+(jr\.?|sr\.?|ii|iii|iv)\s*$', re.IGNORECASE)
+
+
+def _normalize_name(name: str) -> str:
+    """Normalize a player name for fuzzy matching.
+
+    Lowercases, strips accents/diacritics, removes suffixes (Jr., Sr., II, etc.),
+    and collapses whitespace. E.g. "José Ramírez Jr." -> "jose ramirez".
+    """
+    if not name:
+        return ""
+    # Lowercase
+    name = name.strip().lower()
+    # Strip accents: NFD decompose, then remove combining characters
+    name = unicodedata.normalize("NFD", name)
+    name = "".join(c for c in name if unicodedata.category(c) != "Mn")
+    # Remove suffixes
+    name = _SUFFIX_RE.sub("", name)
+    # Remove remaining punctuation except spaces/hyphens
+    name = re.sub(r"[^\w\s-]", "", name)
+    # Collapse whitespace
+    name = re.sub(r"\s+", " ", name).strip()
+    return name
+
 
 def _load_team_projections(year: int) -> dict[str, float]:
     """Load preseason projected win% for each team.
@@ -1384,24 +1418,71 @@ def _load_team_projections(year: int) -> dict[str, float]:
     return dict(zip(df["team_abbr"], df["projected_wpct"]))
 
 
-def _load_pitcher_projections(year: int) -> dict[str, dict]:
-    """Load preseason pitcher projections keyed by pitcher name.
+def _load_pitcher_projections(year: int) -> dict:
+    """Load preseason pitcher projections keyed by MLBAM ID and normalized name.
 
-    Returns {name: {"projected_era": ..., "projected_war": ...}}.
-    Keyed by name since games use MLB IDs while projections use FanGraphs IDs.
+    Returns a dict where keys are either:
+      - int (MLBAM ID from pybaseball crosswalk)
+      - str (normalized pitcher name via _normalize_name)
+      - str prefixed with "last:" for last-name-only fallback (only if unambiguous)
     """
     path = PROJECTIONS_DIR / f"pitcher_projections_{year}.parquet"
     if not path.exists():
         return {}
     df = pd.read_parquet(path)
-    result = {}
-    for _, row in df.iterrows():
-        name = str(row.get("name", "")).strip()
-        if name:
-            result[name] = {
-                "projected_era": row.get("projected_era"),
-                "projected_war": row.get("projected_war"),
+
+    # Build FanGraphs ID -> MLBAM ID crosswalk
+    fg_to_mlbam: dict[int, int] = {}
+    try:
+        from pybaseball import playerid_reverse_lookup
+        fg_ids_int = [int(x) for x in df["fg_id"].dropna().unique() if str(x).isdigit()]
+        if fg_ids_int:
+            crosswalk = playerid_reverse_lookup(fg_ids_int, key_type="fangraphs")
+            fg_to_mlbam = {
+                int(row["key_fangraphs"]): int(row["key_mlbam"])
+                for _, row in crosswalk.iterrows()
+                if pd.notna(row.get("key_fangraphs")) and pd.notna(row.get("key_mlbam"))
             }
+            print(f"    Crosswalk: mapped {len(fg_to_mlbam)}/{len(fg_ids_int)} FG IDs to MLBAM IDs")
+    except Exception as e:
+        print(f"    Crosswalk unavailable ({e}); using name matching only")
+
+    result = {}
+    last_name_counts: dict[str, list[str]] = {}  # last_name -> [normalized full names]
+
+    for _, row in df.iterrows():
+        raw_name = str(row.get("name", "")).strip()
+        if not raw_name:
+            continue
+
+        proj = {
+            "projected_era": row.get("projected_era"),
+            "projected_war": row.get("projected_war"),
+        }
+
+        # Key by normalized name
+        norm = _normalize_name(raw_name)
+        if norm:
+            result[norm] = proj
+
+        # Key by MLBAM ID if crosswalk is available
+        fg_id = row.get("fg_id")
+        if pd.notna(fg_id) and str(fg_id).isdigit():
+            mlbam_id = fg_to_mlbam.get(int(fg_id))
+            if mlbam_id:
+                result[mlbam_id] = proj
+
+        # Track last names for fallback
+        parts = norm.split() if norm else []
+        if parts:
+            last = parts[-1]
+            last_name_counts.setdefault(last, []).append(norm)
+
+    # Add unambiguous last-name fallback entries
+    for last, full_names in last_name_counts.items():
+        if len(full_names) == 1:
+            result[f"last:{last}"] = result[full_names[0]]
+
     return result
 
 
@@ -1444,10 +1525,10 @@ def _compute_adjusted_team_priors(
         if pid in idx.get("pitcher", {}):
             pitcher_df = idx["pitcher"][pid]
             if len(pitcher_df) >= 100:
-                pitcher_xrv = pitcher_df["xrv"].mean()
-                # Negative xRV = good pitcher. Acquiring good pitcher = positive for team.
-                # We use -xRV as the talent signal (positive = good)
-                talent = -pitcher_xrv
+                # Total xRV impact = per-pitch xRV * number of pitches
+                # Negative xRV = good pitcher, so -total = positive talent
+                total_xrv = pitcher_df["xrv"].mean() * len(pitcher_df)
+                talent = -total_xrv
                 team_xrv_change[to_team] = team_xrv_change.get(to_team, 0) + talent
                 if from_team:
                     team_xrv_change[from_team] = team_xrv_change.get(from_team, 0) - talent
@@ -1455,24 +1536,23 @@ def _compute_adjusted_team_priors(
     if not team_xrv_change:
         return team_priors.copy()
 
-    # Scale: each unit of net xRV talent ≈ a small win% adjustment
-    # Rough calibration: a team's full pitching staff faces ~25k pitches/season
-    # An xRV advantage of 0.01 (per pitch) ≈ 250 runs ≈ 25 wins (very rough)
-    # Scale down substantially since we're looking at individual acquisitions
-    SCALE = 0.02  # conservative: 1 unit net talent ≈ 2% win% adjustment
-
+    # Convert total xRV talent to win% adjustment:
+    # ~10 runs = 1 win in MLB, 1 win over 162 games ≈ 0.00617 win%
     adjusted = {}
     for team, base_prior in team_priors.items():
-        change = team_xrv_change.get(team, 0)
-        adjusted[team] = np.clip(base_prior + change * SCALE, 0.3, 0.7)
+        total_talent = team_xrv_change.get(team, 0)
+        talent_in_wins = total_talent / 10.0
+        wpct_adj = talent_in_wins / 162.0
+        adjusted[team] = np.clip(base_prior + wpct_adj, 0.3, 0.7)
     return adjusted
 
 
-def _sp_prior_season_features(idx: dict, pitcher_id: int, prior_year_cutoff: str) -> dict:
+def _sp_prior_season_features(idx: dict, pitcher_id: int, prior_year_cutoff: str, game_date: str = None) -> dict:
     """Compute SP features from prior season data as fallback for early season.
 
     Uses all pitches from prior season for the given pitcher.
     Returns the same dict format as _sp_features_fast, or None if insufficient data.
+    If game_date is provided, computes actual rest days from last prior-season appearance.
     """
     if pitcher_id not in idx.get("pitcher", {}):
         return None
@@ -1536,13 +1616,22 @@ def _sp_prior_season_features(idx: dict, pitcher_id: int, prior_year_cutoff: str
             entropies.append(-float(np.sum(counts * np.log2(counts))))
         sp_transition_entropy = float(np.mean(entropies)) if entropies else 0.0
 
+    # Compute actual rest days from last prior-season appearance
+    rest_days = 14  # default fallback
+    if game_date and "game_date" in before.columns:
+        last_appearance = str(before["game_date"].max())
+        try:
+            rest_days = min((pd.Timestamp(game_date) - pd.Timestamp(last_appearance)).days, 180)
+        except Exception:
+            pass
+
     return {
         "sp_xrv_mean": xrv_mean, "sp_xrv_std": xrv_std,
         "sp_n_pitches": len(recent),
         "sp_k_rate": k_rate, "sp_bb_rate": bb_rate, "sp_avg_velo": avg_velo,
         "sp_pitch_mix_entropy": entropy,
         "sp_xrv_vs_L": xrv_vs_L, "sp_xrv_vs_R": xrv_vs_R,
-        "sp_rest_days": 14,  # prior season = fully rested
+        "sp_rest_days": rest_days,
         "sp_overperf": sp_overperf, "sp_overperf_recent": sp_overperf_recent,
         "sp_velo_trend": 0.0, "sp_spin_trend": 0.0, "sp_xrv_trend": 0.0,
         "sp_home_xrv": sp_home_xrv, "sp_away_xrv": sp_away_xrv,
@@ -1666,7 +1755,7 @@ def build_game_features(
         print(f"  Roster-adjusted priors computed for {len(adjusted_priors)} teams")
 
     # Determine Opening Day for days_into_season (Step 4)
-    opening_day = games["game_date"].min()
+    opening_day = OPENING_DAY.get(target_year, str(games["game_date"].min()))
     print(f"  Opening Day: {opening_day}")
 
     # Load trade deadline acquisitions (current season, only affects games after deadline)
@@ -1721,7 +1810,7 @@ def build_game_features(
                     got_features = True
                 else:
                     # Current season < 50 pitches — try prior-season fallback
-                    fallback = _sp_prior_season_features(idx, int(sp_id), prior_year_cutoff)
+                    fallback = _sp_prior_season_features(idx, int(sp_id), prior_year_cutoff, gdate)
                     if fallback:
                         for k, v in fallback.items():
                             row[f"{side}_{k}"] = v
@@ -1729,7 +1818,7 @@ def build_game_features(
                         got_features = True
             elif pd.notna(sp_id):
                 # Pitcher not in xRV index at all — try prior season
-                fallback = _sp_prior_season_features(idx, int(sp_id), prior_year_cutoff)
+                fallback = _sp_prior_season_features(idx, int(sp_id), prior_year_cutoff, gdate)
                 if fallback:
                     for k, v in fallback.items():
                         row[f"{side}_{k}"] = v
@@ -1889,9 +1978,20 @@ def build_game_features(
         row["home_projected_wpct"] = team_projections.get(home_team, np.nan)
         row["away_projected_wpct"] = team_projections.get(away_team, np.nan)
 
-        # Pitcher projections (look up by name since MLB IDs ≠ FanGraphs IDs)
-        for side_label, sp_name in [("home", home_sp_name), ("away", away_sp_name)]:
-            sp_proj = pitcher_projections.get(sp_name) if pd.notna(sp_name) and sp_name else None
+        # Pitcher projections: try MLBAM ID, then normalized name, then last-name fallback
+        for side_label, sp_id_val, sp_name in [("home", home_sp, home_sp_name), ("away", away_sp, away_sp_name)]:
+            sp_proj = None
+            # Try MLBAM ID first (most reliable)
+            if pd.notna(sp_id_val):
+                sp_proj = pitcher_projections.get(int(sp_id_val))
+            # Try normalized full name
+            if not sp_proj and pd.notna(sp_name) and sp_name:
+                sp_proj = pitcher_projections.get(_normalize_name(str(sp_name)))
+            # Try last-name fallback (only if unambiguous)
+            if not sp_proj and pd.notna(sp_name) and sp_name:
+                parts = _normalize_name(str(sp_name)).split()
+                if parts:
+                    sp_proj = pitcher_projections.get(f"last:{parts[-1]}")
             if sp_proj:
                 row[f"{side_label}_sp_projected_era"] = sp_proj.get("projected_era", np.nan)
                 row[f"{side_label}_sp_projected_war"] = sp_proj.get("projected_war", np.nan)

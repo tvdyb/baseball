@@ -223,11 +223,13 @@ def add_nonlinear_features(X: pd.DataFrame) -> pd.DataFrame:
             if col in X.columns:
                 X[f"{col}_x_early"] = X[col].fillna(0) * early_mask
 
-        # Blended prior: projections early, xRV later
+        # Blended prior: projections early, xRV later (z-scored to comparable scales)
         if "diff_projected_wpct" in X.columns and "diff_sp_xrv_mean" in X.columns:
             proj = X["diff_projected_wpct"].fillna(0)
             xrv = X["diff_sp_xrv_mean"].fillna(0)
-            X["prior_dominance"] = early_mask * proj + (1 - early_mask) * xrv
+            proj_z = (proj - proj.mean()) / (proj.std() + 1e-9)
+            xrv_z = (xrv - xrv.mean()) / (xrv.std() + 1e-9)
+            X["prior_dominance"] = early_mask * proj_z + (1 - early_mask) * xrv_z
 
     return X
 
