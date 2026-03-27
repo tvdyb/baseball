@@ -4,6 +4,7 @@ Scrape Kalshi MLB game market data for backtesting.
 
 Fetches:
   1. All settled KXMLBGAME markets (team, result, volume)
+     from both the regular and historical market listing endpoints
   2. Pre-game closing prices using actual first-pitch timestamps
      from games parquet + candlestick endpoints (historical + live)
 
@@ -31,7 +32,10 @@ KALSHI_DIR = DATA_DIR / "kalshi"
 GAMES_DIR = DATA_DIR / "games"
 API_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 
-# Kalshi team abbreviations → our abbreviations
+# Kalshi team abbreviations → MLB Stats API abbreviations (canonical form).
+# For 2025+: Oakland Athletics = "ATH" (not "OAK"), Arizona = "AZ" (not "ARI").
+# Both the MLB Stats API and our feature pipeline use ATH and AZ.
+# Kalshi tickers use "ARI" for Arizona, so we map ARI → AZ.
 TEAM_MAP = {
     "LAD": "LAD", "TOR": "TOR", "NYY": "NYY", "NYM": "NYM",
     "BOS": "BOS", "HOU": "HOU", "ATL": "ATL", "SD": "SD",
@@ -92,7 +96,10 @@ def parse_event_ticker(event_ticker: str) -> dict | None:
             else:
                 continue
 
-            away_team, home_team = _parse_teams(team_str)
+            # Strip trailing doubleheader markers: G1/G2 or just 1/2
+            team_str_clean = re.sub(r"G?\d$", "", team_str)
+
+            away_team, home_team = _parse_teams(team_str_clean)
             if away_team and home_team:
                 try:
                     game_date = f"{year}-{month:02d}-{day:02d}"
@@ -120,8 +127,24 @@ def _parse_teams(team_str: str) -> tuple[str | None, str | None]:
     return None, None
 
 
-def fetch_all_markets(year: int) -> list[dict]:
-    """Fetch all settled KXMLBGAME markets, paginating through results."""
+def _api_get_with_retry(
+    client: httpx.Client, url: str, params: dict, max_retries: int = 3,
+) -> httpx.Response:
+    """GET with retry and exponential backoff. Raises on final failure."""
+    for attempt in range(max_retries):
+        try:
+            resp = client.get(url, params=params)
+            resp.raise_for_status()
+            return resp
+        except (httpx.TimeoutException, httpx.HTTPStatusError, httpx.ConnectError):
+            if attempt < max_retries - 1:
+                time.sleep((attempt + 1) * 3)
+            else:
+                raise
+
+
+def fetch_regular_markets() -> list[dict]:
+    """Fetch all settled KXMLBGAME markets from the regular endpoint."""
     all_markets = []
     cursor = ""
 
@@ -135,17 +158,7 @@ def fetch_all_markets(year: int) -> list[dict]:
             if cursor:
                 params["cursor"] = cursor
 
-            for attempt in range(3):
-                try:
-                    resp = client.get(f"{API_BASE}/markets", params=params)
-                    resp.raise_for_status()
-                    break
-                except (httpx.TimeoutException, httpx.HTTPStatusError):
-                    if attempt < 2:
-                        time.sleep((attempt + 1) * 3)
-                    else:
-                        raise
-
+            resp = _api_get_with_retry(client, f"{API_BASE}/markets", params)
             data = resp.json()
 
             markets = data.get("markets", [])
@@ -160,8 +173,99 @@ def fetch_all_markets(year: int) -> list[dict]:
 
             time.sleep(0.3)
 
-    log(f"  Fetched {len(all_markets)} total markets")
     return all_markets
+
+
+def fetch_historical_markets(max_pages: int = 500) -> list[dict]:
+    """Fetch settled KXMLBGAME markets from the historical endpoint.
+
+    The historical endpoint does NOT support series_ticker filtering,
+    so we fetch all historical markets and filter client-side.
+    Stops after max_pages to avoid infinite pagination.
+    """
+    mlb_markets = []
+    cursor = ""
+    pages = 0
+    # Track pages without MLB markets — stop early if none are found
+    pages_without_mlb = 0
+
+    with httpx.Client(timeout=60.0) as client:
+        while pages < max_pages:
+            params = {"limit": 200}
+            if cursor:
+                params["cursor"] = cursor
+
+            try:
+                resp = _api_get_with_retry(client, f"{API_BASE}/historical/markets", params)
+            except Exception:
+                log(f"    historical markets: stopped at page {pages} due to error")
+                break
+
+            data = resp.json()
+            markets = data.get("markets", [])
+            if not markets:
+                break
+
+            mlb = [m for m in markets if m.get("event_ticker", "").startswith("KXMLBGAME")]
+            mlb_markets.extend(mlb)
+            pages += 1
+
+            if mlb:
+                pages_without_mlb = 0
+            else:
+                pages_without_mlb += 1
+
+            if pages % 50 == 0:
+                log(f"    historical markets: page {pages}, {len(mlb_markets)} MLB so far")
+
+            # If we've gone 25 pages (5k markets) without finding any MLB,
+            # they probably aren't in the historical archive
+            if pages_without_mlb >= 25 and not mlb_markets:
+                log(f"    historical markets: no MLB markets found in {pages} pages ({pages * 200} markets), stopping")
+                break
+
+            cursor = data.get("cursor", "")
+            if not cursor:
+                break
+
+            time.sleep(0.3)
+
+    return mlb_markets
+
+
+def fetch_all_markets(year: int) -> list[dict]:
+    """Fetch all settled KXMLBGAME markets from both regular and historical endpoints.
+
+    Deduplicates on market ticker.
+    """
+    log("  Fetching from regular endpoint...")
+    regular = fetch_regular_markets()
+    log(f"    {len(regular)} markets from regular endpoint")
+
+    log("  Fetching from historical endpoint...")
+    historical = fetch_historical_markets()
+    log(f"    {len(historical)} MLB markets from historical endpoint")
+
+    # Merge and deduplicate on ticker
+    seen_tickers = set()
+    combined = []
+    for m in regular:
+        t = m["ticker"]
+        if t not in seen_tickers:
+            seen_tickers.add(t)
+            combined.append(m)
+
+    new_from_historical = 0
+    for m in historical:
+        t = m["ticker"]
+        if t not in seen_tickers:
+            seen_tickers.add(t)
+            combined.append(m)
+            new_from_historical += 1
+
+    log(f"  Combined: {len(combined)} unique markets "
+        f"({len(regular)} regular + {new_from_historical} new from historical)")
+    return combined
 
 
 def fetch_historical_cutoff() -> float:
@@ -170,9 +274,8 @@ def fetch_historical_cutoff() -> float:
     Markets settled before this timestamp are archived and must use
     the /historical/ endpoint for candlestick data.
     """
-    with httpx.Client(timeout=15.0) as client:
-        resp = client.get(f"{API_BASE}/historical/cutoff")
-        resp.raise_for_status()
+    with httpx.Client(timeout=30.0) as client:
+        resp = _api_get_with_retry(client, f"{API_BASE}/historical/cutoff", {})
         data = resp.json()
 
     ts_str = data["market_settled_ts"]
@@ -184,11 +287,14 @@ def fetch_historical_cutoff() -> float:
 def group_markets_by_event(markets: list[dict], year: int) -> dict:
     """Group markets by event (game) and filter to target year."""
     events = {}
+    parse_failures = []
 
     for m in markets:
         event_ticker = m["event_ticker"]
         parsed = parse_event_ticker(event_ticker)
         if not parsed:
+            if event_ticker not in {e for e, _ in parse_failures}:
+                parse_failures.append((event_ticker, m["ticker"]))
             continue
         if int(parsed["game_date"][:4]) != year:
             continue
@@ -206,11 +312,18 @@ def group_markets_by_event(markets: list[dict], year: int) -> dict:
         events[event_ticker]["markets"][team] = {
             "ticker": m["ticker"],
             "result": m.get("result"),
-            "volume": float(m.get("volume_fp") or 0),
-            "open_interest": float(m.get("open_interest_fp") or 0),
+            "volume": float(m.get("volume_fp") or m.get("volume") or 0),
+            "open_interest": float(m.get("open_interest_fp") or m.get("open_interest") or 0),
             "open_time": m.get("open_time"),
             "close_time": m.get("close_time"),
         }
+
+    if parse_failures:
+        log(f"  WARNING: {len(parse_failures)} event tickers failed to parse:")
+        for et, ticker in parse_failures[:10]:
+            log(f"    {et} (market: {ticker})")
+        if len(parse_failures) > 10:
+            log(f"    ... and {len(parse_failures) - 10} more")
 
     return events
 
@@ -218,7 +331,8 @@ def group_markets_by_event(markets: list[dict], year: int) -> dict:
 def load_game_start_times(year: int) -> dict:
     """Load actual first-pitch timestamps from games parquet.
 
-    Returns dict mapping (game_date, home_team, away_team) → unix timestamp.
+    Returns dict mapping (game_date, home_team, away_team) → list of unix
+    timestamps. Multiple entries for doubleheaders.
     """
     games_path = GAMES_DIR / f"games_{year}.parquet"
     if not games_path.exists():
@@ -228,7 +342,8 @@ def load_game_start_times(year: int) -> dict:
     df = pd.read_parquet(games_path)
     df["game_date"] = df["game_date"].astype(str)
 
-    start_times = {}
+    start_times: dict[tuple, list[float]] = {}
+    doubleheaders = 0
     for _, row in df.iterrows():
         gdt = row.get("game_datetime", "")
         if not gdt:
@@ -236,12 +351,49 @@ def load_game_start_times(year: int) -> dict:
         try:
             dt = datetime.fromisoformat(gdt.replace("Z", "+00:00"))
             key = (row["game_date"], row["home_team_abbr"], row["away_team_abbr"])
-            start_times[key] = dt.timestamp()
+            if key not in start_times:
+                start_times[key] = []
+            else:
+                doubleheaders += 1
+            start_times[key].append(dt.timestamp())
         except (ValueError, TypeError):
             continue
 
-    log(f"  Loaded {len(start_times)} game start times from {games_path}")
+    # Sort each list so earliest game is first
+    for key in start_times:
+        start_times[key].sort()
+
+    log(f"  Loaded {len(start_times)} matchups ({doubleheaders} doubleheader games) "
+        f"from {games_path}")
     return start_times
+
+
+def _pick_best_start_time(
+    start_times_list: list[float], market_open_time: str, market_close_time: str,
+) -> float:
+    """For doubleheaders, pick the game start time closest to the market's timing.
+
+    The market open_time and close_time bracket the game. We pick the start time
+    that's closest to the market close_time (since markets close around game end).
+    """
+    if len(start_times_list) == 1:
+        return start_times_list[0]
+
+    # Parse market close time as reference
+    try:
+        ref_ts = datetime.fromisoformat(
+            market_close_time.replace("Z", "+00:00")
+        ).timestamp()
+    except (ValueError, TypeError):
+        try:
+            ref_ts = datetime.fromisoformat(
+                market_open_time.replace("Z", "+00:00")
+            ).timestamp()
+        except (ValueError, TypeError):
+            return start_times_list[0]
+
+    # Pick the game start time closest to the market close time
+    return min(start_times_list, key=lambda ts: abs(ts - ref_ts))
 
 
 def _extract_candle_close(price_data: dict) -> float | None:
@@ -506,13 +658,20 @@ def fetch_all_pregame_prices(
             no_home_market += 1
             continue
 
-        # Look up actual game start time
+        # Look up actual game start time (handles doubleheaders)
         gst_key = (game_date, home_team, away_team)
-        game_start_ts = game_start_times.get(gst_key)
+        start_times_list = game_start_times.get(gst_key)
 
-        if game_start_ts is None:
+        if not start_times_list:
             no_start_time += 1
             continue
+
+        # For doubleheaders, pick the start time closest to this market's timing
+        game_start_ts = _pick_best_start_time(
+            start_times_list,
+            home_market["open_time"],
+            home_market["close_time"],
+        )
 
         # Route to batch (live) or individual (historical/fallback)
         try:
