@@ -143,129 +143,166 @@ def _api_get_with_retry(
                 raise
 
 
-def fetch_regular_markets() -> list[dict]:
-    """Fetch all settled KXMLBGAME markets from the regular endpoint."""
-    all_markets = []
+def fetch_events(year: int) -> list[dict]:
+    """Fetch all settled KXMLBGAME events via the Events API.
+
+    Paginates GET /events?series_ticker=KXMLBGAME&status=settled&with_nested_markets=true.
+    For events missing nested markets (can happen with archived events),
+    fetches individually via GET /events/{event_ticker}?with_nested_markets=true
+    or falls back to GET /historical/markets?event_ticker={et}.
+    """
+    all_events = []
     cursor = ""
+    page = 0
 
     with httpx.Client(timeout=60.0) as client:
+        # Phase 1: Paginate the events endpoint
+        while True:
+            params = {
+                "series_ticker": "KXMLBGAME",
+                "status": "settled",
+                "with_nested_markets": "true",
+                "limit": 200,
+            }
+            if cursor:
+                params["cursor"] = cursor
+
+            resp = _api_get_with_retry(client, f"{API_BASE}/events", params)
+            data = resp.json()
+
+            events = data.get("events", [])
+            if not events:
+                break
+
+            all_events.extend(events)
+            page += 1
+            cursor = data.get("cursor", "")
+
+            if not cursor:
+                break
+
+            time.sleep(0.3)
+
+        log(f"  Fetched {len(all_events)} events from events endpoint")
+
+        # Phase 2: For events missing nested markets, fetch individually
+        missing_markets = [
+            e for e in all_events
+            if not e.get("markets")
+        ]
+        if missing_markets:
+            log(f"  {len(missing_markets)} events missing nested markets, fetching individually...")
+            fetched = 0
+            for e in missing_markets:
+                et = e["event_ticker"]
+                try:
+                    resp = _api_get_with_retry(
+                        client,
+                        f"{API_BASE}/events/{et}",
+                        {"with_nested_markets": "true"},
+                    )
+                    event_data = resp.json().get("event", {})
+                    markets = event_data.get("markets", [])
+                    if markets:
+                        e["markets"] = markets
+                        fetched += 1
+                    else:
+                        # Fall back to historical markets endpoint
+                        resp2 = _api_get_with_retry(
+                            client,
+                            f"{API_BASE}/historical/markets",
+                            {"event_ticker": et},
+                        )
+                        hist_markets = resp2.json().get("markets", [])
+                        if hist_markets:
+                            e["markets"] = hist_markets
+                            fetched += 1
+                except Exception:
+                    pass
+                time.sleep(0.2)
+            log(f"    Resolved {fetched}/{len(missing_markets)} events")
+
+        # Phase 3: Supplement with /markets endpoint to catch events the
+        # Events API misses (known gap: ~11 events not returned by /events)
+        known_event_tickers = {e["event_ticker"] for e in all_events}
+        log(f"  Checking /markets endpoint for additional events...")
+        supplement_markets: dict[str, list[dict]] = {}  # event_ticker -> [markets]
+        supplement_cursor = ""
+
         while True:
             params = {
                 "series_ticker": "KXMLBGAME",
                 "status": "settled",
                 "limit": 200,
             }
-            if cursor:
-                params["cursor"] = cursor
+            if supplement_cursor:
+                params["cursor"] = supplement_cursor
 
             resp = _api_get_with_retry(client, f"{API_BASE}/markets", params)
             data = resp.json()
-
             markets = data.get("markets", [])
             if not markets:
                 break
 
-            all_markets.extend(markets)
-            cursor = data.get("cursor", "")
+            for m in markets:
+                et = m.get("event_ticker", "")
+                if et and et not in known_event_tickers:
+                    if et not in supplement_markets:
+                        supplement_markets[et] = []
+                    supplement_markets[et].append(m)
 
-            if not cursor:
+            supplement_cursor = data.get("cursor", "")
+            if not supplement_cursor:
                 break
-
             time.sleep(0.3)
 
-    return all_markets
+        for et, mkts in supplement_markets.items():
+            all_events.append({"event_ticker": et, "markets": mkts})
 
+        if supplement_markets:
+            log(f"  Found {len(supplement_markets)} additional events from /markets endpoint")
 
-def fetch_historical_markets(max_pages: int = 500) -> list[dict]:
-    """Fetch settled KXMLBGAME markets from the historical endpoint.
-
-    The historical endpoint does NOT support series_ticker filtering,
-    so we fetch all historical markets and filter client-side.
-    Stops after max_pages to avoid infinite pagination.
-    """
-    mlb_markets = []
-    cursor = ""
-    pages = 0
-    # Track pages without MLB markets — stop early if none are found
-    pages_without_mlb = 0
-
-    with httpx.Client(timeout=60.0) as client:
-        while pages < max_pages:
-            params = {"limit": 200}
-            if cursor:
-                params["cursor"] = cursor
-
-            try:
-                resp = _api_get_with_retry(client, f"{API_BASE}/historical/markets", params)
-            except Exception:
-                log(f"    historical markets: stopped at page {pages} due to error")
-                break
-
-            data = resp.json()
-            markets = data.get("markets", [])
-            if not markets:
-                break
-
-            mlb = [m for m in markets if m.get("event_ticker", "").startswith("KXMLBGAME")]
-            mlb_markets.extend(mlb)
-            pages += 1
-
-            if mlb:
-                pages_without_mlb = 0
-            else:
-                pages_without_mlb += 1
-
-            if pages % 50 == 0:
-                log(f"    historical markets: page {pages}, {len(mlb_markets)} MLB so far")
-
-            # If we've gone 25 pages (5k markets) without finding any MLB,
-            # they probably aren't in the historical archive
-            if pages_without_mlb >= 25 and not mlb_markets:
-                log(f"    historical markets: no MLB markets found in {pages} pages ({pages * 200} markets), stopping")
-                break
-
-            cursor = data.get("cursor", "")
-            if not cursor:
-                break
-
-            time.sleep(0.3)
-
-    return mlb_markets
+    return all_events
 
 
 def fetch_all_markets(year: int) -> list[dict]:
-    """Fetch all settled KXMLBGAME markets from both regular and historical endpoints.
+    """Fetch all settled KXMLBGAME markets via the Events API.
 
-    Deduplicates on market ticker.
+    Returns a flat list of market dicts (same format as before) for
+    compatibility with downstream code.
     """
-    log("  Fetching from regular endpoint...")
-    regular = fetch_regular_markets()
-    log(f"    {len(regular)} markets from regular endpoint")
+    events = fetch_events(year)
 
-    log("  Fetching from historical endpoint...")
-    historical = fetch_historical_markets()
-    log(f"    {len(historical)} MLB markets from historical endpoint")
-
-    # Merge and deduplicate on ticker
+    # Flatten: extract nested markets from each event
+    all_markets = []
     seen_tickers = set()
-    combined = []
-    for m in regular:
-        t = m["ticker"]
-        if t not in seen_tickers:
-            seen_tickers.add(t)
-            combined.append(m)
+    events_without_markets = []
 
-    new_from_historical = 0
-    for m in historical:
-        t = m["ticker"]
-        if t not in seen_tickers:
-            seen_tickers.add(t)
-            combined.append(m)
-            new_from_historical += 1
+    for e in events:
+        event_ticker = e.get("event_ticker", "")
+        markets = e.get("markets", [])
+        if not markets:
+            events_without_markets.append(event_ticker)
+            continue
 
-    log(f"  Combined: {len(combined)} unique markets "
-        f"({len(regular)} regular + {new_from_historical} new from historical)")
-    return combined
+        for m in markets:
+            # Ensure event_ticker is set on each market
+            if "event_ticker" not in m:
+                m["event_ticker"] = event_ticker
+            t = m.get("ticker", "")
+            if t and t not in seen_tickers:
+                seen_tickers.add(t)
+                all_markets.append(m)
+
+    if events_without_markets:
+        log(f"  WARNING: {len(events_without_markets)} events had no markets:")
+        for et in events_without_markets[:10]:
+            log(f"    {et}")
+        if len(events_without_markets) > 10:
+            log(f"    ... and {len(events_without_markets) - 10} more")
+
+    log(f"  {len(all_markets)} total markets from {len(events)} events")
+    return all_markets
 
 
 def fetch_historical_cutoff() -> float:
@@ -827,6 +864,51 @@ def main():
         for month in sorted(df["month"].unique()):
             n = len(df[df["month"] == month])
             log(f"    {month}: {n}")
+
+    # Coverage diagnostic: compare against games parquet
+    log(f"\nCoverage diagnostic:")
+    games_path = GAMES_DIR / f"games_{args.year}.parquet"
+    if games_path.exists():
+        games_df = pd.read_parquet(games_path)
+        games_df["game_date"] = games_df["game_date"].astype(str)
+        total_mlb = len(games_df)
+        kalshi_events = len(events)
+        kalshi_priced = len(df) if len(df) > 0 else 0
+
+        log(f"  MLB games (parquet): {total_mlb}")
+        log(f"  Kalshi events found: {kalshi_events}")
+        log(f"  Kalshi with prices:  {kalshi_priced}")
+        log(f"  Missing from Kalshi: {total_mlb - kalshi_events}")
+
+        # Find specific missing games
+        kalshi_keys = set()
+        for et, ev in events.items():
+            kalshi_keys.add((ev["game_date"], ev["home_team"], ev["away_team"]))
+
+        missing = []
+        for _, row in games_df.iterrows():
+            key = (row["game_date"], row["home_team_abbr"], row["away_team_abbr"])
+            if key not in kalshi_keys:
+                missing.append(key)
+
+        if missing:
+            # Group by date range
+            missing_dates = sorted(set(m[0] for m in missing))
+            if missing_dates:
+                log(f"  Missing date range: {missing_dates[0]} -> {missing_dates[-1]}")
+                # Show first/last few
+                early = [m for m in missing if m[0] <= missing_dates[min(5, len(missing_dates)-1)]]
+                late = [m for m in missing if m[0] >= missing_dates[max(0, len(missing_dates)-6)]]
+                if early:
+                    log(f"  First missing games:")
+                    for d, h, a in sorted(early)[:5]:
+                        log(f"    {d}: {a} @ {h}")
+                if late and late != early:
+                    log(f"  Last missing games:")
+                    for d, h, a in sorted(late)[-5:]:
+                        log(f"    {d}: {a} @ {h}")
+    else:
+        log(f"  {games_path} not found — cannot compare")
 
 
 if __name__ == "__main__":
