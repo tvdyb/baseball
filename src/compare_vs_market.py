@@ -25,7 +25,7 @@ except ImportError:
     HAS_XGB = False
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from win_model import DIFF_FEATURES, RAW_FEATURES, ALL_FEATURES, add_nonlinear_features
+from win_model import DIFF_FEATURES, RAW_FEATURES, ALL_FEATURES, add_nonlinear_features, _smart_fillna
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 FEATURES_DIR = DATA_DIR / "features"
@@ -53,7 +53,8 @@ def train_ensemble(train_df):
     y = train_df["home_win"].values
 
     scaler = StandardScaler()
-    X_lr = scaler.fit_transform(X.fillna(0))
+    X_filled, train_medians = _smart_fillna(X)
+    X_lr = scaler.fit_transform(X_filled)
     lr = LogisticRegression(C=1.0, max_iter=1000, solver="lbfgs")
     lr.fit(X_lr, y)
 
@@ -83,14 +84,15 @@ def train_ensemble(train_df):
         w_lr = opt.x
         print(f"  Learned blend: LR={w_lr:.2f}, XGB={1-w_lr:.2f}")
 
-    return lr, scaler, xgb_model, available, w_lr
+    return lr, scaler, xgb_model, available, w_lr, train_medians
 
 
-def predict(lr, scaler, xgb_model, features, test_df, w_lr=0.5):
+def predict(lr, scaler, xgb_model, features, test_df, w_lr=0.5, train_medians=None):
     available = [f for f in features if f in test_df.columns]
     X = test_df[available].copy()
 
-    X_lr = scaler.transform(X.fillna(0))
+    X_filled, _ = _smart_fillna(X, train_medians)
+    X_lr = scaler.transform(X_filled)
     lr_probs = lr.predict_proba(X_lr)[:, 1]
 
     if xgb_model and HAS_XGB:
@@ -379,7 +381,7 @@ def main():
     print(f"  {len(train_df)} training games")
 
     print("\nTraining ensemble model...")
-    lr, scaler, xgb_model, features, w_lr = train_ensemble(train_df)
+    lr, scaler, xgb_model, features, w_lr, train_medians = train_ensemble(train_df)
     print(f"  Features used: {len(features)}")
 
     print("\nLoading 2025 test data...")
@@ -387,7 +389,7 @@ def main():
     print(f"  {len(test_df)} test games")
 
     # Generate predictions
-    lr_probs, xgb_probs, ens_probs = predict(lr, scaler, xgb_model, features, test_df, w_lr)
+    lr_probs, xgb_probs, ens_probs = predict(lr, scaler, xgb_model, features, test_df, w_lr, train_medians)
     test_df["model_prob"] = ens_probs
     test_df["model_prob_lr"] = lr_probs
     test_df["model_prob_xgb"] = xgb_probs

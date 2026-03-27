@@ -1369,6 +1369,188 @@ def _compute_team_priors(prior_year: int) -> dict[str, float]:
     return priors
 
 
+PROJECTIONS_DIR = DATA_DIR / "projections"
+
+
+def _load_team_projections(year: int) -> dict[str, float]:
+    """Load preseason projected win% for each team.
+
+    Returns {team_abbr: projected_wpct}. Returns empty dict if unavailable.
+    """
+    path = PROJECTIONS_DIR / f"team_projections_{year}.parquet"
+    if not path.exists():
+        return {}
+    df = pd.read_parquet(path)
+    return dict(zip(df["team_abbr"], df["projected_wpct"]))
+
+
+def _load_pitcher_projections(year: int) -> dict[str, dict]:
+    """Load preseason pitcher projections keyed by pitcher name.
+
+    Returns {name: {"projected_era": ..., "projected_war": ...}}.
+    Keyed by name since games use MLB IDs while projections use FanGraphs IDs.
+    """
+    path = PROJECTIONS_DIR / f"pitcher_projections_{year}.parquet"
+    if not path.exists():
+        return {}
+    df = pd.read_parquet(path)
+    result = {}
+    for _, row in df.iterrows():
+        name = str(row.get("name", "")).strip()
+        if name:
+            result[name] = {
+                "projected_era": row.get("projected_era"),
+                "projected_war": row.get("projected_war"),
+            }
+    return result
+
+
+def _compute_adjusted_team_priors(
+    prior_year: int, team_priors: dict[str, float], idx: dict,
+) -> dict[str, float]:
+    """Compute roster-adjusted team priors using offseason transactions.
+
+    Adjusts raw prior-season win% based on pitching talent gained/lost
+    during the offseason (Oct prior_year through Mar target_year).
+    """
+    target_year = prior_year + 1
+    tx_path = ROSTER_DIR / f"transactions_{target_year}.parquet"
+    if not tx_path.exists():
+        # Try prior year's offseason transactions
+        tx_path = ROSTER_DIR / f"transactions_{prior_year}.parquet"
+        if not tx_path.exists():
+            return team_priors.copy()
+
+    tx = pd.read_parquet(tx_path)
+
+    # Offseason window: Oct of prior year through March of target year
+    offseason_start = f"{prior_year}-10-01"
+    offseason_end = f"{target_year}-03-31"
+    tx = tx[(tx["date"] >= offseason_start) & (tx["date"] <= offseason_end)]
+    if len(tx) == 0:
+        return team_priors.copy()
+
+    # Compute net pitcher xRV change per team
+    team_xrv_change = {}
+    for _, row in tx.iterrows():
+        to_team = row.get("to_team")
+        from_team = row.get("from_team")
+        pid = int(row["player_id"]) if pd.notna(row.get("player_id")) else None
+
+        if not pid or not to_team:
+            continue
+
+        # Check if this player is a pitcher in our xRV data
+        if pid in idx.get("pitcher", {}):
+            pitcher_df = idx["pitcher"][pid]
+            if len(pitcher_df) >= 100:
+                pitcher_xrv = pitcher_df["xrv"].mean()
+                # Negative xRV = good pitcher. Acquiring good pitcher = positive for team.
+                # We use -xRV as the talent signal (positive = good)
+                talent = -pitcher_xrv
+                team_xrv_change[to_team] = team_xrv_change.get(to_team, 0) + talent
+                if from_team:
+                    team_xrv_change[from_team] = team_xrv_change.get(from_team, 0) - talent
+
+    if not team_xrv_change:
+        return team_priors.copy()
+
+    # Scale: each unit of net xRV talent ≈ a small win% adjustment
+    # Rough calibration: a team's full pitching staff faces ~25k pitches/season
+    # An xRV advantage of 0.01 (per pitch) ≈ 250 runs ≈ 25 wins (very rough)
+    # Scale down substantially since we're looking at individual acquisitions
+    SCALE = 0.02  # conservative: 1 unit net talent ≈ 2% win% adjustment
+
+    adjusted = {}
+    for team, base_prior in team_priors.items():
+        change = team_xrv_change.get(team, 0)
+        adjusted[team] = np.clip(base_prior + change * SCALE, 0.3, 0.7)
+    return adjusted
+
+
+def _sp_prior_season_features(idx: dict, pitcher_id: int, prior_year_cutoff: str) -> dict:
+    """Compute SP features from prior season data as fallback for early season.
+
+    Uses all pitches from prior season for the given pitcher.
+    Returns the same dict format as _sp_features_fast, or None if insufficient data.
+    """
+    if pitcher_id not in idx.get("pitcher", {}):
+        return None
+
+    pitcher_df = idx["pitcher"][pitcher_id]
+    # Get only prior-season pitches (before the current season started)
+    before = _get_before(pitcher_df, prior_year_cutoff)
+    if len(before) < 100:
+        return None
+
+    # Use last 2000 pitches from prior season
+    recent = before.iloc[-2000:] if len(before) > 2000 else before
+
+    xrv_mean = recent["xrv"].mean()
+    xrv_std = recent["xrv"].std()
+    total_pa = recent["events"].notna().sum()
+    k_rate = (recent["events"] == "strikeout").sum() / total_pa if total_pa > 0 else np.nan
+    bb_rate = (recent["events"] == "walk").sum() / total_pa if total_pa > 0 else np.nan
+
+    fb_mask = recent["pitch_type"].isin(["FF", "SI", "FC"])
+    avg_velo = recent.loc[fb_mask, "release_speed"].mean() if fb_mask.any() else np.nan
+
+    mix = recent["pitch_type"].value_counts(normalize=True)
+    entropy = -(mix * np.log2(mix + 1e-10)).sum()
+
+    vs_L = recent[recent["stand"] == "L"]
+    vs_R = recent[recent["stand"] == "R"]
+    xrv_vs_L = vs_L["xrv"].mean() if len(vs_L) >= 20 else xrv_mean
+    xrv_vs_R = vs_R["xrv"].mean() if len(vs_R) >= 20 else xrv_mean
+
+    # Home/away splits
+    if "inning_topbot" in recent.columns:
+        home_pitches = recent[recent["inning_topbot"] == "Top"]
+        away_pitches = recent[recent["inning_topbot"] == "Bot"]
+        sp_home_xrv = home_pitches["xrv"].mean() if len(home_pitches) >= 30 else xrv_mean
+        sp_away_xrv = away_pitches["xrv"].mean() if len(away_pitches) >= 30 else xrv_mean
+    else:
+        sp_home_xrv = xrv_mean
+        sp_away_xrv = xrv_mean
+
+    # Overperformance
+    sp_overperf = np.nan
+    sp_overperf_recent = np.nan
+    if "delta_run_exp" in recent.columns:
+        resid = (recent["delta_run_exp"] - recent["xrv"]).dropna()
+        if len(resid) >= 100:
+            sp_overperf = resid.mean()
+            sp_overperf_recent = sp_overperf  # no "recent" distinction for prior season
+
+    # Transition entropy
+    sp_transition_entropy = np.nan
+    if len(recent) >= 100 and "pitch_type" in recent.columns:
+        pt_seq = recent["pitch_type"].values
+        transitions = {}
+        for a, b in zip(pt_seq[:-1], pt_seq[1:]):
+            transitions.setdefault(a, []).append(b)
+        entropies = []
+        for from_pt, to_pts in transitions.items():
+            counts = pd.Series(to_pts).value_counts(normalize=True).values
+            counts = counts[counts > 0]
+            entropies.append(-float(np.sum(counts * np.log2(counts))))
+        sp_transition_entropy = float(np.mean(entropies)) if entropies else 0.0
+
+    return {
+        "sp_xrv_mean": xrv_mean, "sp_xrv_std": xrv_std,
+        "sp_n_pitches": len(recent),
+        "sp_k_rate": k_rate, "sp_bb_rate": bb_rate, "sp_avg_velo": avg_velo,
+        "sp_pitch_mix_entropy": entropy,
+        "sp_xrv_vs_L": xrv_vs_L, "sp_xrv_vs_R": xrv_vs_R,
+        "sp_rest_days": 14,  # prior season = fully rested
+        "sp_overperf": sp_overperf, "sp_overperf_recent": sp_overperf_recent,
+        "sp_velo_trend": 0.0, "sp_spin_trend": 0.0, "sp_xrv_trend": 0.0,
+        "sp_home_xrv": sp_home_xrv, "sp_away_xrv": sp_away_xrv,
+        "sp_transition_entropy": sp_transition_entropy,
+        "sp_from_prior_season": 1,
+    }
+
+
 def build_game_features(
     target_year: int,
     n_pitcher_pitches: int = 2000,
@@ -1465,10 +1647,36 @@ def build_game_features(
     if team_priors:
         print(f"  Team priors from {target_year - 1}: {len(team_priors)} teams")
 
+    # Load preseason projections (Step 3)
+    team_projections = _load_team_projections(target_year)
+    if team_projections:
+        print(f"  Team projections for {target_year}: {len(team_projections)} teams")
+    else:
+        print(f"  WARNING: No team projections for {target_year}")
+
+    pitcher_projections = _load_pitcher_projections(target_year)
+    if pitcher_projections:
+        print(f"  Pitcher projections for {target_year}: {len(pitcher_projections)} pitchers")
+    else:
+        print(f"  WARNING: No pitcher projections for {target_year}")
+
+    # Compute roster-adjusted team priors (Step 6)
+    adjusted_priors = _compute_adjusted_team_priors(target_year - 1, team_priors, idx)
+    if adjusted_priors != team_priors:
+        print(f"  Roster-adjusted priors computed for {len(adjusted_priors)} teams")
+
+    # Determine Opening Day for days_into_season (Step 4)
+    opening_day = games["game_date"].min()
+    print(f"  Opening Day: {opening_day}")
+
     # Load trade deadline acquisitions (current season, only affects games after deadline)
     trade_stats = _load_trade_deadline_acquisitions(target_year, idx)
     if trade_stats:
         print(f"  Trade deadline stats: {len(trade_stats)} teams with transactions")
+
+    # Prior-season cutoff for SP fallback (Step 2)
+    prior_year_cutoff = f"{target_year}-01-01"
+    sp_prior_fallback_count = 0
 
     # Build features for each game
     feature_rows = []
@@ -1487,6 +1695,8 @@ def build_game_features(
         away_team = game["away_team_abbr"]
         home_sp = game.get("home_sp_id")
         away_sp = game.get("away_sp_id")
+        home_sp_name = game.get("home_sp_name", "")
+        away_sp_name = game.get("away_sp_name", "")
         game_pk = game["game_pk"]
 
         row = {
@@ -1499,22 +1709,37 @@ def build_game_features(
             "away_score": game["away_score"],
         }
 
-        # --- Starting Pitcher features ---
-        if pd.notna(home_sp) and int(home_sp) in idx["pitcher"]:
-            stats = _sp_features_fast(idx["pitcher"][int(home_sp)], gdate, n_pitcher_pitches)
-            for k, v in stats.items():
-                row[f"home_{k}"] = v
-        else:
-            for k, v in nan_sp.items():
-                row[f"home_{k}"] = v
+        # --- Starting Pitcher features (with prior-season fallback, Step 2) ---
+        for side, sp_id in [("home", home_sp), ("away", away_sp)]:
+            got_features = False
+            if pd.notna(sp_id) and int(sp_id) in idx["pitcher"]:
+                stats = _sp_features_fast(idx["pitcher"][int(sp_id)], gdate, n_pitcher_pitches)
+                if not np.isnan(stats.get("sp_xrv_mean", np.nan)):
+                    for k, v in stats.items():
+                        row[f"{side}_{k}"] = v
+                    row[f"{side}_sp_from_prior_season"] = 0
+                    got_features = True
+                else:
+                    # Current season < 50 pitches — try prior-season fallback
+                    fallback = _sp_prior_season_features(idx, int(sp_id), prior_year_cutoff)
+                    if fallback:
+                        for k, v in fallback.items():
+                            row[f"{side}_{k}"] = v
+                        sp_prior_fallback_count += 1
+                        got_features = True
+            elif pd.notna(sp_id):
+                # Pitcher not in xRV index at all — try prior season
+                fallback = _sp_prior_season_features(idx, int(sp_id), prior_year_cutoff)
+                if fallback:
+                    for k, v in fallback.items():
+                        row[f"{side}_{k}"] = v
+                    sp_prior_fallback_count += 1
+                    got_features = True
 
-        if pd.notna(away_sp) and int(away_sp) in idx["pitcher"]:
-            stats = _sp_features_fast(idx["pitcher"][int(away_sp)], gdate, n_pitcher_pitches)
-            for k, v in stats.items():
-                row[f"away_{k}"] = v
-        else:
-            for k, v in nan_sp.items():
-                row[f"away_{k}"] = v
+            if not got_features:
+                for k, v in nan_sp.items():
+                    row[f"{side}_{k}"] = v
+                row[f"{side}_sp_from_prior_season"] = np.nan
 
         # --- Matchup: lineup vs opposing SP (Bayesian model, hand-specific) ---
         # Home lineup vs away SP, Away lineup vs home SP
@@ -1655,6 +1880,35 @@ def build_game_features(
         # --- Team strength prior (from prior season win%) ---
         row["home_team_prior"] = team_priors.get(home_team, 0.5)
         row["away_team_prior"] = team_priors.get(away_team, 0.5)
+
+        # --- Roster-adjusted team prior (Step 6) ---
+        row["home_adjusted_team_prior"] = adjusted_priors.get(home_team, 0.5)
+        row["away_adjusted_team_prior"] = adjusted_priors.get(away_team, 0.5)
+
+        # --- Preseason projections (Step 3) ---
+        row["home_projected_wpct"] = team_projections.get(home_team, np.nan)
+        row["away_projected_wpct"] = team_projections.get(away_team, np.nan)
+
+        # Pitcher projections (look up by name since MLB IDs ≠ FanGraphs IDs)
+        for side_label, sp_name in [("home", home_sp_name), ("away", away_sp_name)]:
+            sp_proj = pitcher_projections.get(sp_name) if pd.notna(sp_name) and sp_name else None
+            if sp_proj:
+                row[f"{side_label}_sp_projected_era"] = sp_proj.get("projected_era", np.nan)
+                row[f"{side_label}_sp_projected_war"] = sp_proj.get("projected_war", np.nan)
+            else:
+                row[f"{side_label}_sp_projected_era"] = np.nan
+                row[f"{side_label}_sp_projected_war"] = np.nan
+
+        # --- Season context features (Step 4) ---
+        row["days_into_season"] = (pd.Timestamp(gdate) - pd.Timestamp(opening_day)).days
+
+        # SP info confidence: 0 = no data, ~1 = full 2000-pitch sample
+        for side_label in ["home", "away"]:
+            n_p = row.get(f"{side_label}_sp_n_pitches", 0)
+            if pd.notna(n_p):
+                row[f"{side_label}_sp_info_confidence"] = np.log1p(n_p) / np.log1p(2000)
+            else:
+                row[f"{side_label}_sp_info_confidence"] = 0.0
 
         # --- Trade deadline features (only meaningful after ~Aug 1) ---
         home_trade = trade_stats.get(home_team, {})
@@ -1836,21 +2090,27 @@ def build_game_features(
 
     features_df = pd.DataFrame(feature_rows)
     print(f"  Matchup features computed for {matchup_computed}/{total} games")
+    if sp_prior_fallback_count:
+        print(f"  SP prior-season fallback used for {sp_prior_fallback_count} pitcher-games")
 
-    # --- Team recent form (computed vectorized over the games df) ---
+    # --- Team recent form + games played (computed vectorized over the games df) ---
     # Win% in last 10 games for each team, computed without lookahead
     games_sorted = games.sort_values("game_date").reset_index(drop=True)
     home_form = {}
     away_form = {}
+    home_games_played = {}
+    away_games_played = {}
     team_history = {}  # team -> list of (date, win_flag)
     for _, g in games_sorted.iterrows():
         ht = g["home_team_abbr"]
         at = g["away_team_abbr"]
         hw = g["home_win"]
 
-        # Look up recent form before this game
+        # Look up recent form and games played before this game
         home_form[g["game_pk"]] = _recent_winpct(team_history.get(ht, []), 10)
         away_form[g["game_pk"]] = _recent_winpct(team_history.get(at, []), 10)
+        home_games_played[g["game_pk"]] = len(team_history.get(ht, []))
+        away_games_played[g["game_pk"]] = len(team_history.get(at, []))
 
         # Update history
         team_history.setdefault(ht, []).append(hw)
@@ -1858,6 +2118,8 @@ def build_game_features(
 
     features_df["home_recent_form"] = features_df["game_pk"].map(home_form)
     features_df["away_recent_form"] = features_df["game_pk"].map(away_form)
+    features_df["home_team_games_played"] = features_df["game_pk"].map(home_games_played)
+    features_df["away_team_games_played"] = features_df["game_pk"].map(away_games_played)
 
     # Compute differentials (home - away) for cleaner modeling
     diff_cols = [
@@ -1894,6 +2156,12 @@ def build_game_features(
         # New: trade deadline features
         ("trade_net", 1),           # more acquisitions = stronger
         ("trade_pitcher_xrv", -1),  # negative xRV = better pitcher acquired
+        # New: preseason projections (Step 3)
+        ("projected_wpct", 1),      # higher projected win% = stronger
+        ("sp_projected_era", -1),   # lower ERA = better pitcher
+        ("sp_projected_war", 1),    # higher WAR = better pitcher
+        # New: roster-adjusted team prior (Step 6)
+        ("adjusted_team_prior", 1),
     ]
     for col, sign in diff_cols:
         home_col = f"home_{col}"

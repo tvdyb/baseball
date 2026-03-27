@@ -74,6 +74,12 @@ DIFF_FEATURES = [
     # Trade deadline features
     "diff_trade_net",
     "diff_trade_pitcher_xrv",
+    # Preseason projections
+    "diff_projected_wpct",
+    "diff_sp_projected_era",
+    "diff_sp_projected_war",
+    # Roster-adjusted team prior
+    "diff_adjusted_team_prior",
 ]
 
 RAW_FEATURES = [
@@ -92,9 +98,53 @@ RAW_FEATURES = [
     "is_dome",
     "wind_out",
     "wind_in",
+    # Season context (Step 4)
+    "days_into_season",
+    "home_sp_info_confidence",
+    "away_sp_info_confidence",
+    "home_team_games_played",
+    "away_team_games_played",
 ]
 
 ALL_FEATURES = DIFF_FEATURES + RAW_FEATURES
+
+# Count-like columns that should be filled with median (not 0) for LR
+_COUNT_FEATURES = {
+    "home_sp_n_pitches", "away_sp_n_pitches",
+    "home_matchup_n_known", "away_matchup_n_known",
+    "home_arsenal_matchup_n_known", "away_arsenal_matchup_n_known",
+    "home_team_games_played", "away_team_games_played",
+}
+
+
+def _smart_fillna(X: pd.DataFrame, train_medians: dict = None) -> tuple[pd.DataFrame, dict]:
+    """Smart NaN filling for logistic regression.
+
+    - diff_ columns: fill with 0 (assume equal when unknown)
+    - Count columns (sp_n_pitches, matchup_n_known, etc.): fill with training median
+    - Everything else: fill with 0
+
+    Returns (filled_X, medians_dict) where medians_dict can be reused for test data.
+    """
+    X = X.copy()
+    medians = {}
+
+    for col in X.columns:
+        if col.startswith("diff_"):
+            X[col] = X[col].fillna(0)
+        elif col in _COUNT_FEATURES:
+            if train_medians and col in train_medians:
+                med = train_medians[col]
+            else:
+                med = X[col].median()
+                if pd.isna(med):
+                    med = 0
+            medians[col] = med
+            X[col] = X[col].fillna(med)
+        else:
+            X[col] = X[col].fillna(0)
+
+    return X, medians
 
 
 def load_features(years: list[int]) -> pd.DataFrame:
@@ -161,6 +211,24 @@ def add_nonlinear_features(X: pd.DataFrame) -> pd.DataFrame:
             vals = X[col].fillna(0)
             X[f"{col}_sq"] = vals * vals.abs()
 
+    # --- Step 7: Early-season interaction features ---
+    if "days_into_season" in X.columns:
+        days = X["days_into_season"].fillna(30)
+        # early_season_mask: 1.0 on Opening Day, 0.0 after 60 days
+        early_mask = np.clip(1 - days / 60, 0, 1)
+
+        # Interact key features with early-season mask
+        for col in ["diff_sp_xrv_mean", "diff_hit_xrv_mean",
+                     "diff_team_prior", "diff_projected_wpct"]:
+            if col in X.columns:
+                X[f"{col}_x_early"] = X[col].fillna(0) * early_mask
+
+        # Blended prior: projections early, xRV later
+        if "diff_projected_wpct" in X.columns and "diff_sp_xrv_mean" in X.columns:
+            proj = X["diff_projected_wpct"].fillna(0)
+            xrv = X["diff_sp_xrv_mean"].fillna(0)
+            X["prior_dominance"] = early_mask * proj + (1 - early_mask) * xrv
+
     return X
 
 
@@ -179,7 +247,8 @@ def prepare_xy(df: pd.DataFrame, features: list[str] = None, nonlinear: bool = F
     if nonlinear:
         # Add raw columns needed for nonlinear feature engineering
         for col in ["home_sp_rest_days", "away_sp_rest_days",
-                    "home_bp_fatigue_score", "away_bp_fatigue_score"]:
+                    "home_bp_fatigue_score", "away_bp_fatigue_score",
+                    "days_into_season"]:
             if col in df.columns and col not in X.columns:
                 X[col] = df[col]
         X = add_nonlinear_features(X)
@@ -224,7 +293,8 @@ def evaluate(y_true, y_prob, label=""):
 def train_logistic(X_train, y_train, X_test=None, y_test=None):
     """Train logistic regression baseline."""
     scaler = StandardScaler()
-    X_train_s = scaler.fit_transform(X_train.fillna(0))
+    X_train_filled, train_medians = _smart_fillna(X_train)
+    X_train_s = scaler.fit_transform(X_train_filled)
 
     model = LogisticRegression(
         C=1.0, penalty="l2", max_iter=1000, solver="lbfgs"
@@ -242,7 +312,8 @@ def train_logistic(X_train, y_train, X_test=None, y_test=None):
     evaluate(y_train, train_prob, "Train (in-sample)")
 
     if X_test is not None:
-        X_test_s = scaler.transform(X_test.fillna(0))
+        X_test_filled, _ = _smart_fillna(X_test, train_medians)
+        X_test_s = scaler.transform(X_test_filled)
         test_prob = model.predict_proba(X_test_s)[:, 1]
         evaluate(y_test, test_prob, "Test (out-of-sample)")
         return model, scaler, test_prob
@@ -367,7 +438,8 @@ def walk_forward_evaluation(all_years: list[int], min_train_years: int = 2):
         if lr_probs is not None and xgb_probs is not None:
             # Fit blend weight on training predictions
             from scipy.optimize import minimize_scalar
-            X_train_s = lr_scaler.transform(X_train_lr.fillna(0))
+            X_train_filled, _ = _smart_fillna(X_train_lr)
+            X_train_s = lr_scaler.transform(X_train_filled)
             lr_train_probs = lr_model.predict_proba(X_train_s)[:, 1]
             dtrain_xgb = xgb.DMatrix(X_train_xgb) if xgb_model else None
             xgb_train_probs = xgb_model.predict(dtrain_xgb) if xgb_model else lr_train_probs

@@ -7,7 +7,7 @@ all: scrape build-xrv matchup-models features train predict compare
 # ── Scraping ────────────────────────────────────────────────
 
 # Scrape all raw data: Statcast pitches, game results, weather, OAA, sprint speed, transactions, Kalshi
-scrape: scrape-statcast scrape-games scrape-weather scrape-oaa scrape-sprint-speed scrape-transactions scrape-kalshi
+scrape: scrape-statcast scrape-games scrape-weather scrape-oaa scrape-sprint-speed scrape-transactions scrape-kalshi projections
 
 scrape-statcast:
 	$(PYTHON) src/scrape_statcast.py --seasons $(SEASONS)
@@ -31,6 +31,10 @@ scrape-transactions:
 # Kalshi only has 2025 data
 scrape-kalshi:
 	$(PYTHON) src/scrape_kalshi.py --year 2025
+
+# Preseason projections from FanGraphs
+projections:
+	$(PYTHON) src/scrape_projections.py --seasons $(SEASONS)
 
 # ── Model Building ──────────────────────────────────────────
 
@@ -80,6 +84,6 @@ ablation:
 	$(PYTHON) src/ablation_matchup.py
 
 .PHONY: all scrape scrape-statcast scrape-games scrape-weather scrape-oaa \
-        scrape-sprint-speed scrape-transactions scrape-kalshi \
+        scrape-sprint-speed scrape-transactions scrape-kalshi projections \
         build-xrv matchup-models matchup-models-pooled \
         features train predict compare ablation

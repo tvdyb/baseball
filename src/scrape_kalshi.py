@@ -325,6 +325,9 @@ def group_markets_by_event(markets: list[dict], year: int) -> dict:
     """Group markets by event (game) and filter to target year."""
     events = {}
     parse_failures = []
+    unknown_suffixes = []
+    wrong_year = 0
+    kalshi_teams_seen = set()
 
     for m in markets:
         event_ticker = m["event_ticker"]
@@ -334,6 +337,7 @@ def group_markets_by_event(markets: list[dict], year: int) -> dict:
                 parse_failures.append((event_ticker, m["ticker"]))
             continue
         if int(parsed["game_date"][:4]) != year:
+            wrong_year += 1
             continue
 
         if event_ticker not in events:
@@ -344,7 +348,11 @@ def group_markets_by_event(markets: list[dict], year: int) -> dict:
             }
 
         ticker_suffix = m["ticker"].split("-")[-1]
-        team = TEAM_MAP.get(ticker_suffix, ticker_suffix)
+        team = TEAM_MAP.get(ticker_suffix)
+        if team is None:
+            unknown_suffixes.append((ticker_suffix, m["ticker"], event_ticker))
+            team = ticker_suffix  # use raw suffix as fallback
+        kalshi_teams_seen.add(team)
 
         events[event_ticker]["markets"][team] = {
             "ticker": m["ticker"],
@@ -353,6 +361,9 @@ def group_markets_by_event(markets: list[dict], year: int) -> dict:
             "open_interest": float(m.get("open_interest_fp") or m.get("open_interest") or 0),
             "open_time": m.get("open_time"),
             "close_time": m.get("close_time"),
+            # Store fallback price fields for rescue when candles unavailable
+            "previous_price": float(p) if (p := m.get("previous_price_dollars") or m.get("previous_price")) else None,
+            "last_price": float(p) if (p := m.get("last_price_dollars") or m.get("last_price")) else None,
         }
 
     if parse_failures:
@@ -361,6 +372,16 @@ def group_markets_by_event(markets: list[dict], year: int) -> dict:
             log(f"    {et} (market: {ticker})")
         if len(parse_failures) > 10:
             log(f"    ... and {len(parse_failures) - 10} more")
+
+    if unknown_suffixes:
+        log(f"  WARNING: {len(unknown_suffixes)} markets with unknown team suffix:")
+        for suffix, ticker, et in unknown_suffixes[:10]:
+            log(f"    suffix={suffix} ticker={ticker} event={et}")
+
+    if wrong_year:
+        log(f"  Filtered out {wrong_year} markets from other years")
+
+    log(f"  Kalshi team abbreviations seen: {sorted(kalshi_teams_seen)}")
 
     return events
 
@@ -400,8 +421,13 @@ def load_game_start_times(year: int) -> dict:
     for key in start_times:
         start_times[key].sort()
 
+    all_teams = set()
+    for (_, h, a) in start_times:
+        all_teams.add(h)
+        all_teams.add(a)
     log(f"  Loaded {len(start_times)} matchups ({doubleheaders} doubleheader games) "
         f"from {games_path}")
+    log(f"  Games parquet team abbreviations: {sorted(all_teams)}")
     return start_times
 
 
@@ -448,11 +474,16 @@ def _extract_candle_close(price_data: dict) -> float | None:
     return float(close_p)
 
 
-def _find_pregame_price(candles: list[dict], game_start_ts: float) -> float | None:
+def _find_pregame_price(
+    candles: list[dict], game_start_ts: float,
+) -> tuple[float | None, str]:
     """Extract the last pre-game closing price from a list of candles.
 
     Finds the last candle ending before game_start_ts + 5min buffer
-    with a reasonable price (0.08-0.92).
+    with a reasonable price (0.04-0.96).
+
+    Returns (price, reason) where reason is one of:
+        "found", "no_valid_candles", "no_pregame_candles", "filtered_by_range"
     """
     valid = []
     for c in candles:
@@ -463,17 +494,22 @@ def _find_pregame_price(candles: list[dict], game_start_ts: float) -> float | No
         valid.append((c["end_period_ts"], close_p))
 
     if not valid:
-        return None
+        return None, "no_valid_candles"
 
     cutoff_ts = game_start_ts + 300  # 5-minute buffer
-    pre_game = [
+    pre_game_all = [
         (ts, p) for ts, p in valid
-        if ts <= cutoff_ts and 0.08 <= p <= 0.92
+        if ts <= cutoff_ts
     ]
-    if pre_game:
-        return pre_game[-1][1]  # last one (closest to first pitch)
+    if not pre_game_all:
+        return None, "no_pregame_candles"
 
-    return None
+    pre_game = [(ts, p) for ts, p in pre_game_all if 0.04 <= p <= 0.96]
+    if pre_game:
+        return pre_game[-1][1], "found"
+
+    # Had pre-game candles but all were outside 0.04-0.96
+    return None, "filtered_by_range"
 
 
 def _fetch_candles_with_retry(
@@ -515,8 +551,8 @@ def fetch_pregame_prices_individual(
     results = {}
     stats = {
         "found_hourly": 0, "found_daily": 0,
-        "no_candles": 0, "no_pregame": 0, "error": 0,
-        "via_historical": 0, "via_live": 0,
+        "no_candles": 0, "no_pregame": 0, "filtered_by_range": 0,
+        "error": 0, "via_historical": 0, "via_live": 0,
     }
 
     for i, (event_ticker, market, game_start_ts) in enumerate(markets_to_fetch):
@@ -546,13 +582,15 @@ def fetch_pregame_prices_individual(
                 time.sleep(0.1)
                 continue
 
-            price = _find_pregame_price(candles, game_start_ts)
+            price, reason = _find_pregame_price(candles, game_start_ts)
             if price is not None:
                 results[event_ticker] = price
                 stats["found_hourly"] += 1
                 stats[f"via_{source}"] += 1
+            elif reason == "filtered_by_range":
+                stats["filtered_by_range"] += 1
             elif candles:
-                # Had candles but none were pre-game or in range
+                # Had candles but none were pre-game
                 # Try daily candles as fallback for illiquid markets
                 daily_params = {"period_interval": 1440, "start_ts": start_ts, "end_ts": end_ts}
                 if source == "historical":
@@ -561,11 +599,13 @@ def fetch_pregame_prices_individual(
                     daily_url = f"{API_BASE}/series/KXMLBGAME/markets/{ticker}/candlesticks"
                 daily = _fetch_candles_with_retry(client, daily_url, daily_params)
                 if daily:
-                    price = _find_pregame_price(daily, game_start_ts)
+                    price, reason = _find_pregame_price(daily, game_start_ts)
                     if price is not None:
                         results[event_ticker] = price
                         stats["found_daily"] += 1
                         stats[f"via_{source}"] += 1
+                    elif reason == "filtered_by_range":
+                        stats["filtered_by_range"] += 1
                     else:
                         stats["no_pregame"] += 1
                 else:
@@ -598,7 +638,10 @@ def fetch_pregame_prices_live_batch(
         (results dict, stats dict)
     """
     results = {}
-    stats = {"found_hourly": 0, "found_daily": 0, "no_candles": 0, "no_pregame": 0, "error": 0}
+    stats = {
+        "found_hourly": 0, "found_daily": 0,
+        "no_candles": 0, "no_pregame": 0, "filtered_by_range": 0, "error": 0,
+    }
 
     if not markets_to_fetch:
         return results, stats
@@ -650,10 +693,12 @@ def fetch_pregame_prices_live_batch(
                     stats["no_candles"] += 1
                     continue
 
-                price = _find_pregame_price(candles, game_start_ts)
+                price, reason = _find_pregame_price(candles, game_start_ts)
                 if price is not None:
                     results[event_ticker] = price
                     stats["found_hourly"] += 1
+                elif reason == "filtered_by_range":
+                    stats["filtered_by_range"] += 1
                 else:
                     stats["no_pregame"] += 1
 
@@ -670,16 +715,20 @@ def fetch_pregame_prices_live_batch(
 
 def fetch_all_pregame_prices(
     events: dict, game_start_times: dict, cutoff_ts: float,
-) -> dict:
+) -> tuple[dict, dict]:
     """Fetch pre-game prices for all events.
 
     Routes requests to historical or live endpoint based on the archival cutoff.
-    Always uses candlesticks — never previous_price_dollars.
+
+    Returns:
+        (prices dict, funnel stats dict)
     """
     all_markets = []
     live_markets = []
-    no_start_time = 0
-    no_home_market = 0
+    drop_no_home_market = []
+    drop_no_times = []
+    drop_no_start_time = []
+    drop_close_parse = []
 
     for event_ticker, event in events.items():
         home_team = event["home_team"]
@@ -688,11 +737,18 @@ def fetch_all_pregame_prices(
         home_market = event["markets"].get(home_team)
 
         if not home_market:
-            no_home_market += 1
+            drop_no_home_market.append(
+                f"game_date={game_date}, home={home_team}, away={away_team} "
+                f"(event: {event_ticker}, market keys: {list(event['markets'].keys())})"
+            )
             continue
 
         if not home_market.get("open_time") or not home_market.get("close_time"):
-            no_home_market += 1
+            drop_no_times.append(
+                f"game_date={game_date}, home={home_team}, away={away_team} "
+                f"(event: {event_ticker}, open_time={home_market.get('open_time')}, "
+                f"close_time={home_market.get('close_time')})"
+            )
             continue
 
         # Look up actual game start time (handles doubleheaders)
@@ -700,7 +756,10 @@ def fetch_all_pregame_prices(
         start_times_list = game_start_times.get(gst_key)
 
         if not start_times_list:
-            no_start_time += 1
+            drop_no_start_time.append(
+                f"game_date={game_date}, home={home_team}, away={away_team} "
+                f"(event: {event_ticker})"
+            )
             continue
 
         # For doubleheaders, pick the start time closest to this market's timing
@@ -720,14 +779,42 @@ def fetch_all_pregame_prices(
             else:
                 all_markets.append((event_ticker, home_market, game_start_ts))
         except (ValueError, TypeError):
-            no_home_market += 1
+            drop_close_parse.append(
+                f"game_date={game_date}, home={home_team} "
+                f"(close_time={home_market.get('close_time')})"
+            )
 
     log(f"    {len(all_markets)} archived markets (individual requests)")
     log(f"    {len(live_markets)} live markets (batch eligible)")
-    log(f"    {no_start_time} skipped (no game start time)")
-    log(f"    {no_home_market} skipped (no home market/times)")
+
+    if drop_no_home_market:
+        log(f"    {len(drop_no_home_market)} skipped (no home market):")
+        for msg in drop_no_home_market[:5]:
+            log(f"      {msg}")
+        if len(drop_no_home_market) > 5:
+            log(f"      ... and {len(drop_no_home_market) - 5} more")
+
+    if drop_no_times:
+        log(f"    {len(drop_no_times)} skipped (no open/close time):")
+        for msg in drop_no_times[:5]:
+            log(f"      {msg}")
+        if len(drop_no_times) > 5:
+            log(f"      ... and {len(drop_no_times) - 5} more")
+
+    if drop_no_start_time:
+        log(f"    {len(drop_no_start_time)} skipped (no game start time):")
+        for msg in drop_no_start_time[:5]:
+            log(f"      {msg}")
+        if len(drop_no_start_time) > 5:
+            log(f"      ... and {len(drop_no_start_time) - 5} more")
+
+    if drop_close_parse:
+        log(f"    {len(drop_close_parse)} skipped (close_time parse error):")
+        for msg in drop_close_parse[:3]:
+            log(f"      {msg}")
 
     results = {}
+    total_filtered_by_range = 0
 
     with httpx.Client(timeout=30.0) as client:
         # Fetch archived markets individually (with retry + live fallback)
@@ -737,10 +824,12 @@ def fetch_all_pregame_prices(
                 client, all_markets,
             )
             results.update(ind_results)
+            total_filtered_by_range += ind_stats.get("filtered_by_range", 0)
             log(f"    → {ind_stats['found_hourly']} hourly, "
                   f"{ind_stats['found_daily']} daily, "
                   f"{ind_stats['no_candles']} no candles, "
                   f"{ind_stats['no_pregame']} no pre-game price, "
+                  f"{ind_stats.get('filtered_by_range', 0)} filtered by range, "
                   f"{ind_stats['error']} errors")
             log(f"    → {ind_stats['via_historical']} via historical, "
                   f"{ind_stats['via_live']} via live fallback")
@@ -767,19 +856,43 @@ def fetch_all_pregame_prices(
                 live_stats["found_hourly"] += ind_stats["found_hourly"]
                 live_stats["found_daily"] += ind_stats["found_daily"]
                 live_stats["error"] = ind_stats["error"]
+                live_stats["filtered_by_range"] = live_stats.get("filtered_by_range", 0) + ind_stats.get("filtered_by_range", 0)
 
+            total_filtered_by_range += live_stats.get("filtered_by_range", 0)
             log(f"    → {live_stats['found_hourly']} hourly, "
                   f"{live_stats['found_daily']} daily, "
                   f"{live_stats['no_candles']} no candles, "
                   f"{live_stats['no_pregame']} no pre-game price, "
+                  f"{live_stats.get('filtered_by_range', 0)} filtered by range, "
                   f"{live_stats['error']} errors")
 
-    return results
+    funnel = {
+        "with_home_market": len(events) - len(drop_no_home_market),
+        "drop_no_home_market": len(drop_no_home_market),
+        "drop_no_times": len(drop_no_times),
+        "drop_no_start_time": len(drop_no_start_time),
+        "drop_close_parse": len(drop_close_parse),
+        "routed_to_fetch": len(all_markets) + len(live_markets),
+        "with_candle_price": len(results),
+        "filtered_by_range": total_filtered_by_range,
+    }
+
+    return results, funnel
 
 
-def build_dataset(events: dict, prices: dict) -> pd.DataFrame:
-    """Build final dataset with market prices and outcomes."""
+def build_dataset(events: dict, prices: dict) -> tuple[pd.DataFrame, dict]:
+    """Build final dataset with market prices and outcomes.
+
+    For events without candle prices, falls back to previous_price or
+    last_price from the market object.
+
+    Returns:
+        (DataFrame, build stats dict)
+    """
     rows = []
+    no_home_or_away = 0
+    no_price = 0
+    rescued_by_fallback = 0
 
     for event_ticker, event in events.items():
         home_team = event["home_team"]
@@ -789,12 +902,24 @@ def build_dataset(events: dict, prices: dict) -> pd.DataFrame:
         away_market = event["markets"].get(away_team)
 
         if not home_market or not away_market:
+            no_home_or_away += 1
             continue
 
         home_won = home_market.get("result") == "yes"
 
         home_price = prices.get(event_ticker)
+        price_source = "candle"
+
+        # Fallback: use previous_price or last_price from market object
         if home_price is None:
+            fallback = home_market.get("previous_price") or home_market.get("last_price")
+            if fallback is not None and 0.04 <= fallback <= 0.96:
+                home_price = fallback
+                price_source = "fallback"
+                rescued_by_fallback += 1
+
+        if home_price is None:
+            no_price += 1
             continue
 
         total_volume = home_market["volume"] + away_market["volume"]
@@ -808,12 +933,22 @@ def build_dataset(events: dict, prices: dict) -> pd.DataFrame:
             "kalshi_away_prob": round(1 - home_price, 4),
             "volume": total_volume,
             "event_ticker": event_ticker,
+            "price_source": price_source,
         })
+
+    if rescued_by_fallback:
+        log(f"  Rescued {rescued_by_fallback} games via fallback price (previous_price/last_price)")
+
+    build_stats = {
+        "no_home_or_away_market": no_home_or_away,
+        "no_price": no_price,
+        "rescued_by_fallback": rescued_by_fallback,
+    }
 
     df = pd.DataFrame(rows)
     if len(df) > 0:
         df = df.sort_values("game_date").reset_index(drop=True)
-    return df
+    return df, build_stats
 
 
 def main():
@@ -838,11 +973,11 @@ def main():
     game_start_times = load_game_start_times(args.year)
 
     log(f"\nFetching pre-game prices...")
-    prices = fetch_all_pregame_prices(events, game_start_times, cutoff_ts)
+    prices, funnel = fetch_all_pregame_prices(events, game_start_times, cutoff_ts)
     log(f"\n  Got prices for {len(prices)}/{len(events)} games")
 
     log(f"\nBuilding dataset...")
-    df = build_dataset(events, prices)
+    df, build_stats = build_dataset(events, prices)
     df.to_parquet(output_path, index=False)
     log(f"  Saved {len(df)} games to {output_path}")
 
@@ -864,6 +999,26 @@ def main():
         for month in sorted(df["month"].unique()):
             n = len(df[df["month"] == month])
             log(f"    {month}: {n}")
+
+    # Pipeline funnel
+    n_events = len(events)
+    n_parse_ok = n_events  # already filtered in group_markets_by_event
+    n_with_home = funnel["with_home_market"]
+    n_with_times = n_with_home - funnel["drop_no_times"]
+    n_with_start = n_with_times - funnel["drop_no_start_time"]
+    n_routed = funnel["routed_to_fetch"]
+    n_candle_price = funnel["with_candle_price"]
+    n_final = len(df) if len(df) > 0 else 0
+
+    log(f"\nPipeline funnel:")
+    log(f"  Events after parse/year: {n_events:>5}")
+    log(f"  With home market:        {n_with_home:>5}  ({funnel['drop_no_home_market']} no home market)")
+    log(f"  With open/close time:    {n_with_times:>5}  ({funnel['drop_no_times']} missing times)")
+    log(f"  With game start time:    {n_with_start:>5}  ({funnel['drop_no_start_time']} no start time)")
+    log(f"  Routed to fetch:         {n_routed:>5}  ({funnel['drop_close_parse']} close_time parse err)")
+    log(f"  With candle price:       {n_candle_price:>5}  ({funnel.get('filtered_by_range', 0)} filtered by 0.04-0.96)")
+    log(f"  Rescued by fallback:     {build_stats['rescued_by_fallback']:>5}")
+    log(f"  In final dataset:        {n_final:>5}  ({build_stats['no_home_or_away_market']} no away market, {build_stats['no_price']} no price)")
 
     # Coverage diagnostic: compare against games parquet
     log(f"\nCoverage diagnostic:")
