@@ -34,6 +34,50 @@ from utils import (
 # Backward-compat alias for internal callers
 _filter_competitive = filter_competitive
 
+# Differential columns: (feature_suffix, sign) where sign controls direction
+# positive sign = higher home value is better for home team
+DIFF_COLS = [
+    ("sp_xrv_mean", -1),        # negative = better pitcher, so flip sign
+    ("sp_k_rate", 1),
+    ("sp_bb_rate", -1),
+    ("sp_avg_velo", -1),         # higher velo = better for pitcher
+    ("sp_rest_days", 1),         # more rest = better
+    ("sp_overperf", -1),         # negative = pitcher beats their stuff (good for pitcher)
+    ("sp_overperf_recent", -1),  # recent trend
+    ("bp_xrv_mean", -1),
+    ("bp_fatigue_score", -1),    # more fatigue = worse
+    ("bp_matchup_xrv_mean", -1), # lower = bullpen is tougher vs opposing lineup
+    ("arsenal_matchup_xrv_mean", 1),  # higher = lineup does better (arsenal model)
+    ("arsenal_matchup_xrv_sum", 1),
+    ("bp_arsenal_matchup_xrv_mean", -1),
+    ("hit_xrv_mean", 1),        # higher = better for hitters
+    ("hit_xrv_contact", 1),
+    ("hit_k_rate", -1),
+    ("def_xrv_delta", -1),      # more negative = better defense
+    ("matchup_xrv_mean", 1),    # higher = lineup does better against opposing SP
+    ("matchup_xrv_sum", 1),
+    ("platoon_pct", 1),         # more platoon advantage = better
+    ("recent_form", 1),         # higher win% = better
+    # SP trend features
+    ("sp_velo_trend", -1),      # velo increasing = better for pitcher
+    ("sp_spin_trend", -1),      # spin increasing = better for pitcher
+    ("sp_xrv_trend", -1),       # xRV trending up = worse for pitcher
+    ("sp_transition_entropy", -1),  # higher entropy = more unpredictable = better for pitcher
+    # OAA defense
+    ("oaa_rate", 1),            # higher OAA = better defense
+    # Team strength prior
+    ("team_prior", 1),          # higher prior win% = stronger team
+    # Trade deadline features
+    ("trade_net", 1),           # more acquisitions = stronger
+    ("trade_pitcher_xrv", -1),  # negative xRV = better pitcher acquired
+    # Preseason projections (Step 3)
+    ("projected_wpct", 1),      # higher projected win% = stronger
+    ("sp_projected_era", -1),   # lower ERA = better pitcher
+    ("sp_projected_war", 1),    # higher WAR = better pitcher
+    # Roster-adjusted team prior (Step 6)
+    ("adjusted_team_prior", 1),
+]
+
 
 def _load_hand_models(prefix: str, year: int) -> dict:
     """Load hand-specific models with fallback to combined model."""
@@ -1640,6 +1684,448 @@ def _sp_prior_season_features(idx: dict, pitcher_id: int, prior_year_cutoff: str
     }
 
 
+def compute_single_game_features(
+    game: dict,
+    idx: dict,
+    lineups: dict,
+    matchup_models: dict,
+    arsenal_models: dict,
+    park_factors: dict,
+    team_oaa: dict,
+    team_priors: dict,
+    adjusted_priors: dict,
+    team_projections: dict,
+    pitcher_projections: dict,
+    trade_stats: dict,
+    weather_map: dict,
+    target_year: int,
+    opening_day: str,
+    prior_year_cutoff: str,
+    n_pitcher_pitches: int = 2000,
+) -> tuple[dict, dict]:
+    """Compute all pregame features for a single game.
+
+    Parameters
+    ----------
+    game : dict
+        Must have keys: game_pk, game_date, home_team, away_team,
+        home_sp_id, away_sp_id. Optional: home_sp_name, away_sp_name,
+        home_win, home_score, away_score, weather (dict).
+    lineups : dict
+        {game_pk: {"home": [(pid, hand), ...], "away": [...]}}
+    weather_map : dict
+        {game_pk: {"temperature": ..., "wind_speed": ..., ...}} OR empty.
+        If game has a "weather" key (live API format), that takes precedence.
+
+    Returns
+    -------
+    (row, meta) where row is the feature dict and meta has counters:
+        {"sp_prior_fallback": bool, "matchup_computed": bool}
+    """
+    gdate = str(game["game_date"])
+    home_team = game["home_team"]
+    away_team = game["away_team"]
+    home_sp = game.get("home_sp_id")
+    away_sp = game.get("away_sp_id")
+    home_sp_name = game.get("home_sp_name", "")
+    away_sp_name = game.get("away_sp_name", "")
+    game_pk = game["game_pk"]
+
+    meta = {"sp_prior_fallback": False, "matchup_computed": False}
+
+    row = {
+        "game_pk": game_pk,
+        "game_date": gdate,
+        "home_team": home_team,
+        "away_team": away_team,
+    }
+    # Copy optional result fields
+    for k in ("home_win", "home_score", "away_score"):
+        if k in game and game[k] is not None:
+            row[k] = game[k]
+
+    nan_sp = {f"sp_{k}": np.nan for k in
+              ["xrv_mean", "xrv_std", "n_pitches", "k_rate", "bb_rate", "avg_velo",
+               "pitch_mix_entropy", "xrv_vs_L", "xrv_vs_R", "rest_days",
+               "overperf", "overperf_recent"]}
+    nan_matchup = {"matchup_xrv_mean": np.nan, "matchup_xrv_sum": np.nan,
+                   "matchup_n_hitters": 0, "matchup_n_known": 0}
+
+    # --- Starting Pitcher features (with prior-season fallback) ---
+    for side, sp_id in [("home", home_sp), ("away", away_sp)]:
+        got_features = False
+        if pd.notna(sp_id) and int(sp_id) in idx["pitcher"]:
+            stats = _sp_features_fast(idx["pitcher"][int(sp_id)], gdate, n_pitcher_pitches)
+            if not np.isnan(stats.get("sp_xrv_mean", np.nan)):
+                for k, v in stats.items():
+                    row[f"{side}_{k}"] = v
+                row[f"{side}_sp_from_prior_season"] = 0
+                got_features = True
+            else:
+                fallback = _sp_prior_season_features(idx, int(sp_id), prior_year_cutoff, gdate)
+                if fallback:
+                    for k, v in fallback.items():
+                        row[f"{side}_{k}"] = v
+                    meta["sp_prior_fallback"] = True
+                    got_features = True
+        elif pd.notna(sp_id):
+            fallback = _sp_prior_season_features(idx, int(sp_id), prior_year_cutoff, gdate)
+            if fallback:
+                for k, v in fallback.items():
+                    row[f"{side}_{k}"] = v
+                meta["sp_prior_fallback"] = True
+                got_features = True
+
+        if not got_features:
+            for k, v in nan_sp.items():
+                row[f"{side}_{k}"] = v
+            row[f"{side}_sp_from_prior_season"] = np.nan
+
+    # --- Matchup: lineup vs opposing SP (Bayesian model, hand-specific) ---
+    game_lineup = lineups.get(game_pk)
+
+    if matchup_models and game_lineup and pd.notna(away_sp):
+        away_sp_int = int(away_sp)
+        home_lu = game_lineup.get("home", [])
+        if home_lu and away_sp_int in idx["pitcher"]:
+            hitter_ids = [h[0] for h in home_lu]
+            hitter_hands = [h[1] for h in home_lu]
+            matchup = _compute_hand_matchup(
+                matchup_models, idx["pitcher"][away_sp_int], away_sp_int,
+                gdate, n_pitcher_pitches, hitter_ids, hitter_hands, compute_matchup_xrv)
+            for k, v in matchup.items():
+                row[f"home_{k}"] = v
+            if not np.isnan(matchup["matchup_xrv_mean"]):
+                meta["matchup_computed"] = True
+        else:
+            for k, v in nan_matchup.items():
+                row[f"home_{k}"] = v
+    else:
+        for k, v in nan_matchup.items():
+            row[f"home_{k}"] = v
+
+    if matchup_models and game_lineup and pd.notna(home_sp):
+        home_sp_int = int(home_sp)
+        away_lu = game_lineup.get("away", [])
+        if away_lu and home_sp_int in idx["pitcher"]:
+            hitter_ids = [h[0] for h in away_lu]
+            hitter_hands = [h[1] for h in away_lu]
+            matchup = _compute_hand_matchup(
+                matchup_models, idx["pitcher"][home_sp_int], home_sp_int,
+                gdate, n_pitcher_pitches, hitter_ids, hitter_hands, compute_matchup_xrv)
+            for k, v in matchup.items():
+                row[f"away_{k}"] = v
+        else:
+            for k, v in nan_matchup.items():
+                row[f"away_{k}"] = v
+    else:
+        for k, v in nan_matchup.items():
+            row[f"away_{k}"] = v
+
+    # --- Arsenal Matchup ---
+    nan_arsenal = {"arsenal_matchup_xrv_mean": np.nan, "arsenal_matchup_xrv_sum": np.nan,
+                   "arsenal_matchup_n_hitters": 0, "arsenal_matchup_n_known": 0}
+
+    if arsenal_models and game_lineup and pd.notna(away_sp):
+        away_sp_int = int(away_sp)
+        home_lu = game_lineup.get("home", [])
+        if home_lu and away_sp_int in idx["pitcher"]:
+            hitter_ids = [h[0] for h in home_lu]
+            hitter_hands = [h[1] for h in home_lu]
+            a_matchup = _compute_hand_arsenal_matchup(
+                arsenal_models, idx["pitcher"][away_sp_int], away_sp_int,
+                gdate, n_pitcher_pitches, hitter_ids, hitter_hands)
+            for k, v in a_matchup.items():
+                row[f"home_{k}"] = v
+        else:
+            for k, v in nan_arsenal.items():
+                row[f"home_{k}"] = v
+    else:
+        for k, v in nan_arsenal.items():
+            row[f"home_{k}"] = v
+
+    if arsenal_models and game_lineup and pd.notna(home_sp):
+        home_sp_int = int(home_sp)
+        away_lu = game_lineup.get("away", [])
+        if away_lu and home_sp_int in idx["pitcher"]:
+            hitter_ids = [h[0] for h in away_lu]
+            hitter_hands = [h[1] for h in away_lu]
+            a_matchup = _compute_hand_arsenal_matchup(
+                arsenal_models, idx["pitcher"][home_sp_int], home_sp_int,
+                gdate, n_pitcher_pitches, hitter_ids, hitter_hands)
+            for k, v in a_matchup.items():
+                row[f"away_{k}"] = v
+        else:
+            for k, v in nan_arsenal.items():
+                row[f"away_{k}"] = v
+    else:
+        for k, v in nan_arsenal.items():
+            row[f"away_{k}"] = v
+
+    # --- Bullpen features ---
+    for side in ["home", "away"]:
+        team = home_team if side == "home" else away_team
+        if team in idx["pitching_team"]:
+            bp = _bp_features_fast(idx["pitching_team"][team], gdate)
+            for k, v in bp.items():
+                row[f"{side}_{k}"] = v
+        else:
+            for k in ["bp_xrv_mean", "bp_xrv_std", "bp_recent_ip", "bp_fatigue_score"]:
+                row[f"{side}_{k}"] = np.nan
+
+    # --- Team hitting ---
+    for side in ["home", "away"]:
+        team = home_team if side == "home" else away_team
+        if team in idx["batting_team"]:
+            hit = _hit_features_fast(idx["batting_team"][team], gdate)
+            for k, v in hit.items():
+                row[f"{side}_{k}"] = v
+        else:
+            for k in ["hit_xrv_mean", "hit_xrv_contact", "hit_k_rate"]:
+                row[f"{side}_{k}"] = np.nan
+
+    # --- Defense ---
+    for side in ["home", "away"]:
+        team = home_team if side == "home" else away_team
+        if team in idx["pitching_team"]:
+            d = _def_features_fast(idx["pitching_team"][team], gdate)
+            for k, v in d.items():
+                row[f"{side}_{k}"] = v
+        else:
+            row[f"{side}_def_xrv_delta"] = np.nan
+
+    # --- OAA defense ---
+    row["home_oaa_rate"] = team_oaa.get(home_team, 0.0)
+    row["away_oaa_rate"] = team_oaa.get(away_team, 0.0)
+
+    # --- Team strength prior ---
+    row["home_team_prior"] = team_priors.get(home_team, 0.5)
+    row["away_team_prior"] = team_priors.get(away_team, 0.5)
+
+    # --- Roster-adjusted team prior ---
+    row["home_adjusted_team_prior"] = adjusted_priors.get(home_team, 0.5)
+    row["away_adjusted_team_prior"] = adjusted_priors.get(away_team, 0.5)
+
+    # --- Preseason projections ---
+    row["home_projected_wpct"] = team_projections.get(home_team, np.nan)
+    row["away_projected_wpct"] = team_projections.get(away_team, np.nan)
+
+    # Pitcher projections: try MLBAM ID, then normalized name, then last-name fallback
+    for side_label, sp_id_val, sp_name_val in [("home", home_sp, home_sp_name), ("away", away_sp, away_sp_name)]:
+        sp_proj = None
+        if pd.notna(sp_id_val):
+            sp_proj = pitcher_projections.get(int(sp_id_val))
+        if not sp_proj and pd.notna(sp_name_val) and sp_name_val:
+            sp_proj = pitcher_projections.get(_normalize_name(str(sp_name_val)))
+        if not sp_proj and pd.notna(sp_name_val) and sp_name_val:
+            parts = _normalize_name(str(sp_name_val)).split()
+            if parts:
+                sp_proj = pitcher_projections.get(f"last:{parts[-1]}")
+        if sp_proj:
+            row[f"{side_label}_sp_projected_era"] = sp_proj.get("projected_era", np.nan)
+            row[f"{side_label}_sp_projected_war"] = sp_proj.get("projected_war", np.nan)
+        else:
+            row[f"{side_label}_sp_projected_era"] = np.nan
+            row[f"{side_label}_sp_projected_war"] = np.nan
+
+    # --- Season context features ---
+    row["days_into_season"] = (pd.Timestamp(gdate) - pd.Timestamp(opening_day)).days
+
+    for side_label in ["home", "away"]:
+        n_p = row.get(f"{side_label}_sp_n_pitches", 0)
+        if pd.notna(n_p):
+            row[f"{side_label}_sp_info_confidence"] = np.log1p(n_p) / np.log1p(2000)
+        else:
+            row[f"{side_label}_sp_info_confidence"] = 0.0
+
+    # --- Trade deadline features ---
+    home_trade = trade_stats.get(home_team, {})
+    away_trade = trade_stats.get(away_team, {})
+    if gdate >= f"{target_year}-08-01" and trade_stats:
+        row["home_trade_net"] = home_trade.get("net_acquisitions", 0)
+        row["away_trade_net"] = away_trade.get("net_acquisitions", 0)
+        row["home_trade_pitcher_xrv"] = home_trade.get("acquired_pitcher_xrv", 0.0)
+        row["away_trade_pitcher_xrv"] = away_trade.get("acquired_pitcher_xrv", 0.0)
+    else:
+        row["home_trade_net"] = 0
+        row["away_trade_net"] = 0
+        row["home_trade_pitcher_xrv"] = 0.0
+        row["away_trade_pitcher_xrv"] = 0.0
+
+    # --- Park factor ---
+    row["park_factor"] = park_factors.get(home_team, 1.0)
+
+    # --- Platoon advantage ---
+    if game_lineup:
+        home_lu = game_lineup.get("home", [])
+        away_lu = game_lineup.get("away", [])
+
+        if pd.notna(away_sp) and home_lu:
+            away_sp_throws = None
+            if int(away_sp) in idx["pitcher"]:
+                sp_df = idx["pitcher"][int(away_sp)]
+                if "p_throws" in sp_df.columns and len(sp_df) > 0:
+                    away_sp_throws = sp_df["p_throws"].iloc[-1]
+            if away_sp_throws:
+                platoon_count = sum(1 for _, hand in home_lu
+                                   if (hand == "L" and away_sp_throws == "R")
+                                   or (hand == "R" and away_sp_throws == "L"))
+                row["home_platoon_pct"] = platoon_count / len(home_lu)
+                if not np.isnan(row.get("away_sp_xrv_vs_L", np.nan)):
+                    n_L = sum(1 for _, h in home_lu if h == "L")
+                    n_R = len(home_lu) - n_L
+                    row["away_sp_xrv_vs_lineup"] = (
+                        n_L * row.get("away_sp_xrv_vs_L", 0)
+                        + n_R * row.get("away_sp_xrv_vs_R", 0)
+                    ) / len(home_lu) if len(home_lu) > 0 else np.nan
+                else:
+                    row["away_sp_xrv_vs_lineup"] = np.nan
+            else:
+                row["home_platoon_pct"] = np.nan
+                row["away_sp_xrv_vs_lineup"] = np.nan
+        else:
+            row["home_platoon_pct"] = np.nan
+            row["away_sp_xrv_vs_lineup"] = np.nan
+
+        if pd.notna(home_sp) and away_lu:
+            home_sp_throws = None
+            if int(home_sp) in idx["pitcher"]:
+                sp_df = idx["pitcher"][int(home_sp)]
+                if "p_throws" in sp_df.columns and len(sp_df) > 0:
+                    home_sp_throws = sp_df["p_throws"].iloc[-1]
+            if home_sp_throws:
+                platoon_count = sum(1 for _, hand in away_lu
+                                   if (hand == "L" and home_sp_throws == "R")
+                                   or (hand == "R" and home_sp_throws == "L"))
+                row["away_platoon_pct"] = platoon_count / len(away_lu)
+                if not np.isnan(row.get("home_sp_xrv_vs_L", np.nan)):
+                    n_L = sum(1 for _, h in away_lu if h == "L")
+                    n_R = len(away_lu) - n_L
+                    row["home_sp_xrv_vs_lineup"] = (
+                        n_L * row.get("home_sp_xrv_vs_L", 0)
+                        + n_R * row.get("home_sp_xrv_vs_R", 0)
+                    ) / len(away_lu) if len(away_lu) > 0 else np.nan
+                else:
+                    row["away_platoon_pct"] = np.nan
+                    row["home_sp_xrv_vs_lineup"] = np.nan
+            else:
+                row["away_platoon_pct"] = np.nan
+                row["home_sp_xrv_vs_lineup"] = np.nan
+        else:
+            row["away_platoon_pct"] = np.nan
+            row["home_sp_xrv_vs_lineup"] = np.nan
+    else:
+        row["home_platoon_pct"] = np.nan
+        row["away_platoon_pct"] = np.nan
+        row["away_sp_xrv_vs_lineup"] = np.nan
+        row["home_sp_xrv_vs_lineup"] = np.nan
+
+    # --- Bullpen matchup (Bayesian model, hand-specific) ---
+    bp_matchup_artifacts = matchup_models.get("L") or matchup_models.get("R") if matchup_models else None
+    if bp_matchup_artifacts and game_lineup:
+        away_lu = game_lineup.get("away", [])
+        if away_lu:
+            away_hitter_ids = [h[0] for h in away_lu]
+            away_hitter_hands = [h[1] for h in away_lu]
+            bp_m = compute_bullpen_matchup_xrv(
+                bp_matchup_artifacts, idx, home_team, gdate,
+                away_hitter_ids, away_hitter_hands)
+            for k, v in bp_m.items():
+                row[f"home_{k}"] = v
+        else:
+            row["home_bp_matchup_xrv_mean"] = np.nan
+            row["home_bp_matchup_n_relievers"] = 0
+
+        home_lu = game_lineup.get("home", [])
+        if home_lu:
+            home_hitter_ids = [h[0] for h in home_lu]
+            home_hitter_hands = [h[1] for h in home_lu]
+            bp_m = compute_bullpen_matchup_xrv(
+                bp_matchup_artifacts, idx, away_team, gdate,
+                home_hitter_ids, home_hitter_hands)
+            for k, v in bp_m.items():
+                row[f"away_{k}"] = v
+        else:
+            row["away_bp_matchup_xrv_mean"] = np.nan
+            row["away_bp_matchup_n_relievers"] = 0
+    else:
+        row["home_bp_matchup_xrv_mean"] = np.nan
+        row["home_bp_matchup_n_relievers"] = 0
+        row["away_bp_matchup_xrv_mean"] = np.nan
+        row["away_bp_matchup_n_relievers"] = 0
+
+    # --- Bullpen arsenal matchup ---
+    bp_arsenal_artifacts = arsenal_models.get("L") or arsenal_models.get("R") if arsenal_models else None
+    if bp_arsenal_artifacts and game_lineup:
+        away_lu = game_lineup.get("away", [])
+        if away_lu:
+            bp_a = compute_bullpen_arsenal_matchup_xrv(
+                bp_arsenal_artifacts, idx, home_team, gdate,
+                [h[0] for h in away_lu], [h[1] for h in away_lu])
+            for k, v in bp_a.items():
+                row[f"home_{k}"] = v
+        else:
+            row["home_bp_arsenal_matchup_xrv_mean"] = np.nan
+            row["home_bp_arsenal_matchup_n_relievers"] = 0
+
+        home_lu = game_lineup.get("home", [])
+        if home_lu:
+            bp_a = compute_bullpen_arsenal_matchup_xrv(
+                bp_arsenal_artifacts, idx, away_team, gdate,
+                [h[0] for h in home_lu], [h[1] for h in home_lu])
+            for k, v in bp_a.items():
+                row[f"away_{k}"] = v
+        else:
+            row["away_bp_arsenal_matchup_xrv_mean"] = np.nan
+            row["away_bp_arsenal_matchup_n_relievers"] = 0
+    else:
+        row["home_bp_arsenal_matchup_xrv_mean"] = np.nan
+        row["home_bp_arsenal_matchup_n_relievers"] = 0
+        row["away_bp_arsenal_matchup_xrv_mean"] = np.nan
+        row["away_bp_arsenal_matchup_n_relievers"] = 0
+
+    # --- Weather ---
+    # Live path: game["weather"] dict from MLB API
+    # Batch path: weather_map[game_pk] from weather parquet
+    live_weather = game.get("weather")
+    if live_weather and isinstance(live_weather, dict) and live_weather.get("temp"):
+        row["temperature"] = float(live_weather.get("temp", 0)) if live_weather.get("temp") else np.nan
+        wind_str = live_weather.get("wind", "")
+        if wind_str:
+            parts = wind_str.split(",")
+            try:
+                row["wind_speed"] = float(parts[0].strip().lower().replace("mph", "").strip())
+            except (ValueError, IndexError):
+                row["wind_speed"] = 0.0
+            wind_dir = parts[1].strip().lower() if len(parts) > 1 else ""
+            row["wind_out"] = int("out" in wind_dir)
+            row["wind_in"] = int("in" in wind_dir)
+        else:
+            row["wind_speed"] = 0.0
+            row["wind_out"] = 0
+            row["wind_in"] = 0
+        venue = game.get("venue_name", "")
+        row["is_dome"] = int("dome" in venue.lower() or "roof" in live_weather.get("condition", "").lower())
+    elif weather_map and game_pk in weather_map:
+        w = weather_map[game_pk]
+        row["temperature"] = w.get("temperature")
+        row["wind_speed"] = w.get("wind_speed", 0.0)
+        row["is_dome"] = w.get("is_dome", 0)
+        wind_dir = str(w.get("wind_dir", "none")).lower()
+        row["wind_out"] = int("out" in wind_dir)
+        row["wind_in"] = int("in" in wind_dir)
+    else:
+        row["temperature"] = np.nan
+        row["wind_speed"] = np.nan
+        row["is_dome"] = np.nan
+        row["wind_out"] = np.nan
+        row["wind_in"] = np.nan
+
+    row["is_home"] = 1
+
+    return row, meta
+
+
 def build_game_features(
     target_year: int,
     n_pitcher_pitches: int = 2000,
@@ -1770,418 +2256,33 @@ def build_game_features(
     # Build features for each game
     feature_rows = []
     total = len(games)
-    nan_sp = {f"sp_{k}": np.nan for k in
-              ["xrv_mean", "xrv_std", "n_pitches", "k_rate", "bb_rate", "avg_velo",
-               "pitch_mix_entropy", "xrv_vs_L", "xrv_vs_R", "rest_days",
-               "overperf", "overperf_recent"]}
-    nan_matchup = {"matchup_xrv_mean": np.nan, "matchup_xrv_sum": np.nan,
-                   "matchup_n_hitters": 0, "matchup_n_known": 0}
     matchup_computed = 0
 
     for i, game in games.iterrows():
-        gdate = str(game["game_date"])
-        home_team = game["home_team_abbr"]
-        away_team = game["away_team_abbr"]
-        home_sp = game.get("home_sp_id")
-        away_sp = game.get("away_sp_id")
-        home_sp_name = game.get("home_sp_name", "")
-        away_sp_name = game.get("away_sp_name", "")
-        game_pk = game["game_pk"]
-
-        row = {
-            "game_pk": game_pk,
-            "game_date": gdate,
-            "home_team": home_team,
-            "away_team": away_team,
+        game_dict = {
+            "game_pk": game["game_pk"],
+            "game_date": str(game["game_date"]),
+            "home_team": game["home_team_abbr"],
+            "away_team": game["away_team_abbr"],
+            "home_sp_id": game.get("home_sp_id"),
+            "away_sp_id": game.get("away_sp_id"),
+            "home_sp_name": game.get("home_sp_name", ""),
+            "away_sp_name": game.get("away_sp_name", ""),
             "home_win": game["home_win"],
             "home_score": game["home_score"],
             "away_score": game["away_score"],
         }
-
-        # --- Starting Pitcher features (with prior-season fallback, Step 2) ---
-        for side, sp_id in [("home", home_sp), ("away", away_sp)]:
-            got_features = False
-            if pd.notna(sp_id) and int(sp_id) in idx["pitcher"]:
-                stats = _sp_features_fast(idx["pitcher"][int(sp_id)], gdate, n_pitcher_pitches)
-                if not np.isnan(stats.get("sp_xrv_mean", np.nan)):
-                    for k, v in stats.items():
-                        row[f"{side}_{k}"] = v
-                    row[f"{side}_sp_from_prior_season"] = 0
-                    got_features = True
-                else:
-                    # Current season < 50 pitches — try prior-season fallback
-                    fallback = _sp_prior_season_features(idx, int(sp_id), prior_year_cutoff, gdate)
-                    if fallback:
-                        for k, v in fallback.items():
-                            row[f"{side}_{k}"] = v
-                        sp_prior_fallback_count += 1
-                        got_features = True
-            elif pd.notna(sp_id):
-                # Pitcher not in xRV index at all — try prior season
-                fallback = _sp_prior_season_features(idx, int(sp_id), prior_year_cutoff, gdate)
-                if fallback:
-                    for k, v in fallback.items():
-                        row[f"{side}_{k}"] = v
-                    sp_prior_fallback_count += 1
-                    got_features = True
-
-            if not got_features:
-                for k, v in nan_sp.items():
-                    row[f"{side}_{k}"] = v
-                row[f"{side}_sp_from_prior_season"] = np.nan
-
-        # --- Matchup: lineup vs opposing SP (Bayesian model, hand-specific) ---
-        # Home lineup vs away SP, Away lineup vs home SP
-        game_lineup = lineups.get(game_pk)
-
-        if matchup_models and game_lineup and pd.notna(away_sp):
-            away_sp_int = int(away_sp)
-            home_lu = game_lineup.get("home", [])
-            if home_lu and away_sp_int in idx["pitcher"]:
-                hitter_ids = [h[0] for h in home_lu]
-                hitter_hands = [h[1] for h in home_lu]
-                # Use hand-specific models: aggregate across hitter hands
-                matchup = _compute_hand_matchup(
-                    matchup_models, idx["pitcher"][away_sp_int], away_sp_int,
-                    gdate, n_pitcher_pitches, hitter_ids, hitter_hands, compute_matchup_xrv)
-                for k, v in matchup.items():
-                    row[f"home_{k}"] = v
-                if not np.isnan(matchup["matchup_xrv_mean"]):
-                    matchup_computed += 1
-            else:
-                for k, v in nan_matchup.items():
-                    row[f"home_{k}"] = v
-        else:
-            for k, v in nan_matchup.items():
-                row[f"home_{k}"] = v
-
-        if matchup_models and game_lineup and pd.notna(home_sp):
-            home_sp_int = int(home_sp)
-            away_lu = game_lineup.get("away", [])
-            if away_lu and home_sp_int in idx["pitcher"]:
-                hitter_ids = [h[0] for h in away_lu]
-                hitter_hands = [h[1] for h in away_lu]
-                matchup = _compute_hand_matchup(
-                    matchup_models, idx["pitcher"][home_sp_int], home_sp_int,
-                    gdate, n_pitcher_pitches, hitter_ids, hitter_hands, compute_matchup_xrv)
-                for k, v in matchup.items():
-                    row[f"away_{k}"] = v
-            else:
-                for k, v in nan_matchup.items():
-                    row[f"away_{k}"] = v
-        else:
-            for k, v in nan_matchup.items():
-                row[f"away_{k}"] = v
-
-        # --- Arsenal Matchup: lineup vs opposing SP (arsenal model, hand-specific) ---
-        nan_arsenal = {"arsenal_matchup_xrv_mean": np.nan, "arsenal_matchup_xrv_sum": np.nan,
-                       "arsenal_matchup_n_hitters": 0, "arsenal_matchup_n_known": 0}
-
-        if arsenal_models and game_lineup and pd.notna(away_sp):
-            away_sp_int = int(away_sp)
-            home_lu = game_lineup.get("home", [])
-            if home_lu and away_sp_int in idx["pitcher"]:
-                hitter_ids = [h[0] for h in home_lu]
-                hitter_hands = [h[1] for h in home_lu]
-                a_matchup = _compute_hand_arsenal_matchup(
-                    arsenal_models, idx["pitcher"][away_sp_int], away_sp_int,
-                    gdate, n_pitcher_pitches, hitter_ids, hitter_hands)
-                for k, v in a_matchup.items():
-                    row[f"home_{k}"] = v
-            else:
-                for k, v in nan_arsenal.items():
-                    row[f"home_{k}"] = v
-        else:
-            for k, v in nan_arsenal.items():
-                row[f"home_{k}"] = v
-
-        if arsenal_models and game_lineup and pd.notna(home_sp):
-            home_sp_int = int(home_sp)
-            away_lu = game_lineup.get("away", [])
-            if away_lu and home_sp_int in idx["pitcher"]:
-                hitter_ids = [h[0] for h in away_lu]
-                hitter_hands = [h[1] for h in away_lu]
-                a_matchup = _compute_hand_arsenal_matchup(
-                    arsenal_models, idx["pitcher"][home_sp_int], home_sp_int,
-                    gdate, n_pitcher_pitches, hitter_ids, hitter_hands)
-                for k, v in a_matchup.items():
-                    row[f"away_{k}"] = v
-            else:
-                for k, v in nan_arsenal.items():
-                    row[f"away_{k}"] = v
-        else:
-            for k, v in nan_arsenal.items():
-                row[f"away_{k}"] = v
-
-        # --- Bullpen ---
-        if home_team in idx["pitching_team"]:
-            bp = _bp_features_fast(idx["pitching_team"][home_team], gdate)
-            for k, v in bp.items():
-                row[f"home_{k}"] = v
-        else:
-            for k in ["bp_xrv_mean", "bp_xrv_std", "bp_recent_ip", "bp_fatigue_score"]:
-                row[f"home_{k}"] = np.nan
-
-        if away_team in idx["pitching_team"]:
-            bp = _bp_features_fast(idx["pitching_team"][away_team], gdate)
-            for k, v in bp.items():
-                row[f"away_{k}"] = v
-        else:
-            for k in ["bp_xrv_mean", "bp_xrv_std", "bp_recent_ip", "bp_fatigue_score"]:
-                row[f"away_{k}"] = np.nan
-
-        # --- Team hitting ---
-        if home_team in idx["batting_team"]:
-            hit = _hit_features_fast(idx["batting_team"][home_team], gdate)
-            for k, v in hit.items():
-                row[f"home_{k}"] = v
-        else:
-            for k in ["hit_xrv_mean", "hit_xrv_contact", "hit_k_rate"]:
-                row[f"home_{k}"] = np.nan
-
-        if away_team in idx["batting_team"]:
-            hit = _hit_features_fast(idx["batting_team"][away_team], gdate)
-            for k, v in hit.items():
-                row[f"away_{k}"] = v
-        else:
-            for k in ["hit_xrv_mean", "hit_xrv_contact", "hit_k_rate"]:
-                row[f"away_{k}"] = np.nan
-
-        # --- Defense ---
-        if home_team in idx["pitching_team"]:
-            d = _def_features_fast(idx["pitching_team"][home_team], gdate)
-            for k, v in d.items():
-                row[f"home_{k}"] = v
-        else:
-            row["home_def_xrv_delta"] = np.nan
-
-        if away_team in idx["pitching_team"]:
-            d = _def_features_fast(idx["pitching_team"][away_team], gdate)
-            for k, v in d.items():
-                row[f"away_{k}"] = v
-        else:
-            row["away_def_xrv_delta"] = np.nan
-
-        # --- OAA defense (from prior season) ---
-        row["home_oaa_rate"] = team_oaa.get(home_team, 0.0)
-        row["away_oaa_rate"] = team_oaa.get(away_team, 0.0)
-
-        # --- Team strength prior (from prior season win%) ---
-        row["home_team_prior"] = team_priors.get(home_team, 0.5)
-        row["away_team_prior"] = team_priors.get(away_team, 0.5)
-
-        # --- Roster-adjusted team prior (Step 6) ---
-        row["home_adjusted_team_prior"] = adjusted_priors.get(home_team, 0.5)
-        row["away_adjusted_team_prior"] = adjusted_priors.get(away_team, 0.5)
-
-        # --- Preseason projections (Step 3) ---
-        row["home_projected_wpct"] = team_projections.get(home_team, np.nan)
-        row["away_projected_wpct"] = team_projections.get(away_team, np.nan)
-
-        # Pitcher projections: try MLBAM ID, then normalized name, then last-name fallback
-        for side_label, sp_id_val, sp_name in [("home", home_sp, home_sp_name), ("away", away_sp, away_sp_name)]:
-            sp_proj = None
-            # Try MLBAM ID first (most reliable)
-            if pd.notna(sp_id_val):
-                sp_proj = pitcher_projections.get(int(sp_id_val))
-            # Try normalized full name
-            if not sp_proj and pd.notna(sp_name) and sp_name:
-                sp_proj = pitcher_projections.get(_normalize_name(str(sp_name)))
-            # Try last-name fallback (only if unambiguous)
-            if not sp_proj and pd.notna(sp_name) and sp_name:
-                parts = _normalize_name(str(sp_name)).split()
-                if parts:
-                    sp_proj = pitcher_projections.get(f"last:{parts[-1]}")
-            if sp_proj:
-                row[f"{side_label}_sp_projected_era"] = sp_proj.get("projected_era", np.nan)
-                row[f"{side_label}_sp_projected_war"] = sp_proj.get("projected_war", np.nan)
-            else:
-                row[f"{side_label}_sp_projected_era"] = np.nan
-                row[f"{side_label}_sp_projected_war"] = np.nan
-
-        # --- Season context features (Step 4) ---
-        row["days_into_season"] = (pd.Timestamp(gdate) - pd.Timestamp(opening_day)).days
-
-        # SP info confidence: 0 = no data, ~1 = full 2000-pitch sample
-        for side_label in ["home", "away"]:
-            n_p = row.get(f"{side_label}_sp_n_pitches", 0)
-            if pd.notna(n_p):
-                row[f"{side_label}_sp_info_confidence"] = np.log1p(n_p) / np.log1p(2000)
-            else:
-                row[f"{side_label}_sp_info_confidence"] = 0.0
-
-        # --- Trade deadline features (only meaningful after ~Aug 1) ---
-        home_trade = trade_stats.get(home_team, {})
-        away_trade = trade_stats.get(away_team, {})
-        # Only populate for games after the trade deadline window
-        if gdate >= f"{target_year}-08-01" and trade_stats:
-            row["home_trade_net"] = home_trade.get("net_acquisitions", 0)
-            row["away_trade_net"] = away_trade.get("net_acquisitions", 0)
-            row["home_trade_pitcher_xrv"] = home_trade.get("acquired_pitcher_xrv", 0.0)
-            row["away_trade_pitcher_xrv"] = away_trade.get("acquired_pitcher_xrv", 0.0)
-        else:
-            row["home_trade_net"] = 0
-            row["away_trade_net"] = 0
-            row["home_trade_pitcher_xrv"] = 0.0
-            row["away_trade_pitcher_xrv"] = 0.0
-
-        # --- Park factor ---
-        row["park_factor"] = park_factors.get(home_team, 1.0)
-
-        # --- Platoon advantage ---
-        # How much of the lineup has platoon advantage vs opposing SP?
-        # LHH vs RHP or RHH vs LHP = platoon advantage
-        if game_lineup:
-            home_lu = game_lineup.get("home", [])
-            away_lu = game_lineup.get("away", [])
-
-            # Home lineup platoon advantage vs away SP
-            if pd.notna(away_sp) and home_lu:
-                away_sp_throws = None
-                if int(away_sp) in idx["pitcher"]:
-                    sp_df = idx["pitcher"][int(away_sp)]
-                    if "p_throws" in sp_df.columns and len(sp_df) > 0:
-                        away_sp_throws = sp_df["p_throws"].iloc[-1]
-                if away_sp_throws:
-                    platoon_count = sum(1 for _, hand in home_lu
-                                       if (hand == "L" and away_sp_throws == "R")
-                                       or (hand == "R" and away_sp_throws == "L"))
-                    row["home_platoon_pct"] = platoon_count / len(home_lu)
-
-                    # Weighted SP xRV: use handedness-specific xRV based on lineup composition
-                    if not np.isnan(row.get("away_sp_xrv_vs_L", np.nan)):
-                        n_L = sum(1 for _, h in home_lu if h == "L")
-                        n_R = len(home_lu) - n_L
-                        row["away_sp_xrv_vs_lineup"] = (
-                            n_L * row.get("away_sp_xrv_vs_L", 0)
-                            + n_R * row.get("away_sp_xrv_vs_R", 0)
-                        ) / len(home_lu) if len(home_lu) > 0 else np.nan
-                else:
-                    row["home_platoon_pct"] = np.nan
-                    row["away_sp_xrv_vs_lineup"] = np.nan
-            else:
-                row["home_platoon_pct"] = np.nan
-                row["away_sp_xrv_vs_lineup"] = np.nan
-
-            # Away lineup platoon advantage vs home SP
-            if pd.notna(home_sp) and away_lu:
-                home_sp_throws = None
-                if int(home_sp) in idx["pitcher"]:
-                    sp_df = idx["pitcher"][int(home_sp)]
-                    if "p_throws" in sp_df.columns and len(sp_df) > 0:
-                        home_sp_throws = sp_df["p_throws"].iloc[-1]
-                if home_sp_throws:
-                    platoon_count = sum(1 for _, hand in away_lu
-                                       if (hand == "L" and home_sp_throws == "R")
-                                       or (hand == "R" and home_sp_throws == "L"))
-                    row["away_platoon_pct"] = platoon_count / len(away_lu)
-
-                    if not np.isnan(row.get("home_sp_xrv_vs_L", np.nan)):
-                        n_L = sum(1 for _, h in away_lu if h == "L")
-                        n_R = len(away_lu) - n_L
-                        row["home_sp_xrv_vs_lineup"] = (
-                            n_L * row.get("home_sp_xrv_vs_L", 0)
-                            + n_R * row.get("home_sp_xrv_vs_R", 0)
-                        ) / len(away_lu) if len(away_lu) > 0 else np.nan
-                else:
-                    row["away_platoon_pct"] = np.nan
-                    row["home_sp_xrv_vs_lineup"] = np.nan
-            else:
-                row["away_platoon_pct"] = np.nan
-                row["home_sp_xrv_vs_lineup"] = np.nan
-        else:
-            row["home_platoon_pct"] = np.nan
-            row["away_platoon_pct"] = np.nan
-            row["away_sp_xrv_vs_lineup"] = np.nan
-            row["home_sp_xrv_vs_lineup"] = np.nan
-
-        # --- Bullpen matchup (Bayesian model, hand-specific) ---
-        # For bullpen matchup, use the "L" model for all hitters as a reasonable default
-        # (bullpen relievers face mixed lineups; using combined or first-available model)
-        bp_matchup_artifacts = matchup_models.get("L") or matchup_models.get("R") if matchup_models else None
-        if bp_matchup_artifacts and game_lineup:
-            # Home bullpen vs away lineup
-            away_lu = game_lineup.get("away", [])
-            if away_lu:
-                away_hitter_ids = [h[0] for h in away_lu]
-                away_hitter_hands = [h[1] for h in away_lu]
-                bp_m = compute_bullpen_matchup_xrv(
-                    bp_matchup_artifacts, idx, home_team, gdate,
-                    away_hitter_ids, away_hitter_hands)
-                for k, v in bp_m.items():
-                    row[f"home_{k}"] = v
-            else:
-                row["home_bp_matchup_xrv_mean"] = np.nan
-                row["home_bp_matchup_n_relievers"] = 0
-
-            # Away bullpen vs home lineup
-            home_lu = game_lineup.get("home", [])
-            if home_lu:
-                home_hitter_ids = [h[0] for h in home_lu]
-                home_hitter_hands = [h[1] for h in home_lu]
-                bp_m = compute_bullpen_matchup_xrv(
-                    bp_matchup_artifacts, idx, away_team, gdate,
-                    home_hitter_ids, home_hitter_hands)
-                for k, v in bp_m.items():
-                    row[f"away_{k}"] = v
-            else:
-                row["away_bp_matchup_xrv_mean"] = np.nan
-                row["away_bp_matchup_n_relievers"] = 0
-        else:
-            row["home_bp_matchup_xrv_mean"] = np.nan
-            row["home_bp_matchup_n_relievers"] = 0
-            row["away_bp_matchup_xrv_mean"] = np.nan
-            row["away_bp_matchup_n_relievers"] = 0
-
-        # --- Bullpen arsenal matchup (hand-specific) ---
-        bp_arsenal_artifacts = arsenal_models.get("L") or arsenal_models.get("R") if arsenal_models else None
-        if bp_arsenal_artifacts and game_lineup:
-            away_lu = game_lineup.get("away", [])
-            if away_lu:
-                bp_a = compute_bullpen_arsenal_matchup_xrv(
-                    bp_arsenal_artifacts, idx, home_team, gdate,
-                    [h[0] for h in away_lu], [h[1] for h in away_lu])
-                for k, v in bp_a.items():
-                    row[f"home_{k}"] = v
-            else:
-                row["home_bp_arsenal_matchup_xrv_mean"] = np.nan
-                row["home_bp_arsenal_matchup_n_relievers"] = 0
-
-            home_lu = game_lineup.get("home", [])
-            if home_lu:
-                bp_a = compute_bullpen_arsenal_matchup_xrv(
-                    bp_arsenal_artifacts, idx, away_team, gdate,
-                    [h[0] for h in home_lu], [h[1] for h in home_lu])
-                for k, v in bp_a.items():
-                    row[f"away_{k}"] = v
-            else:
-                row["away_bp_arsenal_matchup_xrv_mean"] = np.nan
-                row["away_bp_arsenal_matchup_n_relievers"] = 0
-        else:
-            row["home_bp_arsenal_matchup_xrv_mean"] = np.nan
-            row["home_bp_arsenal_matchup_n_relievers"] = 0
-            row["away_bp_arsenal_matchup_xrv_mean"] = np.nan
-            row["away_bp_arsenal_matchup_n_relievers"] = 0
-
-        # --- Weather features ---
-        w = weather_map.get(game_pk)
-        if w:
-            row["temperature"] = w.get("temperature")
-            row["wind_speed"] = w.get("wind_speed", 0.0)
-            row["is_dome"] = w.get("is_dome", 0)
-            # Wind direction categories relevant to baseball
-            wind_dir = str(w.get("wind_dir", "none")).lower()
-            row["wind_out"] = int("out" in wind_dir)      # blowing out = more HRs
-            row["wind_in"] = int("in" in wind_dir)        # blowing in = fewer HRs
-        else:
-            row["temperature"] = np.nan
-            row["wind_speed"] = np.nan
-            row["is_dome"] = np.nan
-            row["wind_out"] = np.nan
-            row["wind_in"] = np.nan
-
-        # --- Home advantage (just a flag, model learns the weight) ---
-        row["is_home"] = 1  # always from home perspective
+        row, meta = compute_single_game_features(
+            game_dict, idx, lineups, matchup_models, arsenal_models,
+            park_factors, team_oaa, team_priors, adjusted_priors,
+            team_projections, pitcher_projections, trade_stats,
+            weather_map, target_year, opening_day, prior_year_cutoff,
+            n_pitcher_pitches,
+        )
+        if meta["sp_prior_fallback"]:
+            sp_prior_fallback_count += 1
+        if meta["matchup_computed"]:
+            matchup_computed += 1
 
         feature_rows.append(row)
 
@@ -2222,48 +2323,7 @@ def build_game_features(
     features_df["away_team_games_played"] = features_df["game_pk"].map(away_games_played)
 
     # Compute differentials (home - away) for cleaner modeling
-    diff_cols = [
-        ("sp_xrv_mean", -1),        # negative = better pitcher, so flip sign
-        ("sp_k_rate", 1),
-        ("sp_bb_rate", -1),
-        ("sp_avg_velo", -1),         # higher velo = better for pitcher
-        ("sp_rest_days", 1),         # more rest = better
-        ("sp_overperf", -1),         # negative = pitcher beats their stuff (good for pitcher)
-        ("sp_overperf_recent", -1),  # recent trend
-        ("bp_xrv_mean", -1),
-        ("bp_fatigue_score", -1),    # more fatigue = worse
-        ("bp_matchup_xrv_mean", -1), # lower = bullpen is tougher vs opposing lineup
-        ("arsenal_matchup_xrv_mean", 1),  # higher = lineup does better (arsenal model)
-        ("arsenal_matchup_xrv_sum", 1),
-        ("bp_arsenal_matchup_xrv_mean", -1),
-        ("hit_xrv_mean", 1),        # higher = better for hitters
-        ("hit_xrv_contact", 1),
-        ("hit_k_rate", -1),
-        ("def_xrv_delta", -1),      # more negative = better defense
-        ("matchup_xrv_mean", 1),    # higher = lineup does better against opposing SP
-        ("matchup_xrv_sum", 1),
-        ("platoon_pct", 1),         # more platoon advantage = better
-        ("recent_form", 1),         # higher win% = better
-        # New: SP trend features
-        ("sp_velo_trend", -1),      # velo increasing = better for pitcher
-        ("sp_spin_trend", -1),      # spin increasing = better for pitcher
-        ("sp_xrv_trend", -1),       # xRV trending up = worse for pitcher
-        ("sp_transition_entropy", -1),  # higher entropy = more unpredictable = better for pitcher
-        # New: OAA defense
-        ("oaa_rate", 1),            # higher OAA = better defense
-        # New: team strength prior
-        ("team_prior", 1),          # higher prior win% = stronger team
-        # New: trade deadline features
-        ("trade_net", 1),           # more acquisitions = stronger
-        ("trade_pitcher_xrv", -1),  # negative xRV = better pitcher acquired
-        # New: preseason projections (Step 3)
-        ("projected_wpct", 1),      # higher projected win% = stronger
-        ("sp_projected_era", -1),   # lower ERA = better pitcher
-        ("sp_projected_war", 1),    # higher WAR = better pitcher
-        # New: roster-adjusted team prior (Step 6)
-        ("adjusted_team_prior", 1),
-    ]
-    for col, sign in diff_cols:
+    for col, sign in DIFF_COLS:
         home_col = f"home_{col}"
         away_col = f"away_{col}"
         if home_col in features_df.columns and away_col in features_df.columns:

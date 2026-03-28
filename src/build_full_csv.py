@@ -23,7 +23,7 @@ except ImportError:
     HAS_XGB = False
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from win_model import DIFF_FEATURES, RAW_FEATURES, ALL_FEATURES, _smart_fillna
+from win_model import DIFF_FEATURES, RAW_FEATURES, ALL_FEATURES, _smart_fillna, add_nonlinear_features
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 FEATURES_DIR = DATA_DIR / "features"
@@ -41,71 +41,106 @@ def load_features(years):
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
+def _prepare_xgb_features(df):
+    """Prepare XGB feature matrix with nonlinear features (NaN handled by XGB)."""
+    available = [f for f in ALL_FEATURES if f in df.columns]
+    X = df[available].copy()
+    for col in ["home_sp_rest_days", "away_sp_rest_days",
+                "home_bp_fatigue_score", "away_bp_fatigue_score",
+                "days_into_season"]:
+        if col in df.columns and col not in X.columns:
+            X[col] = df[col]
+    return add_nonlinear_features(X)
+
+
 def train_ensemble(train_df):
-    available = [f for f in ALL_FEATURES if f in train_df.columns]
-    X = train_df[available].copy()
     y = train_df["home_win"].values
 
+    # LR: linear features → _smart_fillna → scaler
+    available = [f for f in ALL_FEATURES if f in train_df.columns]
+    X_lr_raw = train_df[available].copy()
+    X_filled, train_medians = _smart_fillna(X_lr_raw)
     scaler = StandardScaler()
-    X_filled, train_medians = _smart_fillna(X)
     X_lr = scaler.fit_transform(X_filled)
     lr = LogisticRegression(C=1.0, max_iter=1000, solver="lbfgs")
     lr.fit(X_lr, y)
 
+    # XGB: nonlinear features → DMatrix (NaN native)
+    X_xgb = _prepare_xgb_features(train_df)
+    xgb_features = list(X_xgb.columns)
+
     xgb_model = None
     w_lr = 0.5
     if HAS_XGB:
-        dtrain = xgb.DMatrix(X, label=y)
         params = {
             "objective": "binary:logistic", "eval_metric": "logloss",
             "max_depth": 4, "learning_rate": 0.05, "subsample": 0.8,
             "colsample_bytree": 0.8, "min_child_weight": 50,
             "reg_alpha": 0.1, "reg_lambda": 1.0, "verbosity": 0,
         }
-        xgb_model = xgb.train(params, dtrain, num_boost_round=100)
+        # Chronological val split for early stopping
+        n = len(X_xgb)
+        val_size = int(n * 0.2)
+        dtrain = xgb.DMatrix(X_xgb.iloc[:n - val_size], label=y[:n - val_size])
+        dval = xgb.DMatrix(X_xgb.iloc[n - val_size:], label=y[n - val_size:])
+        xgb_model = xgb.train(params, dtrain, num_boost_round=500,
+                               evals=[(dtrain, "train"), (dval, "val")],
+                               early_stopping_rounds=50, verbose_eval=50)
 
         from scipy.optimize import minimize_scalar
         lr_train_probs = lr.predict_proba(X_lr)[:, 1]
-        xgb_train_probs = xgb_model.predict(dtrain)
+        dtrain_full = xgb.DMatrix(X_xgb, label=y)
+        xgb_train_probs = xgb_model.predict(dtrain_full)
 
         def blend_loss(w):
-            blended = w * lr_train_probs + (1 - w) * xgb_train_probs
-            blended = np.clip(blended, 1e-6, 1 - 1e-6)
+            blended = np.clip(w * lr_train_probs + (1 - w) * xgb_train_probs, 1e-6, 1 - 1e-6)
             return log_loss(y, blended)
 
         opt = minimize_scalar(blend_loss, bounds=(0.0, 1.0), method="bounded")
         w_lr = opt.x
         print(f"  Learned blend: LR={w_lr:.2f}, XGB={1-w_lr:.2f}")
 
-    return lr, scaler, xgb_model, available, w_lr, train_medians
+    return lr, scaler, xgb_model, available, xgb_features, w_lr, train_medians
 
 
-def predict(lr, scaler, xgb_model, features, test_df, w_lr=0.5, train_medians=None):
-    available = [f for f in features if f in test_df.columns]
-    X = test_df[available].copy()
-
-    X_filled, _ = _smart_fillna(X, train_medians)
+def predict(lr, scaler, xgb_model, lr_features, xgb_features, test_df, w_lr=0.5, train_medians=None):
+    # LR path
+    available_lr = [f for f in lr_features if f in test_df.columns]
+    X_lr_raw = test_df[available_lr].copy()
+    X_filled, _ = _smart_fillna(X_lr_raw, train_medians)
+    for col in lr_features:
+        if col not in X_filled.columns:
+            X_filled[col] = 0
+    X_filled = X_filled[lr_features]
     X_lr = scaler.transform(X_filled)
     lr_probs = lr.predict_proba(X_lr)[:, 1]
 
+    # XGB path
     if xgb_model and HAS_XGB:
-        dtest = xgb.DMatrix(X)
+        X_xgb = _prepare_xgb_features(test_df)
+        for col in xgb_features:
+            if col not in X_xgb.columns:
+                X_xgb[col] = np.nan
+        X_xgb = X_xgb[xgb_features]
+        dtest = xgb.DMatrix(X_xgb)
         xgb_probs = xgb_model.predict(dtest)
         ens_probs = w_lr * lr_probs + (1 - w_lr) * xgb_probs
     else:
-        xgb_probs = lr_probs
         ens_probs = lr_probs
 
     return ens_probs
 
 
-def compute_bet_pnl(edge, market_prob, outcome):
+def compute_bet_pnl(edge, market_prob, outcome, fee_pct=0.02):
+    """PnL for a flat $100 notional bet with fees."""
     if edge > 0:
-        fair_odds = 1 / market_prob
-        return (fair_odds - 1) * 100 if outcome == 1 else -100.0
+        cost = market_prob * 100
+        fee = cost * fee_pct
+        return (100 - cost - fee) if outcome == 1 else (-cost - fee)
     else:
-        fair_odds = 1 / (1 - market_prob)
-        return (fair_odds - 1) * 100 if outcome == 0 else -100.0
+        cost = (1 - market_prob) * 100
+        fee = cost * fee_pct
+        return (100 - cost - fee) if outcome == 0 else (-cost - fee)
 
 
 def main():
@@ -115,8 +150,8 @@ def main():
     print(f"  {len(train_df)} training games")
 
     print("\nTraining ensemble model...")
-    lr, scaler, xgb_model, features, w_lr, train_medians = train_ensemble(train_df)
-    print(f"  Features used: {len(features)}")
+    lr, scaler, xgb_model, lr_features, xgb_features, w_lr, train_medians = train_ensemble(train_df)
+    print(f"  LR features: {len(lr_features)}, XGB features: {len(xgb_features)}")
 
     # ── Load 2025 features ─────────────────────────────────────────────
     print("\nLoading 2025 features...")
@@ -139,7 +174,7 @@ def main():
 
     # ── Generate predictions ───────────────────────────────────────────
     print("\nGenerating model predictions...")
-    model_probs = predict(lr, scaler, xgb_model, features, test_df, w_lr, train_medians)
+    model_probs = predict(lr, scaler, xgb_model, lr_features, xgb_features, test_df, w_lr, train_medians)
     test_df["model_home_prob"] = model_probs
 
     # ── Load Kalshi data ───────────────────────────────────────────────

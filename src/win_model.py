@@ -25,7 +25,7 @@ import pandas as pd
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import log_loss, brier_score_loss, roc_auc_score
-from sklearn.model_selection import cross_val_predict
+from sklearn.model_selection import cross_val_predict, KFold
 
 try:
     import xgboost as xgb
@@ -341,13 +341,17 @@ def train_xgboost(X_train, y_train, X_test=None, y_test=None):
         "reg_lambda": 1.0,
     }
 
-    dtrain = xgb.DMatrix(X_train, label=y_train, enable_categorical=False)
+    # Split training: last 20% as validation for early stopping (chronological)
+    n = len(X_train)
+    val_size = int(n * 0.2)
+    X_tr = X_train.iloc[:n - val_size]
+    y_tr = y_train[:n - val_size]
+    X_val = X_train.iloc[n - val_size:]
+    y_val = y_train[n - val_size:]
 
-    if X_test is not None:
-        dtest = xgb.DMatrix(X_test, label=y_test, enable_categorical=False)
-        evals = [(dtrain, "train"), (dtest, "test")]
-    else:
-        evals = [(dtrain, "train")]
+    dtrain = xgb.DMatrix(X_tr, label=y_tr)
+    dval = xgb.DMatrix(X_val, label=y_val)
+    evals = [(dtrain, "train"), (dval, "val")]
 
     model = xgb.train(
         params, dtrain,
@@ -364,11 +368,13 @@ def train_xgboost(X_train, y_train, X_test=None, y_test=None):
     for feat, imp in sorted(importance.items(), key=lambda x: -x[1]):
         print(f"    {feat}: {imp/total:.1%}")
 
-    # In-sample
-    train_prob = model.predict(dtrain)
+    # Report on full training set and test set
+    dtrain_full = xgb.DMatrix(X_train, label=y_train)
+    train_prob = model.predict(dtrain_full)
     evaluate(y_train, train_prob, "XGB Train")
 
     if X_test is not None:
+        dtest = xgb.DMatrix(X_test, label=y_test)
         test_prob = model.predict(dtest)
         evaluate(y_test, test_prob, "XGB Test")
         return model, None, test_prob
@@ -436,19 +442,47 @@ def walk_forward_evaluation(all_years: list[int], min_train_years: int = 2):
             result["xgb_auc"] = roc_auc_score(y_test, xgb_probs)
             result["xgb_brier"] = brier_score_loss(y_test, xgb_probs)
 
-        # Ensemble — learn optimal blend via CV on training data
+        # Ensemble — learn optimal blend via K-fold OOF on training data
         if lr_probs is not None and xgb_probs is not None:
-            # Fit blend weight on training predictions
             from scipy.optimize import minimize_scalar
-            X_train_filled, _ = _smart_fillna(X_train_lr)
-            X_train_s = lr_scaler.transform(X_train_filled)
-            lr_train_probs = lr_model.predict_proba(X_train_s)[:, 1]
-            dtrain_xgb = xgb.DMatrix(X_train_xgb) if xgb_model else None
-            xgb_train_probs = xgb_model.predict(dtrain_xgb) if xgb_model else lr_train_probs
+
+            kf = KFold(n_splits=5, shuffle=False)  # chronological folds
+            lr_oof = np.zeros(len(y_train))
+            xgb_oof = np.zeros(len(y_train))
+
+            params = {
+                "objective": "binary:logistic",
+                "eval_metric": "logloss",
+                "max_depth": 4,
+                "learning_rate": 0.05,
+                "subsample": 0.8,
+                "colsample_bytree": 0.8,
+                "min_child_weight": 50,
+                "reg_alpha": 0.1,
+                "reg_lambda": 1.0,
+            }
+
+            for fold_train, fold_val in kf.split(X_train_lr):
+                # LR fold
+                X_ft_filled, fm = _smart_fillna(X_train_lr.iloc[fold_train])
+                X_fv_filled, _ = _smart_fillna(X_train_lr.iloc[fold_val], fm)
+                sc_fold = StandardScaler()
+                lr_fold = LogisticRegression(C=1.0, max_iter=1000, solver="lbfgs")
+                lr_fold.fit(sc_fold.fit_transform(X_ft_filled), y_train[fold_train])
+                lr_oof[fold_val] = lr_fold.predict_proba(sc_fold.transform(X_fv_filled))[:, 1]
+
+                # XGB fold
+                X_ft_xgb = X_train_xgb.iloc[fold_train]
+                X_fv_xgb = X_train_xgb.iloc[fold_val]
+                dt_fold = xgb.DMatrix(X_ft_xgb, label=y_train[fold_train])
+                dv_fold = xgb.DMatrix(X_fv_xgb, label=y_train[fold_val])
+                xgb_fold = xgb.train(params, dt_fold, num_boost_round=200,
+                                      evals=[(dt_fold, "t"), (dv_fold, "v")],
+                                      early_stopping_rounds=30, verbose_eval=0)
+                xgb_oof[fold_val] = xgb_fold.predict(dv_fold)
 
             def blend_loss(w):
-                blended = w * lr_train_probs + (1 - w) * xgb_train_probs
-                blended = np.clip(blended, 1e-6, 1 - 1e-6)
+                blended = np.clip(w * lr_oof + (1 - w) * xgb_oof, 1e-6, 1 - 1e-6)
                 return log_loss(y_train, blended)
 
             opt = minimize_scalar(blend_loss, bounds=(0.1, 0.9), method="bounded")
@@ -459,6 +493,25 @@ def walk_forward_evaluation(all_years: list[int], min_train_years: int = 2):
             result["ens_log_loss"] = log_loss(y_test, ens_probs)
             result["ens_auc"] = roc_auc_score(y_test, ens_probs)
             result["ens_brier"] = brier_score_loss(y_test, ens_probs)
+
+            # Per-year betting analysis
+            if ens_probs is not None:
+                pnls = []
+                for i in range(len(y_test)):
+                    p = ens_probs[i]
+                    if max(p, 1-p) >= 0.55:
+                        bet_home = p >= 0.5
+                        if bet_home:
+                            pnl = 100 if y_test[i] == 1 else -100
+                        else:
+                            pnl = 100 if y_test[i] == 0 else -100
+                        pnls.append(pnl)
+                if pnls:
+                    roi = sum(pnls) / (len(pnls) * 100)
+                    wr = sum(1 for p in pnls if p > 0) / len(pnls)
+                    result["n_bets"] = len(pnls)
+                    result["roi_vs_baseline"] = roi
+                    result["win_rate"] = wr
 
         all_results.append(result)
 
@@ -480,6 +533,13 @@ def walk_forward_evaluation(all_years: list[int], min_train_years: int = 2):
             print(f"  ENS avg log loss: {results_df['ens_log_loss'].mean():.4f}")
             print(f"  ENS avg AUC:      {results_df['ens_auc'].mean():.4f}")
             print(f"  XGB avg AUC:      {results_df['xgb_auc'].mean():.4f}")
+        if "roi_vs_baseline" in results_df.columns:
+            print(f"\n  Per-Year Betting (confidence >= 55%):")
+            for _, row in results_df.iterrows():
+                if "n_bets" in row and pd.notna(row.get("n_bets")):
+                    print(f"    {int(row['test_year'])}: {int(row['n_bets'])} bets, "
+                          f"ROI={row['roi_vs_baseline']:+.1%}, "
+                          f"WR={row['win_rate']:.1%}")
 
     return all_results
 

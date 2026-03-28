@@ -9,8 +9,7 @@ Usage:
 """
 
 import argparse
-import pickle
-from datetime import date, timedelta
+from datetime import date
 from pathlib import Path
 
 import httpx
@@ -28,78 +27,21 @@ except ImportError:
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 from feature_engineering import (
-    _preindex_xrv, _get_before, _sp_features_fast, _bp_features_fast,
-    _hit_features_fast, _def_features_fast, _precompute_pitcher_bases,
-    compute_matchup_xrv, compute_bullpen_matchup_xrv, compute_park_factors,
-    _recent_winpct, _load_hand_models, _compute_hand_matchup,
-    _compute_hand_arsenal_matchup, compute_arsenal_matchup_xrv,
-    compute_bullpen_arsenal_matchup_xrv, _compute_pitcher_arsenal_live,
-    _standardize_arsenal, _filter_competitive,
-    _load_team_oaa, _compute_team_priors, _load_trade_deadline_acquisitions,
+    _preindex_xrv, compute_single_game_features, compute_park_factors,
+    _load_hand_models, _load_team_oaa, _compute_team_priors,
+    _load_trade_deadline_acquisitions, _load_pitcher_projections,
+    _load_team_projections, _compute_adjusted_team_priors,
+    _recent_winpct, DIFF_COLS, OPENING_DAY,
 )
+from win_model import (
+    DIFF_FEATURES, RAW_FEATURES, ALL_FEATURES,
+    _smart_fillna, add_nonlinear_features,
+)
+from utils import DATA_DIR, XRV_DIR, GAMES_DIR, FEATURES_DIR, MODEL_DIR
 
-from utils import DATA_DIR, XRV_DIR, GAMES_DIR, FEATURES_DIR, MODEL_DIR, OAA_DIR
 MLB_API = "https://statsapi.mlb.com/api/v1"
-
-# Same feature set as win_model.py
-DIFF_FEATURES = [
-    "diff_sp_xrv_mean",
-    "diff_sp_k_rate",
-    "diff_sp_bb_rate",
-    "diff_sp_avg_velo",
-    "diff_sp_rest_days",
-    "diff_sp_overperf",
-    "diff_sp_overperf_recent",
-    "diff_bp_xrv_mean",
-    "diff_bp_fatigue_score",
-    "diff_bp_matchup_xrv_mean",
-    "diff_hit_xrv_mean",
-    "diff_hit_xrv_contact",
-    "diff_hit_k_rate",
-    "diff_def_xrv_delta",
-    "diff_matchup_xrv_mean",
-    "diff_matchup_xrv_sum",
-    "diff_arsenal_matchup_xrv_mean",
-    "diff_arsenal_matchup_xrv_sum",
-    "diff_bp_arsenal_matchup_xrv_mean",
-    "diff_platoon_pct",
-    "diff_recent_form",
-    "diff_sp_xrv_vs_lineup",
-    # SP trend features
-    "diff_sp_velo_trend",
-    "diff_sp_spin_trend",
-    "diff_sp_xrv_trend",
-    "diff_sp_transition_entropy",
-    # OAA defense
-    "diff_oaa_rate",
-    # Team strength prior
-    "diff_team_prior",
-    # Context-aware SP xRV
-    "diff_sp_context_xrv",
-    # Trade deadline features
-    "diff_trade_net",
-    "diff_trade_pitcher_xrv",
-]
-
-RAW_FEATURES = [
-    "park_factor",
-    "home_sp_pitch_mix_entropy",
-    "away_sp_pitch_mix_entropy",
-    "home_sp_n_pitches",
-    "away_sp_n_pitches",
-    "home_matchup_n_known",
-    "away_matchup_n_known",
-    "home_arsenal_matchup_n_known",
-    "away_arsenal_matchup_n_known",
-    "temperature",
-    "wind_speed",
-    "is_dome",
-    "wind_out",
-    "wind_in",
-]
-
-ALL_FEATURES = DIFF_FEATURES + RAW_FEATURES
 
 
 def load_training_data(exclude_year: int = None) -> pd.DataFrame:
@@ -117,23 +59,48 @@ def load_training_data(exclude_year: int = None) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
+def _prepare_lr_features(df: pd.DataFrame):
+    """Prepare LR feature matrix: linear features only + _smart_fillna."""
+    available = [f for f in ALL_FEATURES if f in df.columns]
+    return df[available].copy(), available
+
+
+def _prepare_xgb_features(df: pd.DataFrame):
+    """Prepare XGB feature matrix: ALL_FEATURES + nonlinear features (NaN handled by XGB)."""
+    available = [f for f in ALL_FEATURES if f in df.columns]
+    X = df[available].copy()
+    # Add raw columns needed for nonlinear feature engineering
+    for col in ["home_sp_rest_days", "away_sp_rest_days",
+                "home_bp_fatigue_score", "away_bp_fatigue_score",
+                "days_into_season"]:
+        if col in df.columns and col not in X.columns:
+            X[col] = df[col]
+    X = add_nonlinear_features(X)
+    return X, list(X.columns)
+
+
 def train_ensemble(train_df: pd.DataFrame):
-    """Train LR + XGB ensemble on training data."""
-    available = [f for f in ALL_FEATURES if f in train_df.columns]
-    X = train_df[available].copy()
+    """Train LR + XGB ensemble, matching win_model.py pipeline exactly.
+
+    LR: linear features → _smart_fillna → StandardScaler
+    XGB: nonlinear features → DMatrix (NaN handled natively) → early stopping with val split
+    """
     y = train_df["home_win"].values
 
-    # LR
+    # LR path: linear features only
+    X_lr_raw, lr_features = _prepare_lr_features(train_df)
+    X_lr_filled, train_medians = _smart_fillna(X_lr_raw)
     scaler = StandardScaler()
-    X_lr = scaler.fit_transform(X.fillna(0))
+    X_lr_scaled = scaler.fit_transform(X_lr_filled)
     lr = LogisticRegression(C=1.0, max_iter=1000, solver="lbfgs")
-    lr.fit(X_lr, y)
+    lr.fit(X_lr_scaled, y)
 
-    # XGB
+    # XGB path: nonlinear features
+    X_xgb, xgb_features = _prepare_xgb_features(train_df)
+
     xgb_model = None
-    w_lr = 0.5  # default blend weight
+    w_lr = 0.5
     if HAS_XGB:
-        dtrain = xgb.DMatrix(X, label=y)
         params = {
             "objective": "binary:logistic",
             "eval_metric": "logloss",
@@ -146,37 +113,65 @@ def train_ensemble(train_df: pd.DataFrame):
             "reg_lambda": 1.0,
             "verbosity": 0,
         }
-        xgb_model = xgb.train(params, dtrain, num_boost_round=100)
 
-        # Learn optimal blend weight on training data
+        # Chronological validation split for early stopping (never use test data)
+        n = len(X_xgb)
+        val_size = int(n * 0.2)
+        dtrain = xgb.DMatrix(X_xgb.iloc[:n - val_size], label=y[:n - val_size])
+        dval = xgb.DMatrix(X_xgb.iloc[n - val_size:], label=y[n - val_size:])
+        xgb_model = xgb.train(
+            params, dtrain, num_boost_round=500,
+            evals=[(dtrain, "train"), (dval, "val")],
+            early_stopping_rounds=50, verbose_eval=50,
+        )
+
+        # Learn blend weight on in-sample predictions
+        # (for live mode; walk-forward uses OOF — see win_model.py)
         from scipy.optimize import minimize_scalar
-        lr_probs = lr.predict_proba(X_lr)[:, 1]
-        xgb_probs = xgb_model.predict(dtrain)
+        lr_probs = lr.predict_proba(X_lr_scaled)[:, 1]
+        dtrain_full = xgb.DMatrix(X_xgb, label=y)
+        xgb_probs = xgb_model.predict(dtrain_full)
 
         def blend_loss(w):
-            blended = w * lr_probs + (1 - w) * xgb_probs
-            blended = np.clip(blended, 1e-6, 1 - 1e-6)
+            blended = np.clip(w * lr_probs + (1 - w) * xgb_probs, 1e-6, 1 - 1e-6)
             return log_loss(y, blended)
 
         opt = minimize_scalar(blend_loss, bounds=(0.1, 0.9), method="bounded")
         w_lr = opt.x
         print(f"  Learned ensemble weight: LR={w_lr:.2f}, XGB={1-w_lr:.2f}")
 
-    return lr, scaler, xgb_model, available, w_lr
+    return lr, scaler, xgb_model, lr_features, xgb_features, w_lr, train_medians
 
 
-def predict_games(lr, scaler, xgb_model, features, games_df: pd.DataFrame, w_lr: float = 0.5) -> pd.DataFrame:
-    """Generate predictions for a set of games."""
-    available = [f for f in features if f in games_df.columns]
-    X = games_df[available].copy()
+def predict_games(lr, scaler, xgb_model, lr_features, xgb_features,
+                  games_df: pd.DataFrame, w_lr: float = 0.5,
+                  train_medians: dict = None) -> pd.DataFrame:
+    """Generate predictions matching the training pipeline exactly.
 
-    # LR predictions
-    X_lr = scaler.transform(X.fillna(0))
-    lr_probs = lr.predict_proba(X_lr)[:, 1]
+    LR: linear features → _smart_fillna(train_medians) → scaler.transform
+    XGB: nonlinear features → DMatrix (NaN native)
+    """
+    # LR path
+    available_lr = [f for f in lr_features if f in games_df.columns]
+    X_lr_raw = games_df[available_lr].copy()
+    X_lr_filled, _ = _smart_fillna(X_lr_raw, train_medians)
+    # Align columns to training (add missing as 0)
+    for col in lr_features:
+        if col not in X_lr_filled.columns:
+            X_lr_filled[col] = 0
+    X_lr_filled = X_lr_filled[lr_features]
+    X_lr_scaled = scaler.transform(X_lr_filled)
+    lr_probs = lr.predict_proba(X_lr_scaled)[:, 1]
 
-    # XGB predictions
+    # XGB path
     if xgb_model and HAS_XGB:
-        dtest = xgb.DMatrix(X)
+        X_xgb, _ = _prepare_xgb_features(games_df)
+        # Align columns to training
+        for col in xgb_features:
+            if col not in X_xgb.columns:
+                X_xgb[col] = np.nan  # XGB handles NaN natively
+        X_xgb = X_xgb[xgb_features]
+        dtest = xgb.DMatrix(X_xgb)
         xgb_probs = xgb_model.predict(dtest)
         ensemble_probs = w_lr * lr_probs + (1 - w_lr) * xgb_probs
     else:
@@ -247,7 +242,6 @@ def fetch_todays_games(client: httpx.Client, target_date: str) -> list[dict]:
                 "weather": weather,
             }
 
-            # If game is final, include score
             if status == "Final":
                 game["home_score"] = home.get("score", 0)
                 game["away_score"] = away.get("score", 0)
@@ -290,8 +284,7 @@ def build_live_features(
     target_date: str,
     client: httpx.Client,
 ) -> pd.DataFrame:
-    """Build feature vectors for today's games using available data."""
-    # Determine which season we're in
+    """Build feature vectors for today's games using compute_single_game_features."""
     year = int(target_date[:4])
 
     # Load xRV data: current year + prior year
@@ -309,17 +302,15 @@ def build_live_features(
     print("  Pre-indexing xRV data...")
     idx = _preindex_xrv(xrv)
 
-    # Load hand-specific matchup models (from prior season)
+    # Load all context data (same as batch path)
     matchup_models = _load_hand_models("matchup_model", year - 1)
     if matchup_models:
         print(f"  Matchup models loaded for hands: {list(matchup_models.keys())}")
 
-    # Load hand-specific arsenal matchup models (from prior season)
     arsenal_models = _load_hand_models("arsenal_matchup", year - 1)
     if arsenal_models:
         print(f"  Arsenal models loaded for hands: {list(arsenal_models.keys())}")
 
-    # Park factors from prior season
     prior_xrv_path = XRV_DIR / f"statcast_xrv_{year - 1}.parquet"
     if prior_xrv_path.exists():
         prior_xrv = pd.read_parquet(prior_xrv_path)
@@ -327,22 +318,26 @@ def build_live_features(
     else:
         park_factors = {}
 
-    # Load team OAA from prior season
     team_oaa = _load_team_oaa(year - 1)
     if team_oaa:
         print(f"  Team OAA from {year - 1}: {len(team_oaa)} teams")
 
-    # Compute team priors from prior season win%
     team_priors = _compute_team_priors(year - 1)
     if team_priors:
         print(f"  Team priors from {year - 1}: {len(team_priors)} teams")
 
-    # Load trade deadline acquisitions
+    team_projections = _load_team_projections(year)
+    pitcher_projections = _load_pitcher_projections(year)
+    adjusted_priors = _compute_adjusted_team_priors(year - 1, team_priors, idx)
+
     trade_stats = _load_trade_deadline_acquisitions(year, idx)
     if trade_stats:
         print(f"  Trade deadline stats: {len(trade_stats)} teams")
 
-    # Compute recent form from game results
+    opening_day = OPENING_DAY.get(year, target_date)
+    prior_year_cutoff = f"{year}-01-01"
+
+    # Compute recent form from completed games this season
     games_path = GAMES_DIR / f"games_{year}.parquet"
     team_history = {}
     if games_path.exists():
@@ -358,271 +353,45 @@ def build_live_features(
             team_history.setdefault(ht, []).append(hw)
             team_history.setdefault(at, []).append(1 - hw)
 
-    nan_sp = {f"sp_{k}": np.nan for k in
-              ["xrv_mean", "xrv_std", "n_pitches", "k_rate", "bb_rate", "avg_velo",
-               "pitch_mix_entropy", "xrv_vs_L", "xrv_vs_R", "rest_days",
-               "overperf", "overperf_recent"]}
-    nan_matchup = {"matchup_xrv_mean": np.nan, "matchup_xrv_sum": np.nan,
-                   "matchup_n_hitters": 0, "matchup_n_known": 0}
-
+    # Fetch lineups for each game and build features using shared function
     feature_rows = []
+    display_meta = []  # SP names, game_time, status for display
     for game in games:
-        gdate = game["game_date"]
-        home_team = game["home_team"]
-        away_team = game["away_team"]
-        home_sp = game.get("home_sp_id")
-        away_sp = game.get("away_sp_id")
         game_pk = game["game_pk"]
 
-        row = {
-            "game_pk": game_pk,
-            "game_date": gdate,
-            "home_team": home_team,
-            "away_team": away_team,
-        }
-        # Copy over any result data
-        for k in ("home_win", "home_score", "away_score"):
-            if k in game:
-                row[k] = game[k]
-
-        # --- SP features ---
-        for side, sp_id in [("home", home_sp), ("away", away_sp)]:
-            if sp_id and int(sp_id) in idx["pitcher"]:
-                stats = _sp_features_fast(idx["pitcher"][int(sp_id)], gdate, 2000)
-                for k, v in stats.items():
-                    row[f"{side}_{k}"] = v
-            else:
-                for k, v in nan_sp.items():
-                    row[f"{side}_{k}"] = v
-
-        # --- Fetch lineup for matchup features ---
+        # Fetch live lineup
         lineup = fetch_lineup(client, game_pk)
+        lineups = {game_pk: lineup}
 
-        # --- SP matchup: lineup vs opposing SP (hand-specific) ---
-        nan_arsenal = {"arsenal_matchup_xrv_mean": np.nan, "arsenal_matchup_xrv_sum": np.nan,
-                       "arsenal_matchup_n_hitters": 0, "arsenal_matchup_n_known": 0}
+        # weather_map is empty — live weather comes from game["weather"] dict
+        row, meta = compute_single_game_features(
+            game, idx, lineups, matchup_models, arsenal_models,
+            park_factors, team_oaa, team_priors, adjusted_priors,
+            team_projections, pitcher_projections, trade_stats,
+            {},  # weather_map empty — live weather in game["weather"]
+            year, opening_day, prior_year_cutoff,
+        )
 
-        for atk_side, def_sp, def_side in [("home", away_sp, "away"), ("away", home_sp, "home")]:
-            lu = lineup.get(atk_side, [])
-            if matchup_models and lu and def_sp and int(def_sp) in idx["pitcher"]:
-                hitter_ids = [h[0] for h in lu]
-                hitter_hands = [h[1] for h in lu]
-                matchup = _compute_hand_matchup(
-                    matchup_models, idx["pitcher"][int(def_sp)], int(def_sp),
-                    gdate, 2000, hitter_ids, hitter_hands, compute_matchup_xrv)
-                for k, v in matchup.items():
-                    row[f"{atk_side}_{k}"] = v
-            else:
-                for k, v in nan_matchup.items():
-                    row[f"{atk_side}_{k}"] = v
-
-            # Arsenal matchup
-            if arsenal_models and lu and def_sp and int(def_sp) in idx["pitcher"]:
-                hitter_ids = [h[0] for h in lu]
-                hitter_hands = [h[1] for h in lu]
-                a_matchup = _compute_hand_arsenal_matchup(
-                    arsenal_models, idx["pitcher"][int(def_sp)], int(def_sp),
-                    gdate, 2000, hitter_ids, hitter_hands)
-                for k, v in a_matchup.items():
-                    row[f"{atk_side}_{k}"] = v
-            else:
-                for k, v in nan_arsenal.items():
-                    row[f"{atk_side}_{k}"] = v
-
-        # --- Bullpen features ---
-        for side in ["home", "away"]:
-            team = home_team if side == "home" else away_team
-            if team in idx["pitching_team"]:
-                bp = _bp_features_fast(idx["pitching_team"][team], gdate)
-                for k, v in bp.items():
-                    row[f"{side}_{k}"] = v
-            else:
-                for k in ["bp_xrv_mean", "bp_xrv_std", "bp_recent_ip", "bp_fatigue_score"]:
-                    row[f"{side}_{k}"] = np.nan
-
-        # --- Bullpen matchup (hand-specific) ---
-        bp_matchup_artifacts = matchup_models.get("L") or matchup_models.get("R") if matchup_models else None
-        bp_arsenal_artifacts = arsenal_models.get("L") or arsenal_models.get("R") if arsenal_models else None
-        if bp_matchup_artifacts:
-            for def_side, atk_side in [("home", "away"), ("away", "home")]:
-                def_team = home_team if def_side == "home" else away_team
-                lu = lineup.get(atk_side, [])
-                if lu:
-                    hids = [h[0] for h in lu]
-                    hhands = [h[1] for h in lu]
-                    bp_m = compute_bullpen_matchup_xrv(
-                        bp_matchup_artifacts, idx, def_team, gdate, hids, hhands)
-                    for k, v in bp_m.items():
-                        row[f"{def_side}_{k}"] = v
-                else:
-                    row[f"{def_side}_bp_matchup_xrv_mean"] = np.nan
-                    row[f"{def_side}_bp_matchup_n_relievers"] = 0
-        else:
-            for side in ["home", "away"]:
-                row[f"{side}_bp_matchup_xrv_mean"] = np.nan
-                row[f"{side}_bp_matchup_n_relievers"] = 0
-
-        # --- Bullpen arsenal matchup ---
-        if bp_arsenal_artifacts:
-            for def_side, atk_side in [("home", "away"), ("away", "home")]:
-                def_team = home_team if def_side == "home" else away_team
-                lu = lineup.get(atk_side, [])
-                if lu:
-                    bp_a = compute_bullpen_arsenal_matchup_xrv(
-                        bp_arsenal_artifacts, idx, def_team, gdate,
-                        [h[0] for h in lu], [h[1] for h in lu])
-                    for k, v in bp_a.items():
-                        row[f"{def_side}_{k}"] = v
-                else:
-                    row[f"{def_side}_bp_arsenal_matchup_xrv_mean"] = np.nan
-                    row[f"{def_side}_bp_arsenal_matchup_n_relievers"] = 0
-        else:
-            for side in ["home", "away"]:
-                row[f"{side}_bp_arsenal_matchup_xrv_mean"] = np.nan
-                row[f"{side}_bp_arsenal_matchup_n_relievers"] = 0
-
-        # --- Team hitting ---
-        for side in ["home", "away"]:
-            team = home_team if side == "home" else away_team
-            if team in idx["batting_team"]:
-                hit = _hit_features_fast(idx["batting_team"][team], gdate)
-                for k, v in hit.items():
-                    row[f"{side}_{k}"] = v
-            else:
-                for k in ["hit_xrv_mean", "hit_xrv_contact", "hit_k_rate"]:
-                    row[f"{side}_{k}"] = np.nan
-
-        # --- Defense ---
-        for side in ["home", "away"]:
-            team = home_team if side == "home" else away_team
-            if team in idx["pitching_team"]:
-                d = _def_features_fast(idx["pitching_team"][team], gdate)
-                for k, v in d.items():
-                    row[f"{side}_{k}"] = v
-            else:
-                row[f"{side}_def_xrv_delta"] = np.nan
-
-        # --- OAA defense ---
-        row["home_oaa_rate"] = team_oaa.get(home_team, 0.0)
-        row["away_oaa_rate"] = team_oaa.get(away_team, 0.0)
-
-        # --- Team strength prior ---
-        row["home_team_prior"] = team_priors.get(home_team, 0.5)
-        row["away_team_prior"] = team_priors.get(away_team, 0.5)
-
-        # --- Trade deadline features ---
-        if target_date >= f"{year}-08-01" and trade_stats:
-            home_trade = trade_stats.get(home_team, {})
-            away_trade = trade_stats.get(away_team, {})
-            row["home_trade_net"] = home_trade.get("net_acquisitions", 0)
-            row["away_trade_net"] = away_trade.get("net_acquisitions", 0)
-            row["home_trade_pitcher_xrv"] = home_trade.get("acquired_pitcher_xrv", 0.0)
-            row["away_trade_pitcher_xrv"] = away_trade.get("acquired_pitcher_xrv", 0.0)
-        else:
-            row["home_trade_net"] = 0
-            row["away_trade_net"] = 0
-            row["home_trade_pitcher_xrv"] = 0.0
-            row["away_trade_pitcher_xrv"] = 0.0
-
-        # --- Park factor ---
-        row["park_factor"] = park_factors.get(home_team, 1.0)
-
-        # --- Platoon advantage ---
-        for atk_side, def_sp in [("home", away_sp), ("away", home_sp)]:
-            lu = lineup.get(atk_side, [])
-            if lu and def_sp and int(def_sp) in idx["pitcher"]:
-                sp_df = idx["pitcher"][int(def_sp)]
-                sp_throws = sp_df["p_throws"].iloc[-1] if "p_throws" in sp_df.columns and len(sp_df) > 0 else None
-                if sp_throws:
-                    platoon_count = sum(1 for _, hand in lu
-                                       if (hand == "L" and sp_throws == "R")
-                                       or (hand == "R" and sp_throws == "L"))
-                    row[f"{atk_side}_platoon_pct"] = platoon_count / len(lu)
-
-                    # Handedness-weighted SP xRV
-                    def_side = "away" if atk_side == "home" else "home"
-                    xrv_vs_L = row.get(f"{def_side}_sp_xrv_vs_L", np.nan)
-                    xrv_vs_R = row.get(f"{def_side}_sp_xrv_vs_R", np.nan)
-                    if not np.isnan(xrv_vs_L):
-                        n_L = sum(1 for _, h in lu if h == "L")
-                        n_R = len(lu) - n_L
-                        row[f"{def_side}_sp_xrv_vs_lineup"] = (
-                            n_L * xrv_vs_L + n_R * xrv_vs_R
-                        ) / len(lu) if len(lu) > 0 else np.nan
-                    else:
-                        row[f"{def_side}_sp_xrv_vs_lineup"] = np.nan
-                else:
-                    row[f"{atk_side}_platoon_pct"] = np.nan
-                    def_side = "away" if atk_side == "home" else "home"
-                    row[f"{def_side}_sp_xrv_vs_lineup"] = np.nan
-            else:
-                row[f"{atk_side}_platoon_pct"] = np.nan
-                def_side = "away" if atk_side == "home" else "home"
-                row[f"{def_side}_sp_xrv_vs_lineup"] = np.nan
-
-        # --- Recent form ---
+        # Add recent form and games played (not in compute_single_game_features)
+        home_team = game["home_team"]
+        away_team = game["away_team"]
         row["home_recent_form"] = _recent_winpct(team_history.get(home_team, []), 10)
         row["away_recent_form"] = _recent_winpct(team_history.get(away_team, []), 10)
-
-        # --- Weather ---
-        weather = game.get("weather", {})
-        if weather:
-            row["temperature"] = float(weather.get("temp", 0)) if weather.get("temp") else np.nan
-            wind_str = weather.get("wind", "")
-            if wind_str:
-                parts = wind_str.split(",")
-                try:
-                    row["wind_speed"] = float(parts[0].strip().lower().replace("mph", "").strip())
-                except (ValueError, IndexError):
-                    row["wind_speed"] = 0.0
-                wind_dir = parts[1].strip().lower() if len(parts) > 1 else ""
-                row["wind_out"] = int("out" in wind_dir)
-                row["wind_in"] = int("in" in wind_dir)
-            else:
-                row["wind_speed"] = 0.0
-                row["wind_out"] = 0
-                row["wind_in"] = 0
-            venue = game.get("venue_name", "")
-            row["is_dome"] = int("dome" in venue.lower() or "roof" in weather.get("condition", "").lower())
-        else:
-            row["temperature"] = np.nan
-            row["wind_speed"] = np.nan
-            row["is_dome"] = np.nan
-            row["wind_out"] = np.nan
-            row["wind_in"] = np.nan
-
-        row["is_home"] = 1
-
-        # Store SP names for display
-        row["home_sp_name"] = game.get("home_sp_name", "TBD")
-        row["away_sp_name"] = game.get("away_sp_name", "TBD")
-        row["game_time"] = game.get("game_time", "")
-        row["status"] = game.get("status", "")
+        row["home_team_games_played"] = len(team_history.get(home_team, []))
+        row["away_team_games_played"] = len(team_history.get(away_team, []))
 
         feature_rows.append(row)
+        display_meta.append({
+            "home_sp_name": game.get("home_sp_name", "TBD"),
+            "away_sp_name": game.get("away_sp_name", "TBD"),
+            "game_time": game.get("game_time", ""),
+            "status": game.get("status", ""),
+        })
 
     features_df = pd.DataFrame(feature_rows)
 
-    # Compute differentials
-    diff_cols = [
-        ("sp_xrv_mean", -1), ("sp_k_rate", 1), ("sp_bb_rate", -1),
-        ("sp_avg_velo", -1), ("sp_rest_days", 1),
-        ("sp_overperf", -1), ("sp_overperf_recent", -1),
-        ("bp_xrv_mean", -1), ("bp_fatigue_score", -1),
-        ("bp_matchup_xrv_mean", -1),
-        ("hit_xrv_mean", 1), ("hit_xrv_contact", 1), ("hit_k_rate", -1),
-        ("def_xrv_delta", -1),
-        ("matchup_xrv_mean", 1), ("matchup_xrv_sum", 1),
-        ("arsenal_matchup_xrv_mean", 1), ("arsenal_matchup_xrv_sum", 1),
-        ("bp_arsenal_matchup_xrv_mean", -1),
-        ("platoon_pct", 1), ("recent_form", 1),
-        # New features
-        ("sp_velo_trend", -1), ("sp_spin_trend", -1), ("sp_xrv_trend", -1),
-        ("sp_transition_entropy", -1),
-        ("oaa_rate", 1), ("team_prior", 1),
-        ("trade_net", 1), ("trade_pitcher_xrv", -1),
-    ]
-    for col, sign in diff_cols:
+    # Compute differentials (same as batch path)
+    for col, sign in DIFF_COLS:
         hc = f"home_{col}"
         ac = f"away_{col}"
         if hc in features_df.columns and ac in features_df.columns:
@@ -633,11 +402,15 @@ def build_live_features(
             features_df["home_sp_xrv_vs_lineup"] - features_df["away_sp_xrv_vs_lineup"]
         )
 
-    # Context-aware SP xRV: home SP uses home split, away SP uses away split
     if "home_sp_home_xrv" in features_df.columns and "away_sp_away_xrv" in features_df.columns:
         features_df["diff_sp_context_xrv"] = -(
             features_df["home_sp_home_xrv"] - features_df["away_sp_away_xrv"]
         )
+
+    # Attach display metadata
+    for i, dm in enumerate(display_meta):
+        for k, v in dm.items():
+            features_df.loc[i, k] = v
 
     return features_df
 
@@ -648,13 +421,11 @@ def predict_date(target_date: str):
     print(f"MLB Predictions for {target_date}")
     print(f"{'='*60}")
 
-    # Train on all available data
     print("\nTraining model on historical data...")
     train_df = load_training_data()
     print(f"  {len(train_df):,} training games")
-    lr, scaler, xgb_model, features, w_lr = train_ensemble(train_df)
+    lr, scaler, xgb_model, lr_features, xgb_features, w_lr, train_medians = train_ensemble(train_df)
 
-    # Fetch today's games
     print(f"\nFetching games for {target_date}...")
     with httpx.Client(timeout=15.0) as client:
         games = fetch_todays_games(client, target_date)
@@ -664,21 +435,15 @@ def predict_date(target_date: str):
 
         print(f"  Found {len(games)} games")
 
-        # Build features
         print("\nBuilding features...")
         features_df = build_live_features(games, target_date, client)
 
-    # Generate predictions
-    results = predict_games(lr, scaler, xgb_model, features, features_df, w_lr)
+    results = predict_games(lr, scaler, xgb_model, lr_features, xgb_features, features_df, w_lr, train_medians)
 
-    # Merge SP names back in
-    if "home_sp_name" in features_df.columns:
-        results["home_sp_name"] = features_df["home_sp_name"].values
-        results["away_sp_name"] = features_df["away_sp_name"].values
-    if "game_time" in features_df.columns:
-        results["game_time"] = features_df["game_time"].values
-    if "status" in features_df.columns:
-        results["status"] = features_df["status"].values
+    # Merge display columns back
+    for col in ["home_sp_name", "away_sp_name", "game_time", "status"]:
+        if col in features_df.columns:
+            results[col] = features_df[col].values
 
     # Display
     print(f"\n{'='*60}")
@@ -704,7 +469,6 @@ def predict_date(target_date: str):
         print(f"  {pitchers}")
         print()
 
-    # If we have results, show accuracy
     if "home_win" in results.columns and results["home_win"].notna().all():
         picks_correct = results.apply(
             lambda r: (r["home_win_prob"] >= 0.5) == (r["home_win"] == 1), axis=1)
@@ -723,7 +487,7 @@ def backtest_season(year: int):
     train_df = load_training_data(exclude_year=year)
     print(f"  Training on {len(train_df):,} games from prior seasons")
 
-    lr, scaler, xgb_model, features, w_lr = train_ensemble(train_df)
+    lr, scaler, xgb_model, lr_features, xgb_features, w_lr, train_medians = train_ensemble(train_df)
 
     test_path = FEATURES_DIR / f"game_features_{year}.parquet"
     if not test_path.exists():
@@ -733,7 +497,7 @@ def backtest_season(year: int):
     test_df["season"] = year
     print(f"  Predicting {len(test_df)} games")
 
-    results = predict_games(lr, scaler, xgb_model, features, test_df, w_lr)
+    results = predict_games(lr, scaler, xgb_model, lr_features, xgb_features, test_df, w_lr, train_medians)
 
     # Evaluate
     y_true = results["home_win"].values
@@ -800,7 +564,6 @@ def main():
                 bs = brier_score_loss(y_true, probs)
                 print(f"  {name}: log_loss={ll:.4f}, AUC={auc:.4f}, brier={bs:.4f}")
     else:
-        # Live prediction mode
         target_date = args.date or date.today().strftime("%Y-%m-%d")
         predict_date(target_date)
 
