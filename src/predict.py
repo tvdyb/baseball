@@ -269,7 +269,8 @@ def fetch_lineup(client: httpx.Client, game_pk: int) -> dict:
         resp = client.get(f"{MLB_API}/game/{game_pk}/boxscore")
         resp.raise_for_status()
         data = resp.json()
-    except Exception:
+    except Exception as e:
+        print(f"  WARNING: Failed to fetch lineup for game {game_pk}: {e}")
         return {"home": [], "away": []}
 
     result = {}
@@ -367,11 +368,14 @@ def build_live_features(
     # Fetch lineups for each game and build features using shared function
     feature_rows = []
     display_meta = []  # SP names, game_time, status for display
+    empty_lineups = 0
     for game in games:
         game_pk = game["game_pk"]
 
         # Fetch live lineup
         lineup = fetch_lineup(client, game_pk)
+        if not lineup.get("home") and not lineup.get("away"):
+            empty_lineups += 1
         lineups = {game_pk: lineup}
 
         # weather_map is empty — live weather comes from game["weather"] dict
@@ -398,6 +402,10 @@ def build_live_features(
             "game_time": game.get("game_time", ""),
             "status": game.get("status", ""),
         })
+
+    if empty_lineups > 0:
+        print(f"  WARNING: {empty_lineups}/{len(games)} games had no lineup data. "
+              "Matchup features will be NaN for those games.")
 
     features_df = pd.DataFrame(feature_rows)
 
