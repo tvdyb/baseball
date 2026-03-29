@@ -83,13 +83,13 @@ def train_ensemble(train_df):
 
         # Learn blend weight via OOF predictions (not in-sample) to avoid leakage
         from scipy.optimize import minimize_scalar
-        from sklearn.model_selection import KFold
+        from sklearn.model_selection import TimeSeriesSplit
 
-        kf = KFold(n_splits=5, shuffle=False)  # chronological folds
+        tscv = TimeSeriesSplit(n_splits=5)  # forward-only time-series folds
         lr_oof = np.zeros(len(y))
         xgb_oof = np.zeros(len(y))
 
-        for fold_train, fold_val in kf.split(X_lr_raw):
+        for fold_train, fold_val in tscv.split(X_lr_raw):
             # LR fold
             Xf_filled, fm = _smart_fillna(X_lr_raw.iloc[fold_train])
             Xv_filled, _ = _smart_fillna(X_lr_raw.iloc[fold_val], fm)

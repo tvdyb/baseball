@@ -24,7 +24,7 @@ from scipy.optimize import minimize_scalar
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
-from sklearn.model_selection import KFold
+from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler
 
 try:
@@ -119,11 +119,11 @@ def train_ensemble_oof(train_df, features_override=None, n_folds=5):
         )
 
         # OOF predictions for blend weight
-        kf = KFold(n_splits=n_folds, shuffle=False)
+        tscv = TimeSeriesSplit(n_splits=n_folds)  # forward-only time-series folds
         lr_oof = np.zeros(len(y))
         xgb_oof = np.zeros(len(y))
 
-        for fold_train, fold_val in kf.split(X_lr_raw):
+        for fold_train, fold_val in tscv.split(X_lr_raw):
             # LR fold
             Xf_filled, fm = _smart_fillna(X_lr_raw.iloc[fold_train])
             Xv_filled, _ = _smart_fillna(X_lr_raw.iloc[fold_val], fm)
@@ -218,13 +218,13 @@ def walk_forward(df, test_years=None, features_override=None,
         if fit_isotonic and bundle["xgb_model"]:
             # Generate training OOF predictions for isotonic fitting
             y_train = train_df["home_win"].values
-            kf = KFold(n_splits=5, shuffle=False)
+            tscv = TimeSeriesSplit(n_splits=5)  # forward-only time-series folds
             oof_ens = np.zeros(len(y_train))
             lr_feats = bundle["lr_features"]
             X_lr_raw_train = train_df[[f for f in lr_feats if f in train_df.columns]].copy()
             X_xgb_train = _prepare_xgb_features(train_df, bundle["features_used"])
 
-            for ft, fv in kf.split(X_lr_raw_train):
+            for ft, fv in tscv.split(X_lr_raw_train):
                 Xf_filled, fm = _smart_fillna(X_lr_raw_train.iloc[ft])
                 Xv_filled, _ = _smart_fillna(X_lr_raw_train.iloc[fv], fm)
                 sc = StandardScaler()

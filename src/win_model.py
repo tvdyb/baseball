@@ -24,7 +24,7 @@ import pandas as pd
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import log_loss, brier_score_loss, roc_auc_score
-from sklearn.model_selection import KFold
+from sklearn.model_selection import TimeSeriesSplit
 
 try:
     import xgboost as xgb
@@ -501,11 +501,11 @@ def walk_forward_evaluation(all_years: list[int], min_train_years: int = 2):
         if lr_probs is not None and xgb_probs is not None:
             from scipy.optimize import minimize_scalar
 
-            kf = KFold(n_splits=5, shuffle=False)  # chronological folds
+            tscv = TimeSeriesSplit(n_splits=5)  # forward-only time-series folds
             lr_oof = np.zeros(len(y_train))
             xgb_oof = np.zeros(len(y_train))
 
-            for fold_train, fold_val in kf.split(X_train_lr):
+            for fold_train, fold_val in tscv.split(X_train_lr):
                 # LR fold
                 X_ft_filled, fm = _smart_fillna(X_train_lr.iloc[fold_train])
                 X_fv_filled, _ = _smart_fillna(X_train_lr.iloc[fold_val], fm)

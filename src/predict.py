@@ -120,13 +120,13 @@ def train_ensemble(train_df: pd.DataFrame, lr_only: bool = False) -> tuple:
 
         # Learn blend weight via OOF predictions (not in-sample)
         from scipy.optimize import minimize_scalar
-        from sklearn.model_selection import KFold
+        from sklearn.model_selection import TimeSeriesSplit
 
-        kf = KFold(n_splits=5, shuffle=False)
+        tscv = TimeSeriesSplit(n_splits=5)  # forward-only time-series folds
         lr_oof = np.zeros(len(y))
         xgb_oof = np.zeros(len(y))
 
-        for fold_train, fold_val in kf.split(X_lr_raw):
+        for fold_train, fold_val in tscv.split(X_lr_raw):
             Xf_filled, fm = _smart_fillna(X_lr_raw.iloc[fold_train])
             Xv_filled, _ = _smart_fillna(X_lr_raw.iloc[fold_val], fm)
             sc_f = StandardScaler()
@@ -442,7 +442,12 @@ def predict_date(target_date: str, lr_only: bool = False):
 
     print("\nTraining model on historical data...")
     train_df = load_training_data()
-    print(f"  {len(train_df):,} training games")
+    train_df["game_date"] = train_df["game_date"].astype(str)
+    n_before = len(train_df)
+    train_df = train_df[train_df["game_date"] < target_date]
+    if len(train_df) < n_before:
+        print(f"  Filtered out {n_before - len(train_df)} games on/after {target_date}")
+    print(f"  {len(train_df):,} training games (through {train_df['game_date'].max()})")
     lr, scaler, xgb_model, lr_features, xgb_features, w_lr, train_medians = train_ensemble(train_df, lr_only=lr_only)
 
     print(f"\nFetching games for {target_date}...")
