@@ -147,8 +147,8 @@ def predict(lr, scaler, xgb_model, lr_features, xgb_features, test_df, w_lr=0.5,
     return ens_probs
 
 
-def compute_bet_pnl(edge, market_prob, outcome, fee_pct=0.02):
-    """PnL for a flat $100 notional bet with fees."""
+def compute_bet_pnl(edge, market_prob, outcome, fee_pct=0.0):
+    """PnL for a flat $100 notional bet."""
     if edge > 0:
         cost = market_prob * 100
         fee = cost * fee_pct

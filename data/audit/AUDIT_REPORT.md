@@ -1,5 +1,5 @@
 # MLB Win Probability Model — Audit Report
-Generated: 2026-03-29 16:04
+Generated: 2026-03-29 16:34
 ## 1. Leakage Audit
 **Finding 1 (FIXED):** `compare_vs_market.py` and `build_full_csv.py` computed blend weight on in-sample predictions. Both now use 5-fold chronological OOF, matching `win_model.py`.
 **Finding 2 (MINOR):** `add_nonlinear_features` z-scores `prior_dominance` using batch statistics. For XGB (tree-based, rank-invariant), this has no practical impact. No fix needed.
@@ -117,21 +117,21 @@ Correlation: 0.7851
 - **log_loss** delta: -0.00232 [-0.00850, +0.00353] p=0.234
 - **brier** delta: -0.00081 [-0.00341, +0.00175] p=0.281
 
-### ROI Simulation ($100 flat, 2% fee)
+### ROI Simulation ($100 flat, no fee)
 | Edge | Bets | PnL | ROI | Win Rate |
 |------|------|-----|-----|----------|
-| 3% | 1269 | $+3,390 | +2.7% | 47.8% |
-| 5% | 780 | $+2,192 | +2.8% | 46.8% |
-| 7% | 433 | $+2,182 | +5.0% | 47.6% |
-| 10% | 161 | $+1,360 | +8.4% | 47.2% |
+| 3% | 1269 | $+4,514 | +3.6% | 47.8% |
+| 5% | 780 | $+2,865 | +3.7% | 46.8% |
+| 7% | 433 | $+2,543 | +5.9% | 47.6% |
+| 10% | 161 | $+1,482 | +9.2% | 47.2% |
 
-3% edge ROI bootstrap: [-0.1%, +5.4%], p(ROI>0)=0.969
+3% edge ROI bootstrap: [+0.8%, +6.2%], p(ROI>0)=0.995
 
 ### Edge by Side (3% threshold)
 | Side | Bets | PnL | ROI | Win Rate |
 |------|------|-----|-----|----------|
-| home | 519 | $+1,629 | +3.1% | 52.2% |
-| away | 750 | $+1,762 | +2.3% | 44.8% |
+| home | 519 | $+2,128 | +4.1% | 52.2% |
+| away | 750 | $+2,386 | +3.2% | 44.8% |
 
 ![Cumulative PnL](cumulative_pnl_2025.png)
 
@@ -144,7 +144,7 @@ Correlation: 0.7851
 ### What is fragile
 - Early-season predictions (first 30 days) have notably higher log loss
 - 2025 Kalshi comparison is a single season — need more years of market data
-- ROI depends on edge threshold and fee assumptions
+- ROI depends on edge threshold; fees not included in simulation
 
 ### What to do next
 - Collect Kalshi/market data for 2024 to validate market comparison out-of-sample

@@ -169,10 +169,8 @@ def _sharpe(pnls, days_in_sample=None):
     return (mean / std) * np.sqrt(len(pnls))
 
 
-def _compute_bet_pnl(edge, market_prob, outcome, fee_pct=0.02):
-    """Compute PnL for a single flat $100 bet with fees.
-    fee_pct: total round-trip cost as fraction of contract cost.
-    """
+def _compute_bet_pnl(edge, market_prob, outcome, fee_pct=0.0):
+    """Compute PnL for a single flat $100 bet."""
     if edge > 0:
         cost = market_prob * 100
         fee = cost * fee_pct
@@ -268,7 +266,7 @@ def evaluate_vs_market(results_df, model_col, market_col, label=""):
         for i in range(len(df)):
             e = edge[i]
             if abs(e) >= min_edge:
-                pnls.append(_compute_bet_pnl(e, market_probs[i], y[i], fee_pct=0.02))
+                pnls.append(_compute_bet_pnl(e, market_probs[i], y[i]))
         if pnls:
             total_pnl = sum(pnls)
             n_bets = len(pnls)
@@ -284,21 +282,6 @@ def evaluate_vs_market(results_df, model_col, market_col, label=""):
             print(f"  {min_edge:>6.0%} {n_bets:>6d} ${total_pnl:>+9.0f} "
                   f"{roi:>+7.1%} {sharpe:>8.2f} {wr:>7.1%}")
 
-    # Fee sensitivity table
-    print(f"\n  Fee Sensitivity (ROI at different fee levels):")
-    print(f"  {'Edge':>7s} {'0% fee':>10s} {'1% fee':>10s} {'2% fee':>10s}")
-    print(f"  {'-'*39}")
-    for min_edge in EDGE_THRESHOLDS:
-        row_parts = [f"  {min_edge:>6.0%}"]
-        for fee in [0.0, 0.01, 0.02]:
-            pnls = [_compute_bet_pnl(edge[i], market_probs[i], y[i], fee)
-                    for i in range(len(df)) if abs(edge[i]) >= min_edge]
-            if pnls:
-                roi = sum(pnls) / (len(pnls) * 100)
-                row_parts.append(f"{roi:>+9.1%}")
-            else:
-                row_parts.append(f"{'---':>10s}")
-        print(" ".join(row_parts))
 
 
 def detailed_roi_analysis(df, model_col, market_col, label=""):
@@ -342,7 +325,7 @@ def detailed_roi_analysis(df, model_col, market_col, label=""):
         pnls = []
         for i in range(len(m_edge)):
             if abs(m_edge[i]) >= edge_default:
-                pnls.append(_compute_bet_pnl(m_edge[i], m_market[i], m_y[i], fee_pct=0.02))
+                pnls.append(_compute_bet_pnl(m_edge[i], m_market[i], m_y[i]))
 
         n_bets = len(pnls)
         if n_bets > 0:
@@ -434,7 +417,7 @@ def _write_pnl_csv(df, model_probs, market_probs, edge, y, label):
             continue
         bet_side = "home" if edge[i] > 0 else "away"
         result = int((edge[i] > 0 and y[i] == 1) or (edge[i] < 0 and y[i] == 0))
-        pnl = _compute_bet_pnl(edge[i], market_probs[i], y[i], fee_pct=0.02)
+        pnl = _compute_bet_pnl(edge[i], market_probs[i], y[i])
         cumulative += pnl
         rows.append({
             "game_date": df.iloc[i].get("game_date", ""),

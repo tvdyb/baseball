@@ -567,8 +567,8 @@ def early_vs_late_analysis(wf_df, n_boot=5000):
 
 # ── Market comparison ────────────────────────────────────────────────────────
 
-def _compute_bet_pnl(edge, market_prob, outcome, fee_pct=0.02):
-    """PnL for $100 flat bet with fees."""
+def _compute_bet_pnl(edge, market_prob, outcome, fee_pct=0.0):
+    """PnL for $100 flat bet."""
     if edge > 0:
         cost = market_prob * 100
         fee = cost * fee_pct
@@ -760,7 +760,7 @@ def generate_plots(wf_df, cal_data, ablation_df, market_data, output_dir):
             fig, ax = plt.subplots(figsize=(10, 5))
             ax.plot(bet_dates, cum_pnl, "b-", linewidth=1)
             ax.axhline(y=0, color="black", linewidth=0.5)
-            ax.set_title("Cumulative PnL vs Kalshi (3% edge, 2% fee, $100 flat)")
+            ax.set_title("Cumulative PnL vs Kalshi (3% edge, no fee, $100 flat)")
             ax.set_ylabel("Cumulative PnL ($)")
             ax.set_xlabel("Date")
             fig.tight_layout()
@@ -970,7 +970,7 @@ def generate_markdown_report(wf_df, bootstrap_results, cal_data, cal_data_cal,
                              f"[{b['ci_lo']:+.5f}, {b['ci_hi']:+.5f}] p={b['p_value']:.3f}{sig}\n")
 
         # ROI
-        lines.append("\n### ROI Simulation ($100 flat, 2% fee)\n")
+        lines.append("\n### ROI Simulation ($100 flat, no fee)\n")
         lines.append("| Edge | Bets | PnL | ROI | Win Rate |\n")
         lines.append("|------|------|-----|-----|----------|\n")
         for threshold in [3, 5, 7, 10]:
@@ -1017,7 +1017,7 @@ def generate_markdown_report(wf_df, bootstrap_results, cal_data, cal_data_cal,
     lines.append("\n### What is fragile\n")
     lines.append("- Early-season predictions (first 30 days) have notably higher log loss\n")
     lines.append("- 2025 Kalshi comparison is a single season — need more years of market data\n")
-    lines.append("- ROI depends on edge threshold and fee assumptions\n")
+    lines.append("- ROI depends on edge threshold; fees not included in simulation\n")
 
     lines.append("\n### What to do next\n")
     lines.append("- Collect Kalshi/market data for 2024 to validate market comparison out-of-sample\n")
