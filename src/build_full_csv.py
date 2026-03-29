@@ -87,18 +87,40 @@ def train_ensemble(train_df):
                                evals=[(dtrain, "train"), (dval, "val")],
                                early_stopping_rounds=50, verbose_eval=50)
 
+        # Learn blend weight via OOF predictions (not in-sample) to avoid leakage
         from scipy.optimize import minimize_scalar
-        lr_train_probs = lr.predict_proba(X_lr)[:, 1]
-        dtrain_full = xgb.DMatrix(X_xgb, label=y)
-        xgb_train_probs = xgb_model.predict(dtrain_full)
+        from sklearn.model_selection import KFold
+
+        kf = KFold(n_splits=5, shuffle=False)  # chronological folds
+        lr_oof = np.zeros(len(y))
+        xgb_oof = np.zeros(len(y))
+
+        for fold_train, fold_val in kf.split(X_lr_raw):
+            # LR fold
+            Xf_filled, fm = _smart_fillna(X_lr_raw.iloc[fold_train])
+            Xv_filled, _ = _smart_fillna(X_lr_raw.iloc[fold_val], fm)
+            sc_f = StandardScaler()
+            lr_f = LogisticRegression(C=1.0, max_iter=1000, solver="lbfgs")
+            lr_f.fit(sc_f.fit_transform(Xf_filled), y[fold_train])
+            lr_oof[fold_val] = lr_f.predict_proba(sc_f.transform(Xv_filled))[:, 1]
+
+            # XGB fold
+            Xf_xgb = X_xgb.iloc[fold_train]
+            Xv_xgb = X_xgb.iloc[fold_val]
+            df_fold = xgb.DMatrix(Xf_xgb, label=y[fold_train])
+            dv_fold = xgb.DMatrix(Xv_xgb, label=y[fold_val])
+            xgb_f = xgb.train(params, df_fold, num_boost_round=200,
+                              evals=[(df_fold, "t"), (dv_fold, "v")],
+                              early_stopping_rounds=30, verbose_eval=0)
+            xgb_oof[fold_val] = xgb_f.predict(dv_fold)
 
         def blend_loss(w):
-            blended = np.clip(w * lr_train_probs + (1 - w) * xgb_train_probs, 1e-6, 1 - 1e-6)
+            blended = np.clip(w * lr_oof + (1 - w) * xgb_oof, 1e-6, 1 - 1e-6)
             return log_loss(y, blended)
 
         opt = minimize_scalar(blend_loss, bounds=(0.0, 1.0), method="bounded")
         w_lr = opt.x
-        print(f"  Learned blend: LR={w_lr:.2f}, XGB={1-w_lr:.2f}")
+        print(f"  Learned blend (OOF): LR={w_lr:.2f}, XGB={1-w_lr:.2f}")
 
     return lr, scaler, xgb_model, available, xgb_features, w_lr, train_medians
 
