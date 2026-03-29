@@ -1,5 +1,6 @@
 data/*
 !data/audit/
+!data/picks/
 models/
 notebooks/
 __pycache__/

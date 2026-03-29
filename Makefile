@@ -103,8 +103,17 @@ predict-today:
 predict-today-lr:
 	$(PYTHON) src/predict.py --lr-only
 
+# Generate market-making picks for tomorrow
+picks:
+	$(PYTHON) src/picks.py
+
+# Picks for a specific date
+picks-date:
+	$(PYTHON) src/picks.py --date $(DATE)
+
 .PHONY: all scrape scrape-statcast scrape-games scrape-weather scrape-oaa \
         scrape-sprint-speed scrape-transactions scrape-kalshi projections \
         build-xrv matchup-models matchup-models-pooled \
         features train predict compare ablation \
-        audit audit-quick clean-audit predict-today predict-today-lr
+        audit audit-quick clean-audit predict-today predict-today-lr \
+        picks picks-date
