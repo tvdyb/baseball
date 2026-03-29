@@ -83,7 +83,28 @@ compare:
 ablation:
 	$(PYTHON) src/ablation_matchup.py
 
+# Full model audit (walk-forward, bootstrap, calibration, ablation, market comparison)
+audit:
+	$(PYTHON) src/audit.py
+
+# Audit without the expensive ablation step
+audit-quick:
+	$(PYTHON) src/audit.py --skip-ablation
+
+# Remove audit outputs
+clean-audit:
+	rm -rf data/audit/
+
+# Predict today's games
+predict-today:
+	$(PYTHON) src/predict.py
+
+# Predict today's games (LR-only mode)
+predict-today-lr:
+	$(PYTHON) src/predict.py --lr-only
+
 .PHONY: all scrape scrape-statcast scrape-games scrape-weather scrape-oaa \
         scrape-sprint-speed scrape-transactions scrape-kalshi projections \
         build-xrv matchup-models matchup-models-pooled \
-        features train predict compare ablation
+        features train predict compare ablation \
+        audit audit-quick clean-audit predict-today predict-today-lr

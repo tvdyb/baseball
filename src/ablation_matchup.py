@@ -19,6 +19,10 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import log_loss, roc_auc_score
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from win_model import _smart_fillna
+
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 FEATURES_DIR = DATA_DIR / "features"
 
@@ -125,10 +129,13 @@ def eval_feature_set(df, feature_list, all_years, label, min_train=2):
         if len(train) < 100 or len(test) < 50:
             continue
 
-        X_train = train[available].fillna(0)
-        X_test = test[available].fillna(0)
+        X_train_raw = train[available].copy()
+        X_test_raw = test[available].copy()
         y_train = train["home_win"].values
         y_test = test["home_win"].values
+
+        X_train, train_medians = _smart_fillna(X_train_raw)
+        X_test, _ = _smart_fillna(X_test_raw, train_medians)
 
         scaler = StandardScaler()
         X_tr = scaler.fit_transform(X_train)

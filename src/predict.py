@@ -36,10 +36,10 @@ from feature_engineering import (
     _recent_winpct, DIFF_COLS, OPENING_DAY,
 )
 from win_model import (
-    DIFF_FEATURES, RAW_FEATURES, ALL_FEATURES,
+    ALL_FEATURES, XGB_PARAMS,
     _smart_fillna, add_nonlinear_features,
 )
-from utils import DATA_DIR, XRV_DIR, GAMES_DIR, FEATURES_DIR, MODEL_DIR
+from utils import XRV_DIR, GAMES_DIR, FEATURES_DIR
 
 MLB_API = "https://statsapi.mlb.com/api/v1"
 
@@ -79,11 +79,13 @@ def _prepare_xgb_features(df: pd.DataFrame):
     return X, list(X.columns)
 
 
-def train_ensemble(train_df: pd.DataFrame):
+def train_ensemble(train_df: pd.DataFrame, lr_only: bool = False) -> tuple:
     """Train LR + XGB ensemble, matching win_model.py pipeline exactly.
 
     LR: linear features → _smart_fillna → StandardScaler
     XGB: nonlinear features → DMatrix (NaN handled natively) → early stopping with val split
+
+    If lr_only=True, skip XGB training and set w_lr=1.0.
     """
     y = train_df["home_win"].values
 
@@ -95,50 +97,59 @@ def train_ensemble(train_df: pd.DataFrame):
     lr = LogisticRegression(C=1.0, max_iter=1000, solver="lbfgs")
     lr.fit(X_lr_scaled, y)
 
+    if lr_only:
+        print("  LR-only mode: skipping XGB training")
+        return lr, scaler, None, lr_features, [], 1.0, train_medians
+
     # XGB path: nonlinear features
     X_xgb, xgb_features = _prepare_xgb_features(train_df)
 
     xgb_model = None
     w_lr = 0.5
     if HAS_XGB:
-        params = {
-            "objective": "binary:logistic",
-            "eval_metric": "logloss",
-            "max_depth": 4,
-            "learning_rate": 0.05,
-            "subsample": 0.8,
-            "colsample_bytree": 0.8,
-            "min_child_weight": 50,
-            "reg_alpha": 0.1,
-            "reg_lambda": 1.0,
-            "verbosity": 0,
-        }
-
         # Chronological validation split for early stopping (never use test data)
         n = len(X_xgb)
         val_size = int(n * 0.2)
         dtrain = xgb.DMatrix(X_xgb.iloc[:n - val_size], label=y[:n - val_size])
         dval = xgb.DMatrix(X_xgb.iloc[n - val_size:], label=y[n - val_size:])
         xgb_model = xgb.train(
-            params, dtrain, num_boost_round=500,
+            XGB_PARAMS, dtrain, num_boost_round=500,
             evals=[(dtrain, "train"), (dval, "val")],
             early_stopping_rounds=50, verbose_eval=50,
         )
 
-        # Learn blend weight on in-sample predictions
-        # (for live mode; walk-forward uses OOF — see win_model.py)
+        # Learn blend weight via OOF predictions (not in-sample)
         from scipy.optimize import minimize_scalar
-        lr_probs = lr.predict_proba(X_lr_scaled)[:, 1]
-        dtrain_full = xgb.DMatrix(X_xgb, label=y)
-        xgb_probs = xgb_model.predict(dtrain_full)
+        from sklearn.model_selection import KFold
+
+        kf = KFold(n_splits=5, shuffle=False)
+        lr_oof = np.zeros(len(y))
+        xgb_oof = np.zeros(len(y))
+
+        for fold_train, fold_val in kf.split(X_lr_raw):
+            Xf_filled, fm = _smart_fillna(X_lr_raw.iloc[fold_train])
+            Xv_filled, _ = _smart_fillna(X_lr_raw.iloc[fold_val], fm)
+            sc_f = StandardScaler()
+            lr_f = LogisticRegression(C=1.0, max_iter=1000, solver="lbfgs")
+            lr_f.fit(sc_f.fit_transform(Xf_filled), y[fold_train])
+            lr_oof[fold_val] = lr_f.predict_proba(sc_f.transform(Xv_filled))[:, 1]
+
+            df_fold = xgb.DMatrix(X_xgb.iloc[fold_train], label=y[fold_train])
+            dv_fold = xgb.DMatrix(X_xgb.iloc[fold_val], label=y[fold_val])
+            xgb_f = xgb.train(
+                XGB_PARAMS, df_fold, num_boost_round=200,
+                evals=[(df_fold, "t"), (dv_fold, "v")],
+                early_stopping_rounds=30, verbose_eval=0,
+            )
+            xgb_oof[fold_val] = xgb_f.predict(dv_fold)
 
         def blend_loss(w):
-            blended = np.clip(w * lr_probs + (1 - w) * xgb_probs, 1e-6, 1 - 1e-6)
+            blended = np.clip(w * lr_oof + (1 - w) * xgb_oof, 1e-6, 1 - 1e-6)
             return log_loss(y, blended)
 
         opt = minimize_scalar(blend_loss, bounds=(0.1, 0.9), method="bounded")
         w_lr = opt.x
-        print(f"  Learned ensemble weight: LR={w_lr:.2f}, XGB={1-w_lr:.2f}")
+        print(f"  Learned ensemble weight (OOF): LR={w_lr:.2f}, XGB={1-w_lr:.2f}")
 
     return lr, scaler, xgb_model, lr_features, xgb_features, w_lr, train_medians
 
@@ -415,7 +426,7 @@ def build_live_features(
     return features_df
 
 
-def predict_date(target_date: str):
+def predict_date(target_date: str, lr_only: bool = False):
     """Predict games for a specific date."""
     print(f"\n{'='*60}")
     print(f"MLB Predictions for {target_date}")
@@ -424,7 +435,7 @@ def predict_date(target_date: str):
     print("\nTraining model on historical data...")
     train_df = load_training_data()
     print(f"  {len(train_df):,} training games")
-    lr, scaler, xgb_model, lr_features, xgb_features, w_lr, train_medians = train_ensemble(train_df)
+    lr, scaler, xgb_model, lr_features, xgb_features, w_lr, train_medians = train_ensemble(train_df, lr_only=lr_only)
 
     print(f"\nFetching games for {target_date}...")
     with httpx.Client(timeout=15.0) as client:
@@ -445,10 +456,24 @@ def predict_date(target_date: str):
         if col in features_df.columns:
             results[col] = features_df[col].values
 
+    # Add confidence from SP info
+    if "home_sp_info_confidence" in features_df.columns:
+        results["sp_confidence"] = (
+            features_df["home_sp_info_confidence"].fillna(0)
+            + features_df["away_sp_info_confidence"].fillna(0)
+        ) / 2
+
+    # Early-season warning
+    if "days_into_season" in features_df.columns:
+        days = features_df["days_into_season"].iloc[0] if len(features_df) > 0 else 999
+        if days < 21:
+            print("\n  \u26a0 EARLY SEASON: Model has limited current-season data."
+                  " Consider reduced position sizing.")
+
     # Display
     print(f"\n{'='*60}")
-    print(f"  {'Matchup':<35s} {'Home%':>6s} {'Away%':>6s} {'Pick':>6s}")
-    print(f"  {'-'*55}")
+    print(f"  {'Matchup':<35s} {'Home%':>6s} {'Away%':>6s} {'Pick':>6s} {'Conf':>5s}")
+    print(f"  {'-'*60}")
 
     for _, r in results.iterrows():
         away_sp = r.get("away_sp_name", "TBD")
@@ -457,7 +482,10 @@ def predict_date(target_date: str):
         pitchers = f"  {away_sp} vs {home_sp}"
 
         pick_team = r["home_team"] if r["home_win_prob"] >= 0.5 else r["away_team"]
-        pick_prob = max(r["home_win_prob"], r["away_win_prob"])
+
+        conf_val = r.get("sp_confidence", 1.0)
+        conf_str = f"{conf_val:.2f}" if pd.notna(conf_val) else "N/A"
+        low_conf = " \u26a0" if pd.notna(conf_val) and conf_val < 0.3 else ""
 
         result_str = ""
         if "home_win" in r and pd.notna(r.get("home_win")):
@@ -465,7 +493,8 @@ def predict_date(target_date: str):
             correct = pick_team == actual
             result_str = f"  {'W' if correct else 'L'} ({actual} won)"
 
-        print(f"  {matchup:<35s} {r['home_win_prob']:>5.1%} {r['away_win_prob']:>5.1%} {pick_team:>5s}{result_str}")
+        print(f"  {matchup:<35s} {r['home_win_prob']:>5.1%} {r['away_win_prob']:>5.1%}"
+              f" {pick_team:>5s} {conf_str:>5s}{low_conf}{result_str}")
         print(f"  {pitchers}")
         print()
 
@@ -478,7 +507,7 @@ def predict_date(target_date: str):
     return results
 
 
-def backtest_season(year: int):
+def backtest_season(year: int, lr_only: bool = False):
     """Full season backtest with predictions for every game."""
     print(f"\n{'='*60}")
     print(f"Backtesting {year}")
@@ -487,7 +516,7 @@ def backtest_season(year: int):
     train_df = load_training_data(exclude_year=year)
     print(f"  Training on {len(train_df):,} games from prior seasons")
 
-    lr, scaler, xgb_model, lr_features, xgb_features, w_lr, train_medians = train_ensemble(train_df)
+    lr, scaler, xgb_model, lr_features, xgb_features, w_lr, train_medians = train_ensemble(train_df, lr_only=lr_only)
 
     test_path = FEATURES_DIR / f"game_features_{year}.parquet"
     if not test_path.exists():
@@ -542,12 +571,14 @@ def main():
                         help="Predict games on this date (YYYY-MM-DD). Default: today")
     parser.add_argument("--backtest", type=int, nargs="+",
                         help="Backtest season(s)")
+    parser.add_argument("--lr-only", action="store_true",
+                        help="Use logistic regression only (skip XGBoost)")
     args = parser.parse_args()
 
     if args.backtest:
         all_results = []
         for year in args.backtest:
-            r = backtest_season(year)
+            r = backtest_season(year, lr_only=args.lr_only)
             if r is not None:
                 all_results.append(r)
 
@@ -565,7 +596,7 @@ def main():
                 print(f"  {name}: log_loss={ll:.4f}, AUC={auc:.4f}, brier={bs:.4f}")
     else:
         target_date = args.date or date.today().strftime("%Y-%m-%d")
-        predict_date(target_date)
+        predict_date(target_date, lr_only=args.lr_only)
 
 
 if __name__ == "__main__":

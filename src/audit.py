@@ -44,7 +44,7 @@ except ImportError:
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from utils import DATA_DIR, FEATURES_DIR
 from win_model import (
-    ALL_FEATURES, DIFF_FEATURES, RAW_FEATURES,
+    ALL_FEATURES, XGB_PARAMS, FEATURE_GROUPS, EDGE_THRESHOLDS,
     _smart_fillna, add_nonlinear_features,
 )
 
@@ -53,77 +53,6 @@ warnings.filterwarnings("ignore", category=UserWarning)
 AUDIT_DIR = DATA_DIR / "audit"
 ALL_YEARS = list(range(2018, 2026))
 MIN_TRAIN_YEARS = 2  # first testable year = 2020
-
-XGB_PARAMS = {
-    "objective": "binary:logistic",
-    "eval_metric": "logloss",
-    "max_depth": 4,
-    "learning_rate": 0.05,
-    "subsample": 0.8,
-    "colsample_bytree": 0.8,
-    "min_child_weight": 50,
-    "reg_alpha": 0.1,
-    "reg_lambda": 1.0,
-    "verbosity": 0,
-}
-
-# ── Feature groups for ablation ──────────────────────────────────────────────
-
-FEATURE_GROUPS = {
-    "base_hitting": [
-        "diff_hit_xrv_mean", "diff_hit_xrv_contact", "diff_hit_k_rate",
-    ],
-    "sp_quality": [
-        "diff_sp_xrv_mean", "diff_sp_k_rate", "diff_sp_bb_rate",
-        "diff_sp_avg_velo", "diff_sp_rest_days",
-        "diff_sp_overperf", "diff_sp_overperf_recent",
-        "diff_sp_context_xrv",
-        "home_sp_pitch_mix_entropy", "away_sp_pitch_mix_entropy",
-        "home_sp_n_pitches", "away_sp_n_pitches",
-        "home_sp_info_confidence", "away_sp_info_confidence",
-    ],
-    "bullpen": [
-        "diff_bp_xrv_mean", "diff_bp_fatigue_score",
-        "diff_bp_matchup_xrv_mean", "diff_bp_arsenal_matchup_xrv_mean",
-    ],
-    "matchup_sparse": [
-        "diff_matchup_xrv_mean", "diff_matchup_xrv_sum",
-        "home_matchup_n_known", "away_matchup_n_known",
-    ],
-    "matchup_arsenal": [
-        "diff_arsenal_matchup_xrv_mean", "diff_arsenal_matchup_xrv_sum",
-        "home_arsenal_matchup_n_known", "away_arsenal_matchup_n_known",
-    ],
-    "weather": [
-        "temperature", "wind_speed", "is_dome", "wind_out", "wind_in",
-    ],
-    "defense": [
-        "diff_oaa_rate", "diff_def_xrv_delta",
-    ],
-    "team_prior": [
-        "diff_team_prior", "diff_adjusted_team_prior",
-    ],
-    "projections": [
-        "diff_projected_wpct", "diff_sp_projected_era", "diff_sp_projected_war",
-    ],
-    "sp_trends": [
-        "diff_sp_velo_trend", "diff_sp_spin_trend",
-        "diff_sp_xrv_trend", "diff_sp_transition_entropy",
-    ],
-    "trades": [
-        "diff_trade_net", "diff_trade_pitcher_xrv",
-    ],
-    "context": [
-        "days_into_season", "park_factor",
-        "home_team_games_played", "away_team_games_played",
-    ],
-    "form": [
-        "diff_recent_form",
-    ],
-    "platoon": [
-        "diff_platoon_pct", "diff_sp_xrv_vs_lineup",
-    ],
-}
 
 
 # ── Data loading ─────────────────────────────────────────────────────────────
@@ -261,7 +190,7 @@ def predict_ensemble(bundle, test_df):
 
 def walk_forward(df, test_years=None, features_override=None,
                  fit_isotonic=False, verbose=True):
-    """Walk-forward evaluation. Returns per-game DataFrame."""
+    """Walk-forward evaluation. Returns (per-game DataFrame, yearly_info list)."""
     if test_years is None:
         test_years = [y for y in ALL_YEARS[MIN_TRAIN_YEARS:]]
 
@@ -345,7 +274,7 @@ def walk_forward(df, test_years=None, features_override=None,
                 "away_team_games_played": row.get("away_team_games_played", np.nan),
             })
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows), yearly_info
 
 
 # ── Baselines ────────────────────────────────────────────────────────────────
@@ -489,7 +418,7 @@ def calibration_analysis(y, probs, n_bins=10, label=""):
 def run_ablation(df, feature_groups, n_boot=5000):
     """Leave-one-group-out ablation with bootstrap CIs."""
     print("\n  Running full model walk-forward for ablation baseline...")
-    full_wf = walk_forward(df, verbose=False)
+    full_wf, _ = walk_forward(df, verbose=False)
     y_full = full_wf["home_win"].values
     ens_full = np.clip(full_wf["ens_prob"].values, 0.01, 0.99)
     full_ll = log_loss(y_full, ens_full)
@@ -506,7 +435,7 @@ def run_ablation(df, feature_groups, n_boot=5000):
 
         print(f"    {group_name}: removing {len(ALL_FEATURES) - len(remaining)} features...", end="")
         t0 = time.time()
-        ablated_wf = walk_forward(df, features_override=remaining, verbose=False)
+        ablated_wf, _ = walk_forward(df, features_override=remaining, verbose=False)
         dt = time.time() - t0
 
         y_abl = ablated_wf["home_win"].values
@@ -691,7 +620,7 @@ def market_comparison(wf_df, n_boot=10000):
 
             # ROI simulation
             edge = m - k
-            for threshold in [0.03, 0.05, 0.07, 0.10]:
+            for threshold in EDGE_THRESHOLDS:
                 pnls = []
                 for i in range(len(edge)):
                     if abs(edge[i]) >= threshold:
@@ -720,6 +649,21 @@ def market_comparison(wf_df, n_boot=10000):
                     "ci_hi": np.percentile(roi_boots, 97.5),
                     "p_value_positive": np.mean(np.array(roi_boots) <= 0),
                 }
+
+            # C1: Home vs away edge decomposition
+            home_bets = [i for i in range(len(edge)) if edge[i] >= 0.03]
+            away_bets = [i for i in range(len(edge)) if edge[i] <= -0.03]
+            side_analysis = {}
+            for side, idxs in [("home", home_bets), ("away", away_bets)]:
+                if len(idxs) > 0:
+                    side_pnls = [_compute_bet_pnl(edge[i], k[i], y[i]) for i in idxs]
+                    side_analysis[side] = {
+                        "n_bets": len(idxs),
+                        "pnl": sum(side_pnls),
+                        "roi": sum(side_pnls) / (len(idxs) * 100),
+                        "win_rate": sum(1 for p in side_pnls if p > 0) / len(idxs),
+                    }
+            kalshi_results["side_analysis"] = side_analysis
 
             # Per-game CSV
             merged["kalshi_prob"] = k
@@ -871,7 +815,7 @@ def generate_plots(wf_df, cal_data, ablation_df, market_data, output_dir):
 
 def generate_markdown_report(wf_df, bootstrap_results, cal_data, cal_data_cal,
                              ablation_df, market_data, conf_df, monthly_df,
-                             early_late, output_dir):
+                             early_late, output_dir, yearly_info=None):
     """Write AUDIT_REPORT.md."""
     lines = []
     lines.append("# MLB Win Probability Model — Audit Report\n")
@@ -926,6 +870,17 @@ def generate_markdown_report(wf_df, bootstrap_results, cal_data, cal_data_cal,
                  f"{brier_score_loss(y_all, xgb_all):.4f} | {roc_auc_score(y_all, xgb_all):.4f} |\n")
     lines.append(f"| Ensemble | {log_loss(y_all, p_all):.4f} | "
                  f"{brier_score_loss(y_all, p_all):.4f} | {roc_auc_score(y_all, p_all):.4f} |\n")
+
+    # Blend weight stability
+    if yearly_info:
+        lines.append("\n### Blend Weight Stability\n")
+        lines.append("| Year | w_lr |\n")
+        lines.append("|------|------|\n")
+        for yi in yearly_info:
+            lines.append(f"| {yi['season']} | {yi['w_lr']:.2f} |\n")
+        w_lrs = [yi["w_lr"] for yi in yearly_info]
+        lines.append(f"\nMean={np.mean(w_lrs):.2f}, Std={np.std(w_lrs):.2f}, "
+                     f"Range=[{min(w_lrs):.2f}, {max(w_lrs):.2f}]\n")
 
     # 3. Bootstrap significance
     lines.append("\n## 3. Statistical Significance\n")
@@ -1030,6 +985,17 @@ def generate_markdown_report(wf_df, bootstrap_results, cal_data, cal_data_cal,
             lines.append(f"\n3% edge ROI bootstrap: [{b['ci_lo']:+.1%}, {b['ci_hi']:+.1%}], "
                          f"p(ROI>0)={1-b['p_value_positive']:.3f}\n")
 
+        # Side analysis (home vs away edge)
+        if "side_analysis" in mk:
+            lines.append("\n### Edge by Side (3% threshold)\n")
+            lines.append("| Side | Bets | PnL | ROI | Win Rate |\n")
+            lines.append("|------|------|-----|-----|----------|\n")
+            for side in ["home", "away"]:
+                if side in mk["side_analysis"]:
+                    s = mk["side_analysis"][side]
+                    lines.append(f"| {side} | {s['n_bets']} | ${s['pnl']:+,.0f} | "
+                                 f"{s['roi']:+.1%} | {s['win_rate']:.1%} |\n")
+
         lines.append("\n![Cumulative PnL](cumulative_pnl_2025.png)\n")
 
     # 9. Conclusions
@@ -1085,9 +1051,17 @@ def main():
 
     # 2. Walk-forward with isotonic calibration
     print("\nWalk-forward evaluation (2020-2025)...")
-    wf_df = walk_forward(df, fit_isotonic=True)
+    wf_df, yearly_info = walk_forward(df, fit_isotonic=True)
     wf_df.to_csv(AUDIT_DIR / "walk_forward_predictions.csv", index=False)
     print(f"  Saved {len(wf_df)} predictions")
+
+    # C2: Blend weight stability across years
+    if yearly_info:
+        w_lrs = [yi["w_lr"] for yi in yearly_info]
+        print(f"\n  Blend weight stability: mean={np.mean(w_lrs):.2f}, "
+              f"std={np.std(w_lrs):.2f}, range=[{min(w_lrs):.2f}, {max(w_lrs):.2f}]")
+        for yi in yearly_info:
+            print(f"    {yi['season']}: w_lr={yi['w_lr']:.2f}")
 
     # 3. Baselines
     print("\nComputing baselines...")
@@ -1188,7 +1162,7 @@ def main():
     generate_markdown_report(
         wf_df, boot_results, cal_data, cal_data_cal,
         ablation_df, market_data, conf_df, month_df, early_late,
-        AUDIT_DIR,
+        AUDIT_DIR, yearly_info=yearly_info,
     )
 
     elapsed = time.time() - t_start

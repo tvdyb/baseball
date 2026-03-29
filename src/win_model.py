@@ -18,14 +18,13 @@ Evaluation:
 """
 
 import argparse
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import log_loss, brier_score_loss, roc_auc_score
-from sklearn.model_selection import cross_val_predict, KFold
+from sklearn.model_selection import KFold
 
 try:
     import xgboost as xgb
@@ -33,8 +32,21 @@ try:
 except ImportError:
     HAS_XGB = False
 
-from utils import DATA_DIR, FEATURES_DIR, MODEL_DIR
+from utils import FEATURES_DIR
 
+# XGBoost hyperparameters (single source of truth — imported by predict.py, audit.py)
+XGB_PARAMS = {
+    "objective": "binary:logistic",
+    "eval_metric": "logloss",
+    "max_depth": 4,
+    "learning_rate": 0.05,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "min_child_weight": 50,
+    "reg_alpha": 0.1,
+    "reg_lambda": 1.0,
+    "verbosity": 0,
+}
 
 # Features to use (differentials are cleaner for the model)
 DIFF_FEATURES = [
@@ -83,7 +95,6 @@ DIFF_FEATURES = [
 ]
 
 RAW_FEATURES = [
-    "park_factor",
     "home_sp_pitch_mix_entropy",
     "away_sp_pitch_mix_entropy",
     "home_sp_n_pitches",
@@ -98,22 +109,78 @@ RAW_FEATURES = [
     "is_dome",
     "wind_out",
     "wind_in",
-    # Season context (Step 4)
-    "days_into_season",
+    # SP confidence
     "home_sp_info_confidence",
     "away_sp_info_confidence",
-    "home_team_games_played",
-    "away_team_games_played",
 ]
 
 ALL_FEATURES = DIFF_FEATURES + RAW_FEATURES
+
+# Edge thresholds for ROI simulation (single source of truth)
+EDGE_THRESHOLDS = [0.03, 0.05, 0.07, 0.10]
+
+# Feature groups for ablation (single source of truth — imported by audit.py)
+FEATURE_GROUPS = {
+    "base_hitting": [
+        "diff_hit_xrv_mean", "diff_hit_xrv_contact", "diff_hit_k_rate",
+    ],
+    "sp_quality": [
+        "diff_sp_xrv_mean", "diff_sp_k_rate", "diff_sp_bb_rate",
+        "diff_sp_avg_velo", "diff_sp_rest_days",
+        "diff_sp_overperf", "diff_sp_overperf_recent",
+        "diff_sp_context_xrv",
+        "home_sp_pitch_mix_entropy", "away_sp_pitch_mix_entropy",
+        "home_sp_n_pitches", "away_sp_n_pitches",
+        "home_sp_info_confidence", "away_sp_info_confidence",
+    ],
+    "bullpen": [
+        "diff_bp_xrv_mean", "diff_bp_fatigue_score",
+        "diff_bp_matchup_xrv_mean", "diff_bp_arsenal_matchup_xrv_mean",
+    ],
+    "matchup_sparse": [
+        "diff_matchup_xrv_mean", "diff_matchup_xrv_sum",
+        "home_matchup_n_known", "away_matchup_n_known",
+    ],
+    "matchup_arsenal": [
+        "diff_arsenal_matchup_xrv_mean", "diff_arsenal_matchup_xrv_sum",
+        "home_arsenal_matchup_n_known", "away_arsenal_matchup_n_known",
+    ],
+    "weather": [
+        "temperature", "wind_speed", "is_dome", "wind_out", "wind_in",
+    ],
+    "defense": [
+        "diff_oaa_rate", "diff_def_xrv_delta",
+    ],
+    "team_prior": [
+        "diff_team_prior", "diff_adjusted_team_prior",
+    ],
+    "projections": [
+        "diff_projected_wpct", "diff_sp_projected_era", "diff_sp_projected_war",
+    ],
+    "sp_trends": [
+        "diff_sp_velo_trend", "diff_sp_spin_trend",
+        "diff_sp_xrv_trend", "diff_sp_transition_entropy",
+    ],
+    "trades": [
+        "diff_trade_net", "diff_trade_pitcher_xrv",
+    ],
+    "context": [
+        "days_into_season", "park_factor",
+        "home_team_games_played", "away_team_games_played",
+    ],
+    "form": [
+        "diff_recent_form",
+    ],
+    "platoon": [
+        "diff_platoon_pct", "diff_sp_xrv_vs_lineup",
+    ],
+}
 
 # Count-like columns that should be filled with median (not 0) for LR
 _COUNT_FEATURES = {
     "home_sp_n_pitches", "away_sp_n_pitches",
     "home_matchup_n_known", "away_matchup_n_known",
     "home_arsenal_matchup_n_known", "away_arsenal_matchup_n_known",
-    "home_team_games_played", "away_team_games_played",
 }
 
 
@@ -329,18 +396,6 @@ def train_xgboost(X_train, y_train, X_test=None, y_test=None):
         print("  XGBoost not available, skipping")
         return None, None, None
 
-    params = {
-        "objective": "binary:logistic",
-        "eval_metric": "logloss",
-        "max_depth": 4,
-        "learning_rate": 0.05,
-        "subsample": 0.8,
-        "colsample_bytree": 0.8,
-        "min_child_weight": 50,
-        "reg_alpha": 0.1,
-        "reg_lambda": 1.0,
-    }
-
     # Split training: last 20% as validation for early stopping (chronological)
     n = len(X_train)
     val_size = int(n * 0.2)
@@ -354,7 +409,7 @@ def train_xgboost(X_train, y_train, X_test=None, y_test=None):
     evals = [(dtrain, "train"), (dval, "val")]
 
     model = xgb.train(
-        params, dtrain,
+        XGB_PARAMS, dtrain,
         num_boost_round=500,
         evals=evals,
         early_stopping_rounds=50,
@@ -450,18 +505,6 @@ def walk_forward_evaluation(all_years: list[int], min_train_years: int = 2):
             lr_oof = np.zeros(len(y_train))
             xgb_oof = np.zeros(len(y_train))
 
-            params = {
-                "objective": "binary:logistic",
-                "eval_metric": "logloss",
-                "max_depth": 4,
-                "learning_rate": 0.05,
-                "subsample": 0.8,
-                "colsample_bytree": 0.8,
-                "min_child_weight": 50,
-                "reg_alpha": 0.1,
-                "reg_lambda": 1.0,
-            }
-
             for fold_train, fold_val in kf.split(X_train_lr):
                 # LR fold
                 X_ft_filled, fm = _smart_fillna(X_train_lr.iloc[fold_train])
@@ -476,7 +519,7 @@ def walk_forward_evaluation(all_years: list[int], min_train_years: int = 2):
                 X_fv_xgb = X_train_xgb.iloc[fold_val]
                 dt_fold = xgb.DMatrix(X_ft_xgb, label=y_train[fold_train])
                 dv_fold = xgb.DMatrix(X_fv_xgb, label=y_train[fold_val])
-                xgb_fold = xgb.train(params, dt_fold, num_boost_round=200,
+                xgb_fold = xgb.train(XGB_PARAMS, dt_fold, num_boost_round=200,
                                       evals=[(dt_fold, "t"), (dv_fold, "v")],
                                       early_stopping_rounds=30, verbose_eval=0)
                 xgb_oof[fold_val] = xgb_fold.predict(dv_fold)

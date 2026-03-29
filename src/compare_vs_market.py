@@ -25,7 +25,7 @@ except ImportError:
     HAS_XGB = False
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from win_model import DIFF_FEATURES, RAW_FEATURES, ALL_FEATURES, add_nonlinear_features, _smart_fillna
+from win_model import ALL_FEATURES, XGB_PARAMS, EDGE_THRESHOLDS, add_nonlinear_features, _smart_fillna
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 FEATURES_DIR = DATA_DIR / "features"
@@ -33,7 +33,6 @@ ANALYSIS_DIR = DATA_DIR / "analysis"
 
 MONTH_NAMES = {3: "Mar", 4: "Apr", 5: "May", 6: "Jun", 7: "Jul",
                8: "Aug", 9: "Sep", 10: "Oct"}
-EDGE_THRESHOLDS = [0.03, 0.05, 0.07, 0.10]
 
 
 def load_features(years):
@@ -78,18 +77,12 @@ def train_ensemble(train_df):
     xgb_model = None
     w_lr = 0.5
     if HAS_XGB:
-        params = {
-            "objective": "binary:logistic", "eval_metric": "logloss",
-            "max_depth": 4, "learning_rate": 0.05, "subsample": 0.8,
-            "colsample_bytree": 0.8, "min_child_weight": 50,
-            "reg_alpha": 0.1, "reg_lambda": 1.0, "verbosity": 0,
-        }
         # Chronological val split for early stopping
         n = len(X_xgb)
         val_size = int(n * 0.2)
         dtrain = xgb.DMatrix(X_xgb.iloc[:n - val_size], label=y[:n - val_size])
         dval = xgb.DMatrix(X_xgb.iloc[n - val_size:], label=y[n - val_size:])
-        xgb_model = xgb.train(params, dtrain, num_boost_round=500,
+        xgb_model = xgb.train(XGB_PARAMS, dtrain, num_boost_round=500,
                                evals=[(dtrain, "train"), (dval, "val")],
                                early_stopping_rounds=50, verbose_eval=50)
 
@@ -115,7 +108,7 @@ def train_ensemble(train_df):
             Xv_xgb = X_xgb.iloc[fold_val]
             df_fold = xgb.DMatrix(Xf_xgb, label=y[fold_train])
             dv_fold = xgb.DMatrix(Xv_xgb, label=y[fold_val])
-            xgb_f = xgb.train(params, df_fold, num_boost_round=200,
+            xgb_f = xgb.train(XGB_PARAMS, df_fold, num_boost_round=200,
                               evals=[(df_fold, "t"), (dv_fold, "v")],
                               early_stopping_rounds=30, verbose_eval=0)
             xgb_oof[fold_val] = xgb_f.predict(dv_fold)
