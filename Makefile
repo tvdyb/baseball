@@ -111,9 +111,21 @@ picks:
 picks-date:
 	$(PYTHON) src/picks.py --date $(DATE)
 
+# Polymarket market-making bot (dry run)
+poly-dry:
+	$(PYTHON) src/polymarket_bot.py --date $(DATE) --dry-run --bankroll $(BANKROLL)
+
+# Polymarket market-making bot (live)
+poly-live:
+	$(PYTHON) src/polymarket_bot.py --date $(DATE) --bankroll $(BANKROLL)
+
+# Polymarket sizing table only (no trading)
+poly-sizing:
+	$(PYTHON) src/polymarket_bot.py --date $(DATE) --bankroll $(BANKROLL) --sizing-only
+
 .PHONY: all scrape scrape-statcast scrape-games scrape-weather scrape-oaa \
         scrape-sprint-speed scrape-transactions scrape-kalshi projections \
         build-xrv matchup-models matchup-models-pooled \
         features train predict compare ablation \
         audit audit-quick clean-audit predict-today predict-today-lr \
-        picks picks-date
+        picks picks-date poly-dry poly-live poly-sizing
