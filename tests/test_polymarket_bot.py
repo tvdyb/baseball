@@ -110,7 +110,10 @@ class TestQuoteComputation:
         quotes = bot.compute_quotes(game_state)
         assert quotes is not None
         bid_price, bid_size, ask_price, ask_size = quotes
-        assert bid_price < game_state.model_fair < ask_price
+        # Quotes are centered around blended fair = w*model + (1-w)*market
+        w = bot.config.model_weight
+        blended = w * game_state.model_fair + (1 - w) * game_state.poly_home_mid
+        assert bid_price < blended < ask_price
         assert bid_size > 0
         assert ask_size > 0
 

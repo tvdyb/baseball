@@ -245,6 +245,7 @@ class BotConfig:
     max_games: int = 15
     debug_discovery: bool = False
     max_loss: float = 500.0  # kill switch: halt all trading if total P&L < -max_loss
+    model_weight: float = 0.40  # blend weight: fair = w*model + (1-w)*market
 
 
 # ── Polymarket Market Discovery ────────────────────────────────────────────────
@@ -1083,17 +1084,22 @@ class MLBMarketMaker:
                 gs.poly_bid_depth = book.get("bid_depth", 0)
                 gs.poly_ask_depth = book.get("ask_depth", 0)
 
-                # Compute edge and sizing using mid price
+                # Compute blended fair value and edge
+                # Historical calibration shows model is overconfident at large edges.
+                # Blending with market: fair = w*model + (1-w)*market shrinks edges
+                # to match realized win rates (w=0.4 optimal from 2025 data).
                 if gs.poly_home_mid:
-                    gs.edge = gs.model_fair - gs.poly_home_mid
-                    gs.half_kelly, gs.side = compute_half_kelly(gs.model_fair, gs.poly_home_mid)
+                    w = self.config.model_weight
+                    blended_fair = w * gs.model_fair + (1 - w) * gs.poly_home_mid
+                    gs.edge = blended_fair - gs.poly_home_mid  # = w * (model - market)
+                    gs.half_kelly, gs.side = compute_half_kelly(blended_fair, gs.poly_home_mid)
 
                     abs_edge = abs(gs.edge)
-                    if abs_edge >= 0.07:
+                    if abs_edge >= 0.07 * w:
                         gs.conviction = "strong"
-                    elif abs_edge >= 0.04:
+                    elif abs_edge >= 0.04 * w:
                         gs.conviction = "lean"
-                    elif abs_edge >= 0.02:
+                    elif abs_edge >= 0.02 * w:
                         gs.conviction = "watch"
                     else:
                         gs.conviction = "skip"
@@ -1194,8 +1200,9 @@ class MLBMarketMaker:
         if position_notional < 1.0:
             return None
 
-        # Compute fair-value-centered quotes
-        fair = gs.model_fair
+        # Compute fair-value-centered quotes using blended fair value
+        w = self.config.model_weight
+        fair = w * gs.model_fair + (1 - w) * gs.poly_home_mid
         hs = gs.half_spread
 
         bid_price = round_to_tick(fair - hs)
@@ -1622,7 +1629,7 @@ class MLBMarketMaker:
               f"Cycle #{self._cycle_count} — {now_et.strftime('%I:%M:%S%p')} ET — "
               f"{'DRY RUN' if self.config.dry_run else 'LIVE'}")
         print(f"  Bankroll: ${self.config.bankroll:,.0f} | Min edge: {self.config.min_edge:.0%} | "
-              f"Poll: {self.config.poll_interval_s:.0f}s")
+              f"Model wt: {self.config.model_weight:.0%} | Poll: {self.config.poll_interval_s:.0f}s")
         print(f"{'='*125}")
 
         print(f"\n  {'Game':<14s} {'Time':>9s} {'Model':>6s} {'Poly':>6s} {'Sprd':>5s} {'Edge':>6s} "
@@ -1854,7 +1861,7 @@ class MLBMarketMaker:
 
 # ── One-shot: Fetch Poly prices and recompute sizing ───────────────────────────
 
-def print_sizing_table(target_date: str, bankroll: float = 5000.0):
+def print_sizing_table(target_date: str, bankroll: float = 5000.0, model_weight: float = 0.40):
     """Fetch Polymarket prices and print half-Kelly sizing table (no trading)."""
     # Load picks
     picks_path = PICKS_DIR / f"picks_{target_date}.json"
@@ -1893,6 +1900,7 @@ def print_sizing_table(target_date: str, bankroll: float = 5000.0):
                 rows.append({
                     "game": f"{at}@{ht}",
                     "model": fair,
+                    "blended": None,
                     "poly_mid": None,
                     "edge": None,
                     "side": "",
@@ -1938,6 +1946,7 @@ def print_sizing_table(target_date: str, bankroll: float = 5000.0):
                 rows.append({
                     "game": f"{at}@{ht}",
                     "model": fair,
+                    "blended": None,
                     "poly_mid": None,
                     "edge": None,
                     "side": "",
@@ -1949,13 +1958,15 @@ def print_sizing_table(target_date: str, bankroll: float = 5000.0):
                 time.sleep(0.15)
                 continue
 
-            edge = fair - mid
-            hk, side = compute_half_kelly(fair, mid)
+            blended = model_weight * fair + (1 - model_weight) * mid
+            edge = blended - mid  # = model_weight * (fair - mid)
+            hk, side = compute_half_kelly(blended, mid)
             size_usd = min(bankroll * hk, bankroll * MAX_POSITION_PER_GAME)
 
             rows.append({
                 "game": f"{at}@{ht}",
                 "model": fair,
+                "blended": blended,
                 "poly_mid": mid,
                 "poly_bid": book.get("best_bid"),
                 "poly_ask": book.get("best_ask"),
@@ -1976,13 +1987,14 @@ def print_sizing_table(target_date: str, bankroll: float = 5000.0):
 
     # Print table
     print(f"{'='*130}")
-    print(f"  POLYMARKET HALF-KELLY SIZING — {target_date} — Bankroll: ${bankroll:,.0f}")
+    print(f"  POLYMARKET HALF-KELLY SIZING — {target_date} — Bankroll: ${bankroll:,.0f} — "
+          f"Model weight: {model_weight:.0%}")
     print(f"{'='*130}")
 
-    print(f"\n  {'ET Time':>9s} {'Game':<14s} {'Model':>6s} {'Poly':>6s} {'Bid':>5s} {'Ask':>5s} "
+    print(f"\n  {'ET Time':>9s} {'Game':<14s} {'Model':>6s} {'Blend':>6s} {'Poly':>6s} {'Bid':>5s} {'Ask':>5s} "
           f"{'Sprd':>5s} {'Edge':>6s} {'Side':>6s} {'½Kelly':>7s} "
           f"{'$Size':>7s} {'$BidDp':>7s} {'$AskDp':>7s}")
-    print(f"  {'-'*125}")
+    print(f"  {'-'*130}")
 
     total_size = 0.0
     for r in rows:
@@ -2004,6 +2016,7 @@ def print_sizing_table(target_date: str, bankroll: float = 5000.0):
 
         game = r["game"]
         model_str = f"{r['model']:.1%}"
+        blend_str = f"{r['blended']:.1%}" if r.get("blended") else "  ---"
         poly_str = f"{r['poly_mid']:.1%}" if r.get("poly_mid") else "  ---"
         bid_str = f"{r['poly_bid']:.2f}" if r.get("poly_bid") else " ---"
         ask_str = f"{r['poly_ask']:.2f}" if r.get("poly_ask") else " ---"
@@ -2017,7 +2030,7 @@ def print_sizing_table(target_date: str, bankroll: float = 5000.0):
 
         total_size += r.get("size_usd", 0)
 
-        print(f"  {time_str:>9s} {game:<14s} {model_str:>6s} {poly_str:>6s} {bid_str:>5s} {ask_str:>5s} "
+        print(f"  {time_str:>9s} {game:<14s} {model_str:>6s} {blend_str:>6s} {poly_str:>6s} {bid_str:>5s} {ask_str:>5s} "
               f"{sprd_str:>5s} {edge_str:>6s} {side_str:>6s} {hk_str:>7s} "
               f"{size_str:>7s} {bd_str:>7s} {ad_str:>7s}")
 
@@ -2035,6 +2048,8 @@ def main():
     parser.add_argument("--interval", type=float, default=30.0, help="Poll interval in seconds")
     parser.add_argument("--dry-run", action="store_true", default=False, help="Dry run (no real orders)")
     parser.add_argument("--sizing-only", action="store_true", help="Just print sizing table, don't run bot")
+    parser.add_argument("--model-weight", type=float, default=0.40,
+                        help="Blend weight: fair = w*model + (1-w)*market (default: 0.40)")
     parser.add_argument("--max-loss", type=float, default=500.0,
                         help="Kill switch: halt all trading if total P&L drops below -$X (default: 500)")
     parser.add_argument("--debug-discovery", action="store_true",
@@ -2045,7 +2060,7 @@ def main():
     DEBUG_DISCOVERY = args.debug_discovery
 
     if args.sizing_only:
-        print_sizing_table(args.date, args.bankroll)
+        print_sizing_table(args.date, args.bankroll, args.model_weight)
         return
 
     # Validate env vars for live trading
@@ -2066,6 +2081,7 @@ def main():
         dry_run=args.dry_run,
         debug_discovery=args.debug_discovery,
         max_loss=args.max_loss,
+        model_weight=args.model_weight,
     )
 
     bot = MLBMarketMaker(config)
