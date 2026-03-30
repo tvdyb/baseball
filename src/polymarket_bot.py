@@ -51,6 +51,7 @@ CLOB_API = "https://clob.polymarket.com"
 MLB_API = "https://statsapi.mlb.com/api/v1"
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 PICKS_DIR = DATA_DIR / "picks"
+STATE_DIR = DATA_DIR / "state"
 
 # Quoting parameters
 PRE_LINEUP_HALF_SPREAD = 0.03   # ±3¢ before lineups
@@ -523,19 +524,33 @@ def fetch_clob_midpoint(client: httpx.Client, token_id: str) -> float | None:
 # ── MLB API Monitoring ─────────────────────────────────────────────────────────
 
 def fetch_mlb_game_status(target_date: str) -> list[dict]:
-    """Fetch current game status, SPs, and lineup availability from MLB API."""
-    with httpx.Client(timeout=15.0) as client:
-        resp = client.get(
-            f"{MLB_API}/schedule",
-            params={
-                "sportId": 1,
-                "date": target_date,
-                "hydrate": "probablePitcher,team,linescore",
-                "gameType": "R",
-            },
-        )
-        resp.raise_for_status()
-        data = resp.json()
+    """Fetch current game status, SPs, and lineup availability from MLB API.
+
+    Returns empty list on API failure (caller should handle gracefully).
+    """
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            resp = client.get(
+                f"{MLB_API}/schedule",
+                params={
+                    "sportId": 1,
+                    "date": target_date,
+                    "hydrate": "probablePitcher,team,linescore",
+                    "gameType": "R",
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.HTTPStatusError as e:
+        print(f"  WARNING: MLB schedule API returned HTTP {e.response.status_code}")
+        return []
+    except (httpx.RequestError, httpx.TimeoutException) as e:
+        print(f"  WARNING: MLB schedule API unreachable: {type(e).__name__}")
+        return []
+
+    if not isinstance(data, dict):
+        print(f"  WARNING: MLB schedule API returned unexpected type: {type(data).__name__}")
+        return []
 
     games = []
     for d in data.get("dates", []):
@@ -558,18 +573,41 @@ def fetch_mlb_game_status(target_date: str) -> list[dict]:
 
 
 def check_lineup_status(game_pk: int) -> dict:
-    """Check if lineups are posted for a game."""
+    """Check if lineups are posted for a game.
+
+    Returns dict with:
+      - home_lineup, away_lineup: bool (True if 9+ batters)
+      - status: "ok" | "api_error" | "parse_error"
+      - error: str or None
+    """
     try:
         with httpx.Client(timeout=10.0) as client:
             resp = client.get(f"{MLB_API}/game/{game_pk}/boxscore")
             resp.raise_for_status()
             data = resp.json()
-    except Exception:
-        return {"home_lineup": False, "away_lineup": False}
+    except httpx.HTTPStatusError as e:
+        return {"home_lineup": False, "away_lineup": False,
+                "status": "api_error", "error": f"HTTP {e.response.status_code}"}
+    except (httpx.RequestError, httpx.TimeoutException) as e:
+        return {"home_lineup": False, "away_lineup": False,
+                "status": "api_error", "error": str(e)}
+    except Exception as e:
+        return {"home_lineup": False, "away_lineup": False,
+                "status": "parse_error", "error": str(e)}
 
-    result = {}
+    teams = data.get("teams")
+    if not isinstance(teams, dict):
+        return {"home_lineup": False, "away_lineup": False,
+                "status": "parse_error", "error": "missing 'teams' key"}
+
+    result = {"status": "ok", "error": None}
     for side in ("home", "away"):
-        batting_order = data.get("teams", {}).get(side, {}).get("battingOrder", [])
+        team_data = teams.get(side, {})
+        if not isinstance(team_data, dict):
+            result[f"{side}_lineup"] = False
+            result["status"] = "parse_error"
+            continue
+        batting_order = team_data.get("battingOrder", [])
         result[f"{side}_lineup"] = len(batting_order) >= 9
     return result
 
@@ -812,11 +850,20 @@ class FastMLBMonitor:
                         if not gs or gs.lineups_confirmed:
                             continue
 
-                        status = await asyncio.to_thread(check_lineup_status, game_pk)
-                        if status.get("home_lineup") and not gs.home_lineup_confirmed:
+                        result = await asyncio.to_thread(check_lineup_status, game_pk)
+
+                        if result.get("status") == "parse_error":
+                            print(f"  [MLB] WARNING: Schema error fetching lineup for {key}: "
+                                  f"{result.get('error')}. Widening spreads.")
+                            gs.spread_widened = True
+                        elif result.get("status") == "api_error":
+                            _debug(f"Lineup API error for {key}: {result.get('error')}")
+                            # Transient — don't change state, retry next cycle
+
+                        if result.get("home_lineup") and not gs.home_lineup_confirmed:
                             gs.home_lineup_confirmed = True
                             print(f"  [MLB] LINEUP: {key} home lineup confirmed")
-                        if status.get("away_lineup") and not gs.away_lineup_confirmed:
+                        if result.get("away_lineup") and not gs.away_lineup_confirmed:
                             gs.away_lineup_confirmed = True
                             print(f"  [MLB] LINEUP: {key} away lineup confirmed")
 
@@ -1395,6 +1442,163 @@ class MLBMarketMaker:
         gs.bid_filled = 0.0
         gs.ask_filled = 0.0
 
+    # ── State Persistence & Reconciliation ────────────────────────────
+
+    def _state_path(self) -> Path:
+        return STATE_DIR / f"bot_state_{self.config.target_date}.json"
+
+    def save_state(self):
+        """Save bot state to JSON for crash recovery.
+
+        Persists order IDs, positions, P&L, fill history, and risk flags.
+        Does NOT save in dry-run mode (ephemeral).
+        """
+        if self.config.dry_run:
+            return
+
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+        state = {
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+            "target_date": self.config.target_date,
+            "cycle": self._cycle_count,
+            "games": {},
+        }
+
+        for key, gs in self.games.items():
+            state["games"][key] = {
+                "home_team": gs.home_team,
+                "away_team": gs.away_team,
+                "model_fair": gs.model_fair,
+                "game_time_utc": gs.game_time_utc,
+                # Order tracking
+                "bid_order_id": gs.bid_order_id,
+                "ask_order_id": gs.ask_order_id,
+                "bid_price": gs.bid_price,
+                "ask_price": gs.ask_price,
+                "bid_size": gs.bid_size,
+                "ask_size": gs.ask_size,
+                "bid_filled": gs.bid_filled,
+                "ask_filled": gs.ask_filled,
+                # Position & P&L
+                "net_position": gs.net_position,
+                "realized_pnl": gs.realized_pnl,
+                "cost_basis": gs.cost_basis,
+                "total_bought": gs.total_bought,
+                "total_sold": gs.total_sold,
+                "fill_history": gs.fill_history,
+                # Risk state
+                "consecutive_bid_fills": gs.consecutive_bid_fills,
+                "consecutive_ask_fills": gs.consecutive_ask_fills,
+                "quote_halted": gs.quote_halted,
+                "halt_reason": gs.halt_reason,
+            }
+
+        try:
+            tmp = self._state_path().with_suffix(".tmp")
+            with open(tmp, "w") as f:
+                json.dump(state, f, indent=2)
+            tmp.rename(self._state_path())
+        except Exception as e:
+            print(f"  WARNING: Failed to save state: {e}")
+
+    async def load_and_reconcile_state(self):
+        """Load saved state and reconcile order IDs with the CLOB.
+
+        For each saved order ID:
+          - If still LIVE on the exchange: restore it (keep quoting around it)
+          - If MATCHED/CANCELLED/EXPIRED: clear it, but keep position/P&L
+
+        Always restores position, P&L, and fill history regardless of order status.
+        """
+        path = self._state_path()
+        if not path.exists():
+            return
+
+        try:
+            with open(path) as f:
+                state = json.load(f)
+        except (json.JSONDecodeError, IOError) as e:
+            print(f"  WARNING: Could not read state file: {e}")
+            return
+
+        if state.get("target_date") != self.config.target_date:
+            print(f"  State file is for {state.get('target_date')}, ignoring")
+            return
+
+        saved_games = state.get("games", {})
+        restored = 0
+        orders_live = 0
+        orders_gone = 0
+
+        for key, gs in self.games.items():
+            saved = saved_games.get(key)
+            if not saved:
+                continue
+
+            # Restore position & P&L (always, regardless of order status)
+            gs.net_position = saved.get("net_position", 0.0)
+            gs.realized_pnl = saved.get("realized_pnl", 0.0)
+            gs.cost_basis = saved.get("cost_basis", 0.0)
+            gs.total_bought = saved.get("total_bought", 0.0)
+            gs.total_sold = saved.get("total_sold", 0.0)
+            gs.fill_history = saved.get("fill_history", [])
+            gs.consecutive_bid_fills = saved.get("consecutive_bid_fills", 0)
+            gs.consecutive_ask_fills = saved.get("consecutive_ask_fills", 0)
+
+            # Restore halt state
+            if saved.get("quote_halted"):
+                gs.quote_halted = True
+                gs.halt_reason = saved.get("halt_reason", "restored from state")
+
+            restored += 1
+
+            # Reconcile order IDs with exchange
+            if not self._clob_client:
+                continue
+
+            for order_attr, filled_attr, price_attr, size_attr in [
+                ("bid_order_id", "bid_filled", "bid_price", "bid_size"),
+                ("ask_order_id", "ask_filled", "ask_price", "ask_size"),
+            ]:
+                saved_id = saved.get(order_attr)
+                if not saved_id or saved_id.startswith("dry_"):
+                    continue
+
+                try:
+                    order = await asyncio.to_thread(
+                        self._clob_client.get_order, saved_id
+                    )
+                except Exception as e:
+                    print(f"  [RECONCILE] Could not check {key} {order_attr}: {e}")
+                    orders_gone += 1
+                    continue
+
+                if not order:
+                    orders_gone += 1
+                    continue
+
+                status = str(order.get("status", "")).upper()
+                size_matched = float(order.get("size_matched", 0) or 0)
+
+                if status in ("LIVE", "OPEN", "ACTIVE", ""):
+                    # Order still live on exchange — restore it
+                    setattr(gs, order_attr, saved_id)
+                    setattr(gs, price_attr, saved.get(price_attr))
+                    setattr(gs, size_attr, saved.get(size_attr, 0.0))
+                    setattr(gs, filled_attr, size_matched)
+                    orders_live += 1
+                    print(f"  [RECONCILE] {key} {order_attr}: LIVE "
+                          f"({size_matched:.1f} filled)")
+                else:
+                    # Order is gone — don't restore the ID
+                    orders_gone += 1
+                    print(f"  [RECONCILE] {key} {order_attr}: {status} "
+                          f"(cleared)")
+
+        print(f"  Reconciled state: {restored} games restored, "
+              f"{orders_live} orders live, {orders_gone} orders gone")
+
     # ── Display ────────────────────────────────────────────────────────
 
     def print_dashboard(self):
@@ -1560,6 +1764,11 @@ class MLBMarketMaker:
                 self.config.dry_run = True
                 self._clob_client = None
 
+        # Reconcile state from previous session (crash recovery)
+        if not self.config.dry_run:
+            print("\n  Checking for saved state...")
+            await self.load_and_reconcile_state()
+
         # Launch concurrent risk monitors
         self._trade_flow = TradeFlowMonitor(self.games)
         self._mlb_monitor = FastMLBMonitor(
@@ -1588,8 +1797,9 @@ class MLBMarketMaker:
                 # Place/update quotes (polls order status, checks kill switch)
                 await self.place_or_update_quotes()
 
-                # Display
+                # Display & persist
                 self.print_dashboard()
+                self.save_state()
 
                 # If killed, break after displaying final state
                 if self._killed:
@@ -1623,6 +1833,8 @@ class MLBMarketMaker:
             for gs in self.games.values():
                 await self._cancel_game_orders(gs)
 
+            # Save final state (positions/P&L survive, orders are cleared)
+            self.save_state()
             print("  Bot stopped.")
 
     def stop(self):

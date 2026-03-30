@@ -9,7 +9,8 @@ Usage:
 """
 
 import argparse
-from datetime import date
+import os
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -42,6 +43,78 @@ from win_model import (
 from utils import XRV_DIR, GAMES_DIR, FEATURES_DIR
 
 MLB_API = "https://statsapi.mlb.com/api/v1"
+
+# Maximum age (in hours) for parquet files used in live prediction
+MAX_DATA_AGE_HOURS = 48
+
+
+class StaleDataError(Exception):
+    """Raised when required data files are too old for live prediction."""
+    pass
+
+
+def _check_file_freshness(path: Path, max_age_hours: float = MAX_DATA_AGE_HOURS,
+                           label: str = "") -> float:
+    """Check modification time of a file. Returns age in hours.
+
+    Raises StaleDataError if older than max_age_hours.
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"Required data file not found: {path}")
+    mtime = path.stat().st_mtime
+    age_hours = (datetime.now(timezone.utc).timestamp() - mtime) / 3600
+    name = label or path.name
+    if age_hours > max_age_hours:
+        raise StaleDataError(
+            f"{name} is {age_hours:.1f}h old (max {max_age_hours}h). "
+            f"Run the upstream pipeline to refresh: {path}"
+        )
+    return age_hours
+
+
+def validate_live_data_freshness(target_date: str, max_age_hours: float = MAX_DATA_AGE_HOURS):
+    """Validate that all parquet files needed for live prediction are fresh.
+
+    Checks:
+      - xRV for current + prior year
+      - Games file for current year (for team history/form)
+
+    Raises StaleDataError with actionable message if any file is stale.
+    """
+    year = int(target_date[:4])
+    issues = []
+
+    for yr in [year - 1, year]:
+        xrv_path = XRV_DIR / f"statcast_xrv_{yr}.parquet"
+        if xrv_path.exists():
+            try:
+                age = _check_file_freshness(xrv_path, max_age_hours, f"xRV {yr}")
+                print(f"  xRV {yr}: {age:.1f}h old ✓")
+            except StaleDataError as e:
+                issues.append(str(e))
+        elif yr == year:
+            # Current-year xRV is optional early in the season
+            print(f"  xRV {yr}: not found (OK if early in season)")
+        else:
+            issues.append(f"Prior-year xRV ({yr}) not found: {xrv_path}")
+
+    games_path = GAMES_DIR / f"games_{year}.parquet"
+    if games_path.exists():
+        try:
+            age = _check_file_freshness(games_path, max_age_hours, f"Games {year}")
+            print(f"  Games {year}: {age:.1f}h old ✓")
+        except StaleDataError as e:
+            issues.append(str(e))
+    else:
+        print(f"  Games {year}: not found (OK for opening day)")
+
+    if issues:
+        raise StaleDataError(
+            "Stale or missing data files for live prediction:\n  " +
+            "\n  ".join(issues) +
+            "\n\nRun: make scrape-statcast scrape-games build-xrv"
+        )
+    print("  All data files fresh ✓")
 
 
 def load_training_data(exclude_year: int = None) -> pd.DataFrame:
@@ -263,21 +336,79 @@ def fetch_todays_games(client: httpx.Client, target_date: str) -> list[dict]:
     return games
 
 
+class LineupStatus:
+    """Distinguishes lineup fetch outcomes for downstream decision-making."""
+    AVAILABLE = "available"       # lineup posted, parsed successfully
+    NOT_POSTED = "not_posted"     # API reachable, lineups not yet posted
+    API_ERROR = "api_error"       # network/HTTP error (transient)
+    PARSE_ERROR = "parse_error"   # API returned unexpected schema
+
+
 def fetch_lineup(client: httpx.Client, game_pk: int) -> dict:
-    """Fetch starting lineup from boxscore endpoint."""
+    """Fetch starting lineup from boxscore endpoint.
+
+    Returns dict with:
+      - home, away: list of (player_id, bat_side) tuples
+      - home_status, away_status: LineupStatus values
+      - error: str or None (details for API_ERROR/PARSE_ERROR)
+    """
     try:
         resp = client.get(f"{MLB_API}/game/{game_pk}/boxscore")
         resp.raise_for_status()
         data = resp.json()
+    except httpx.HTTPStatusError as e:
+        print(f"  WARNING: MLB API returned {e.response.status_code} for game {game_pk}")
+        return {
+            "home": [], "away": [],
+            "home_status": LineupStatus.API_ERROR,
+            "away_status": LineupStatus.API_ERROR,
+            "error": f"HTTP {e.response.status_code}",
+        }
+    except (httpx.RequestError, httpx.TimeoutException) as e:
+        print(f"  WARNING: MLB API unreachable for game {game_pk}: {type(e).__name__}")
+        return {
+            "home": [], "away": [],
+            "home_status": LineupStatus.API_ERROR,
+            "away_status": LineupStatus.API_ERROR,
+            "error": str(e),
+        }
     except Exception as e:
-        print(f"  WARNING: Failed to fetch lineup for game {game_pk}: {e}")
-        return {"home": [], "away": []}
+        print(f"  WARNING: Unexpected error fetching lineup for game {game_pk}: {e}")
+        return {
+            "home": [], "away": [],
+            "home_status": LineupStatus.PARSE_ERROR,
+            "away_status": LineupStatus.PARSE_ERROR,
+            "error": str(e),
+        }
 
-    result = {}
+    # Validate expected schema
+    teams = data.get("teams")
+    if not isinstance(teams, dict):
+        print(f"  WARNING: Unexpected boxscore schema for game {game_pk}: "
+              f"'teams' is {type(teams).__name__}")
+        return {
+            "home": [], "away": [],
+            "home_status": LineupStatus.PARSE_ERROR,
+            "away_status": LineupStatus.PARSE_ERROR,
+            "error": "missing or invalid 'teams' key",
+        }
+
+    result = {"error": None}
     for side in ("home", "away"):
-        team_data = data.get("teams", {}).get(side, {})
+        team_data = teams.get(side, {})
+        if not isinstance(team_data, dict):
+            result[side] = []
+            result[f"{side}_status"] = LineupStatus.PARSE_ERROR
+            continue
+
         batting_order = team_data.get("battingOrder", [])
         players = team_data.get("players", {})
+
+        if not batting_order:
+            # API reachable, schema valid, lineups just not posted yet
+            result[side] = []
+            result[f"{side}_status"] = LineupStatus.NOT_POSTED
+            continue
 
         lineup = []
         for pid in batting_order:
@@ -287,6 +418,10 @@ def fetch_lineup(client: httpx.Client, game_pk: int) -> dict:
             lineup.append((int(pid), bat_side))
 
         result[side] = lineup
+        result[f"{side}_status"] = (
+            LineupStatus.AVAILABLE if len(lineup) >= 9
+            else LineupStatus.NOT_POSTED
+        )
 
     return result
 
@@ -295,9 +430,19 @@ def build_live_features(
     games: list[dict],
     target_date: str,
     client: httpx.Client,
+    skip_freshness_check: bool = False,
 ) -> pd.DataFrame:
-    """Build feature vectors for today's games using compute_single_game_features."""
+    """Build feature vectors for today's games using compute_single_game_features.
+
+    Validates data freshness before loading (raises StaleDataError if stale).
+    Set skip_freshness_check=True for backtesting or offline use.
+    """
     year = int(target_date[:4])
+
+    # Validate data freshness for live prediction
+    if not skip_freshness_check:
+        print("  Checking data freshness...")
+        validate_live_data_freshness(target_date)
 
     # Load xRV data: current year + prior year
     xrv_frames = []
@@ -368,15 +513,25 @@ def build_live_features(
     # Fetch lineups for each game and build features using shared function
     feature_rows = []
     display_meta = []  # SP names, game_time, status for display
-    empty_lineups = 0
+    api_errors = 0
+    not_posted = 0
+    parse_errors = 0
     for game in games:
         game_pk = game["game_pk"]
 
-        # Fetch live lineup
+        # Fetch live lineup with status tracking
         lineup = fetch_lineup(client, game_pk)
-        if not lineup.get("home") and not lineup.get("away"):
-            empty_lineups += 1
         lineups = {game_pk: lineup}
+
+        # Track lineup fetch outcomes
+        for side in ("home", "away"):
+            st = lineup.get(f"{side}_status", LineupStatus.NOT_POSTED)
+            if st == LineupStatus.API_ERROR:
+                api_errors += 1
+            elif st == LineupStatus.PARSE_ERROR:
+                parse_errors += 1
+            elif st == LineupStatus.NOT_POSTED:
+                not_posted += 1
 
         # weather_map is empty — live weather comes from game["weather"] dict
         row, meta = compute_single_game_features(
@@ -395,6 +550,10 @@ def build_live_features(
         row["home_team_games_played"] = len(team_history.get(home_team, []))
         row["away_team_games_played"] = len(team_history.get(away_team, []))
 
+        # Tag lineup status so downstream can decide to suppress trades
+        row["_lineup_home_status"] = lineup.get("home_status", LineupStatus.NOT_POSTED)
+        row["_lineup_away_status"] = lineup.get("away_status", LineupStatus.NOT_POSTED)
+
         feature_rows.append(row)
         display_meta.append({
             "home_sp_name": game.get("home_sp_name", "TBD"),
@@ -403,9 +562,16 @@ def build_live_features(
             "status": game.get("status", ""),
         })
 
-    if empty_lineups > 0:
-        print(f"  WARNING: {empty_lineups}/{len(games)} games had no lineup data. "
+    # Report lineup fetch outcomes
+    total_sides = len(games) * 2
+    if api_errors > 0:
+        print(f"  WARNING: {api_errors}/{total_sides} lineup fetches failed (API error). "
               "Matchup features will be NaN for those games.")
+    if parse_errors > 0:
+        print(f"  ERROR: {parse_errors}/{total_sides} lineup fetches returned unexpected schema. "
+              "MLB API may have changed.")
+    if not_posted > 0:
+        print(f"  INFO: {not_posted}/{total_sides} lineups not yet posted.")
 
     features_df = pd.DataFrame(feature_rows)
 
