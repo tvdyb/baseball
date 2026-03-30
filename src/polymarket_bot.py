@@ -1348,7 +1348,9 @@ class MLBMarketMaker:
 
         if self._clob_client:
             try:
-                from py_clob_client.clob_types import OrderArgs, OrderType
+                from py_clob_client.clob_types import (
+                    OrderArgs, PartialCreateOrderOptions,
+                )
 
                 order_args = OrderArgs(
                     price=price,
@@ -1356,12 +1358,14 @@ class MLBMarketMaker:
                     side=side,
                     token_id=token_id,
                 )
-                order_type = OrderType.GTC
+                options = PartialCreateOrderOptions(
+                    tick_size="0.01",
+                    neg_risk=neg_risk if neg_risk else None,
+                )
                 result = await asyncio.to_thread(
                     self._clob_client.create_and_post_order,
                     order_args,
-                    order_type,
-                    neg_risk,
+                    options,
                 )
                 order_id = result.get("orderID") or result.get("id", "")
                 print(f"    ORDER: {game_key} {label}: {side} {size:.0f} @ {price:.2f} -> {order_id}")
@@ -1380,7 +1384,7 @@ class MLBMarketMaker:
             if not self.config.dry_run and self._clob_client:
                 try:
                     await asyncio.to_thread(
-                        self._clob_client.cancel, order_id=order_id
+                        self._clob_client.cancel, order_id
                     )
                 except Exception as e:
                     _debug(f"Cancel failed for {order_id}: {e}")
