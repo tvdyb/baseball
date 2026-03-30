@@ -424,6 +424,7 @@ def save_picks(picks: pd.DataFrame, target_date: str):
             "conviction": str(r.get("conviction", "")),
             "quote_bid": round(float(r["quote_bid"]), 4),
             "quote_ask": round(float(r["quote_ask"]), 4),
+            "kalshi_mid": round(float(r["kalshi_mid"]), 4) if pd.notna(r.get("kalshi_mid")) else None,
             "market_ticker": r.get("market_ticker", ""),
             "lineup_degraded": bool(r.get("_lineup_degraded", False)),
         }

@@ -643,3 +643,57 @@ class TestMLBAPIErrorHandling:
 
         result = fetch_mlb_game_status("2026-03-30")
         assert result == []
+
+
+# ── Cross-Market Confirmation ────────────────────────────────────────────────
+
+class TestCrossMarketConfirmation:
+    """Test that the Kalshi cross-market confirmation filter works correctly."""
+
+    def test_confirmed_edge_trades(self, bot, game_state):
+        """When model and Kalshi agree vs Poly, game should be tradeable."""
+        # Model=0.55, Poly=0.425 → model_edge = +0.125
+        # Kalshi=0.50 → kalshi_edge = +0.075 (same direction)
+        # confirmation = 0.125 * 0.075 = 0.009375 > 0.002
+        game_state.kalshi_mid = 0.50
+        game_state.confirmation = 0.125 * 0.075
+        assert game_state.is_market_confirmed is True
+
+    def test_unconfirmed_edge_blocked(self, bot, game_state):
+        """When Kalshi disagrees, conviction=unconfirmed blocks quoting."""
+        game_state.kalshi_mid = 0.41
+        game_state.confirmation = 0.125 * (-0.015)
+        game_state.conviction = "unconfirmed"
+        game_state.half_kelly = 0.0
+        game_state.side = ""
+
+        quotes = bot.compute_quotes(game_state)
+        assert quotes is None
+
+    def test_no_kalshi_falls_through(self, game_state):
+        """When no Kalshi data available, should not filter."""
+        game_state.kalshi_mid = None
+        game_state.confirmation = None
+        assert game_state.is_market_confirmed is True
+
+    def test_confirmation_positive_same_direction(self):
+        """Confirmation signal is positive when both point same way vs Poly."""
+        gs = GameState(home_team="NYY", away_team="BOS", model_fair=0.60)
+        gs.poly_home_mid = 0.52
+        gs.kalshi_mid = 0.57
+        model_edge = 0.60 - 0.52  # +0.08
+        kalshi_edge = 0.57 - 0.52  # +0.05
+        gs.confirmation = model_edge * kalshi_edge  # 0.004 > 0.002
+        assert gs.confirmation > 0.002
+        assert gs.is_market_confirmed is True
+
+    def test_confirmation_negative_opposite_direction(self):
+        """Confirmation signal is negative when they disagree."""
+        gs = GameState(home_team="NYY", away_team="BOS", model_fair=0.60)
+        gs.poly_home_mid = 0.52
+        gs.kalshi_mid = 0.50
+        model_edge = 0.60 - 0.52  # +0.08
+        kalshi_edge = 0.50 - 0.52  # -0.02
+        gs.confirmation = model_edge * kalshi_edge  # -0.0016
+        assert gs.confirmation < 0
+        assert gs.is_market_confirmed is False

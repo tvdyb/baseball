@@ -112,6 +112,7 @@ class GameState:
     home_team: str
     away_team: str
     model_fair: float  # home win prob from model
+    kalshi_mid: float | None = None  # Kalshi implied prob (for cross-market confirmation)
     home_sp: str = ""
     away_sp: str = ""
     game_time_utc: str = ""  # ISO
@@ -152,6 +153,7 @@ class GameState:
 
     # Computed
     edge: float = 0.0
+    confirmation: float | None = None  # model_edge * kalshi_edge (positive = confirmed)
     half_kelly: float = 0.0
     side: str = ""  # "BUY_HOME" or "BUY_AWAY"
     conviction: str = "skip"
@@ -193,6 +195,13 @@ class GameState:
     @property
     def is_adverse_halted(self) -> bool:
         return self.adverse_halted and time.time() < self.adverse_halt_until
+
+    @property
+    def is_market_confirmed(self) -> bool:
+        """True if Kalshi confirms the model's direction vs Polymarket, or if no Kalshi data."""
+        if self.confirmation is None:
+            return True  # no Kalshi data → fall back to raw model
+        return self.confirmation > 0  # threshold applied at edge computation time
 
     @property
     def minutes_to_first_pitch(self) -> float | None:
@@ -245,6 +254,7 @@ class BotConfig:
     max_games: int = 15
     debug_discovery: bool = False
     max_loss: float = 500.0  # kill switch: halt all trading if total P&L < -max_loss
+    confirmation_threshold: float = 0.002  # min model_edge * kalshi_edge to confirm trade
 
 
 # ── Polymarket Market Discovery ────────────────────────────────────────────────
@@ -962,6 +972,7 @@ class MLBMarketMaker:
                 home_team=p["home_team"],
                 away_team=p["away_team"],
                 model_fair=p["model_fair"],
+                kalshi_mid=p.get("kalshi_mid"),
                 home_sp=p.get("home_sp", ""),
                 away_sp=p.get("away_sp", ""),
             )
@@ -1083,13 +1094,35 @@ class MLBMarketMaker:
                 gs.poly_bid_depth = book.get("bid_depth", 0)
                 gs.poly_ask_depth = book.get("ask_depth", 0)
 
-                # Compute edge and sizing using mid price
+                # Compute edge, cross-market confirmation, and sizing
                 if gs.poly_home_mid:
-                    gs.edge = gs.model_fair - gs.poly_home_mid
-                    gs.half_kelly, gs.side = compute_half_kelly(gs.model_fair, gs.poly_home_mid)
+                    model_edge = gs.model_fair - gs.poly_home_mid
+                    gs.edge = model_edge
+
+                    # Cross-market confirmation: does Kalshi agree with model direction?
+                    # confirmation = (model - poly) * (kalshi - poly)
+                    # Positive = Kalshi and model both disagree with Poly in same direction
+                    if gs.kalshi_mid is not None:
+                        kalshi_edge = gs.kalshi_mid - gs.poly_home_mid
+                        gs.confirmation = model_edge * kalshi_edge
+                    else:
+                        gs.confirmation = None  # no Kalshi → no filter
+
+                    # Only size/trade if confirmed (or no Kalshi available)
+                    confirmed = (gs.confirmation is None or
+                                 gs.confirmation > self.config.confirmation_threshold)
+
+                    if confirmed:
+                        gs.half_kelly, gs.side = compute_half_kelly(
+                            gs.model_fair, gs.poly_home_mid)
+                    else:
+                        gs.half_kelly = 0.0
+                        gs.side = ""
 
                     abs_edge = abs(gs.edge)
-                    if abs_edge >= 0.07:
+                    if not confirmed:
+                        gs.conviction = "unconfirmed"
+                    elif abs_edge >= 0.07:
                         gs.conviction = "strong"
                     elif abs_edge >= 0.04:
                         gs.conviction = "lean"
@@ -1184,6 +1217,8 @@ class MLBMarketMaker:
         if gs.poly_home_mid is None:
             return None
         if abs(gs.edge) < self.config.min_edge:
+            return None
+        if gs.conviction == "unconfirmed":
             return None
 
         # Half-Kelly determines total desired position (in contracts)
@@ -1481,6 +1516,7 @@ class MLBMarketMaker:
                 "home_team": gs.home_team,
                 "away_team": gs.away_team,
                 "model_fair": gs.model_fair,
+                "kalshi_mid": gs.kalshi_mid,
                 "game_time_utc": gs.game_time_utc,
                 # Order tracking
                 "bid_order_id": gs.bid_order_id,
@@ -1622,13 +1658,13 @@ class MLBMarketMaker:
               f"Cycle #{self._cycle_count} — {now_et.strftime('%I:%M:%S%p')} ET — "
               f"{'DRY RUN' if self.config.dry_run else 'LIVE'}")
         print(f"  Bankroll: ${self.config.bankroll:,.0f} | Min edge: {self.config.min_edge:.0%} | "
-              f"Poll: {self.config.poll_interval_s:.0f}s")
+              f"Confirm: {self.config.confirmation_threshold} | Poll: {self.config.poll_interval_s:.0f}s")
         print(f"{'='*125}")
 
-        print(f"\n  {'Game':<14s} {'Time':>9s} {'Model':>6s} {'Poly':>6s} {'Sprd':>5s} {'Edge':>6s} "
-              f"{'½K%':>5s} {'Side':>6s} {'Conv':>7s} {'LU':>3s} "
-              f"{'Bid':>6s} {'Ask':>6s} {'$BidDp':>7s} {'$AskDp':>7s} {'Risk':>8s} {'Status':>12s}")
-        print(f"  {'-'*122}")
+        print(f"\n  {'Game':<14s} {'Time':>9s} {'Model':>6s} {'Kalshi':>6s} {'Poly':>6s} {'Sprd':>5s} {'Edge':>6s} "
+              f"{'Conf':>6s} {'½K%':>5s} {'Side':>6s} {'Conv':>10s} {'LU':>3s} "
+              f"{'Bid':>6s} {'Ask':>6s} {'Risk':>8s} {'Status':>12s}")
+        print(f"  {'-'*125}")
 
         # Sort by game time
         sorted_games = sorted(
@@ -1648,12 +1684,12 @@ class MLBMarketMaker:
             edge_str = f"{gs.edge:+.1%}" if gs.poly_home_mid else "  ---"
             kelly_str = f"{gs.half_kelly:.1%}" if gs.half_kelly > 0 else "  ---"
             side_str = gs.side.replace("BUY_", "") if gs.side else "---"
+            kalshi_str = f"{gs.kalshi_mid:.1%}" if gs.kalshi_mid else "  ---"
+            conf_str = f"{gs.confirmation:.4f}" if gs.confirmation is not None else "  n/a"
             conv_str = gs.conviction.upper() if gs.conviction in ("strong", "lean") else gs.conviction
             lineup_str = "Y" if gs.lineups_confirmed else ("P" if gs.home_lineup_confirmed or gs.away_lineup_confirmed else "N")
             bid_str = f"{gs.bid_price:.2f}" if gs.bid_price else "  ---"
             ask_str = f"{gs.ask_price:.2f}" if gs.ask_price else "  ---"
-            bd_str = f"${gs.poly_bid_depth:,.0f}" if gs.poly_bid_depth else "  ---"
-            ad_str = f"${gs.poly_ask_depth:,.0f}" if gs.poly_ask_depth else "  ---"
 
             # Risk flags
             risk_flags = []
@@ -1686,12 +1722,14 @@ class MLBMarketMaker:
                 status = "NO_BOOK"
             elif abs(gs.edge) < self.config.min_edge:
                 status = "THIN_EDGE"
+            elif gs.conviction == "unconfirmed":
+                status = "UNCONFIRM"
             else:
                 status = "READY"
 
-            print(f"  {game:<14s} {time_str:>9s} {model_str:>6s} {poly_str:>6s} {sprd_str:>5s} {edge_str:>6s} "
-                  f"{kelly_str:>5s} {side_str:>6s} {conv_str:>7s} {lineup_str:>3s} "
-                  f"{bid_str:>6s} {ask_str:>6s} {bd_str:>7s} {ad_str:>7s} {risk_str:>8s} {status:>12s}")
+            print(f"  {game:<14s} {time_str:>9s} {model_str:>6s} {kalshi_str:>6s} {poly_str:>6s} {sprd_str:>5s} {edge_str:>6s} "
+                  f"{conf_str:>6s} {kelly_str:>5s} {side_str:>6s} {conv_str:>10s} {lineup_str:>3s} "
+                  f"{bid_str:>6s} {ask_str:>6s} {risk_str:>8s} {status:>12s}")
 
         # P&L summary
         total_realized = sum(g.realized_pnl for g in self.games.values())
@@ -1950,12 +1988,26 @@ def print_sizing_table(target_date: str, bankroll: float = 5000.0):
                 continue
 
             edge = fair - mid
-            hk, side = compute_half_kelly(fair, mid)
+            kalshi_mid = p.get("kalshi_mid")
+
+            # Cross-market confirmation
+            if kalshi_mid is not None:
+                confirmation = edge * (kalshi_mid - mid)
+                confirmed = confirmation > 0.002
+            else:
+                confirmation = None
+                confirmed = True  # no Kalshi → trust model
+
+            if confirmed:
+                hk, side = compute_half_kelly(fair, mid)
+            else:
+                hk, side = 0.0, ""
             size_usd = min(bankroll * hk, bankroll * MAX_POSITION_PER_GAME)
 
             rows.append({
                 "game": f"{at}@{ht}",
                 "model": fair,
+                "kalshi": kalshi_mid,
                 "poly_mid": mid,
                 "poly_bid": book.get("best_bid"),
                 "poly_ask": book.get("best_ask"),
@@ -1963,11 +2015,13 @@ def print_sizing_table(target_date: str, bankroll: float = 5000.0):
                 "bid_depth": book.get("bid_depth", 0),
                 "ask_depth": book.get("ask_depth", 0),
                 "edge": edge,
-                "side": side.replace("BUY_", ""),
+                "confirmation": confirmation,
+                "confirmed": confirmed,
+                "side": side.replace("BUY_", "") if side else "",
                 "half_kelly": hk,
                 "size_usd": size_usd,
                 "game_time": pm.game_start_time,
-                "status": "OK",
+                "status": "OK" if confirmed else "UNCONFIRM",
             })
             time.sleep(0.15)
 
@@ -1979,10 +2033,10 @@ def print_sizing_table(target_date: str, bankroll: float = 5000.0):
     print(f"  POLYMARKET HALF-KELLY SIZING — {target_date} — Bankroll: ${bankroll:,.0f}")
     print(f"{'='*130}")
 
-    print(f"\n  {'ET Time':>9s} {'Game':<14s} {'Model':>6s} {'Poly':>6s} {'Bid':>5s} {'Ask':>5s} "
-          f"{'Sprd':>5s} {'Edge':>6s} {'Side':>6s} {'½Kelly':>7s} "
-          f"{'$Size':>7s} {'$BidDp':>7s} {'$AskDp':>7s}")
-    print(f"  {'-'*125}")
+    print(f"\n  {'ET Time':>9s} {'Game':<14s} {'Model':>6s} {'Kalshi':>6s} {'Poly':>6s} {'Bid':>5s} {'Ask':>5s} "
+          f"{'Sprd':>5s} {'Edge':>6s} {'Conf':>7s} {'Side':>6s} {'½Kelly':>7s} "
+          f"{'$Size':>7s} {'Status':>10s}")
+    print(f"  {'-'*120}")
 
     total_size = 0.0
     for r in rows:
@@ -2004,22 +2058,24 @@ def print_sizing_table(target_date: str, bankroll: float = 5000.0):
 
         game = r["game"]
         model_str = f"{r['model']:.1%}"
+        kalshi_str = f"{r['kalshi']:.1%}" if r.get("kalshi") else "  ---"
         poly_str = f"{r['poly_mid']:.1%}" if r.get("poly_mid") else "  ---"
         bid_str = f"{r['poly_bid']:.2f}" if r.get("poly_bid") else " ---"
         ask_str = f"{r['poly_ask']:.2f}" if r.get("poly_ask") else " ---"
         sprd_str = f"{r['poly_spread']:.2f}" if r.get("poly_spread") else " ---"
         edge_str = f"{r['edge']:+.1%}" if r.get("edge") is not None else "  ---"
+        conf_val = r.get("confirmation")
+        conf_str = f"{conf_val:.4f}" if conf_val is not None else "  n/a"
         side_str = r.get("side", "---") or "---"
         hk_str = f"{r['half_kelly']:.1%}" if r["half_kelly"] > 0 else "  ---"
         size_str = f"${r['size_usd']:,.0f}" if r["size_usd"] > 0 else "  ---"
-        bd_str = f"${r.get('bid_depth', 0):,.0f}" if r.get("bid_depth") else "  ---"
-        ad_str = f"${r.get('ask_depth', 0):,.0f}" if r.get("ask_depth") else "  ---"
+        status_str = r.get("status", "")
 
         total_size += r.get("size_usd", 0)
 
-        print(f"  {time_str:>9s} {game:<14s} {model_str:>6s} {poly_str:>6s} {bid_str:>5s} {ask_str:>5s} "
-              f"{sprd_str:>5s} {edge_str:>6s} {side_str:>6s} {hk_str:>7s} "
-              f"{size_str:>7s} {bd_str:>7s} {ad_str:>7s}")
+        print(f"  {time_str:>9s} {game:<14s} {model_str:>6s} {kalshi_str:>6s} {poly_str:>6s} {bid_str:>5s} {ask_str:>5s} "
+              f"{sprd_str:>5s} {edge_str:>6s} {conf_str:>7s} {side_str:>6s} {hk_str:>7s} "
+              f"{size_str:>7s} {status_str:>10s}")
 
     print(f"\n  Total desired exposure: ${total_size:,.0f} / ${bankroll:,.0f} bankroll")
     print(f"  Max per game: ${bankroll * MAX_POSITION_PER_GAME:,.0f}")
@@ -2037,6 +2093,8 @@ def main():
     parser.add_argument("--sizing-only", action="store_true", help="Just print sizing table, don't run bot")
     parser.add_argument("--max-loss", type=float, default=500.0,
                         help="Kill switch: halt all trading if total P&L drops below -$X (default: 500)")
+    parser.add_argument("--confirmation-threshold", type=float, default=0.002,
+                        help="Min cross-market confirmation signal to trade (default: 0.002)")
     parser.add_argument("--debug-discovery", action="store_true",
                         help="Print full discovery chain (sports, events, books)")
     args = parser.parse_args()
@@ -2066,6 +2124,7 @@ def main():
         dry_run=args.dry_run,
         debug_discovery=args.debug_discovery,
         max_loss=args.max_loss,
+        confirmation_threshold=args.confirmation_threshold,
     )
 
     bot = MLBMarketMaker(config)
