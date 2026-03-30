@@ -8,3 +8,5 @@ pymc>=5.10
 scipy>=1.11
 pybaseball>=2.3
 httpx>=0.25
+py-clob-client>=0.9
+websockets>=12.0

@@ -8,7 +8,8 @@ half-Kelly sizing.
 
 Requires:
   - POLYMARKET_PRIVATE_KEY env var (Polygon wallet)
-  - py-clob-client + polymir packages
+  - POLYMARKET_API_KEY, POLYMARKET_API_SECRET, POLYMARKET_API_PASSPHRASE env vars
+  - py-clob-client package (pip install py-clob-client)
   - Model picks JSON (run `make picks` first)
 
 Usage:
@@ -241,7 +242,6 @@ class BotConfig:
     poll_interval_s: float = 30.0
     dry_run: bool = True
     max_games: int = 15
-    use_polymir: bool = True  # use polymir LiveClobClient for orders
     debug_discovery: bool = False
     max_loss: float = 500.0  # kill switch: halt all trading if total P&L < -max_loss
 
@@ -732,13 +732,18 @@ class FastMLBMonitor:
     Runs as a concurrent async task. On detection of a change, immediately
     sets the halt flag on the affected game so the quoting loop cancels orders
     on its next iteration (which should be near-instant since we use asyncio).
+
+    When a game transitions to Live/Final, triggers immediate order cancellation
+    via the bot's cancel method (if a bot reference is provided).
     """
 
-    def __init__(self, games: dict[str, GameState], target_date: str):
+    def __init__(self, games: dict[str, GameState], target_date: str,
+                 cancel_callback=None):
         self._games = games
         self._target_date = target_date
         self._running = False
         self._game_pks: dict[str, int] = {}  # game_key → game_pk
+        self._cancel_callback = cancel_callback  # async fn(GameState) to cancel orders
 
     async def run(self):
         """High-frequency MLB API polling loop."""
@@ -791,10 +796,12 @@ class FastMLBMonitor:
 
                     gs.game_time_utc = gs.game_time_utc or mg.get("game_time", "")
 
-                    # Game started
+                    # Game started — immediately cancel all orders
                     if mg.get("status") in ("Live", "Final"):
                         if not gs.quote_halted:
-                            print(f"\n  *** [MLB] GAME {mg['status'].upper()}: {key} → HALTING")
+                            print(f"\n  *** [MLB] GAME {mg['status'].upper()}: {key} → HALTING & CANCELLING")
+                            if self._cancel_callback:
+                                await self._cancel_callback(gs)
                         gs.quote_halted = True
                         gs.halt_reason = f"Game {mg['status']}"
 
@@ -880,7 +887,7 @@ class MLBMarketMaker:
         self._running = False
         self._killed = False  # kill switch tripped
         self._cycle_count = 0
-        self._clob_client = None  # polymir LiveClobClient or None in dry-run
+        self._clob_client = None  # py-clob-client ClobClient or None in dry-run
         self._mlb_games: list[dict] = []  # raw MLB API data for lineup checks
         self._trade_flow: TradeFlowMonitor | None = None
         self._mlb_monitor: FastMLBMonitor | None = None
@@ -1177,7 +1184,9 @@ class MLBMarketMaker:
                     continue
 
                 try:
-                    order = await self._clob_client.get_order(order_id)
+                    order = await asyncio.to_thread(
+                        self._clob_client.get_order, order_id
+                    )
                 except Exception as e:
                     _debug(f"get_order failed for {key} {side_label}: {e}")
                     continue
@@ -1306,44 +1315,55 @@ class MLBMarketMaker:
             # Place new orders
             home_token = gs.poly_market.home_token_id
 
+            neg_risk = gs.poly_market.neg_risk
+
             # Bid: buy home token at bid_price
             if not gs.bid_order_id:
                 result = await self._place_order(
-                    home_token, "BUY", bid_price, bid_size, key, "BID"
+                    home_token, "BUY", bid_price, bid_size, key, "BID", neg_risk
                 )
                 if result:
-                    gs.bid_order_id = result.get("orderID", "")
+                    gs.bid_order_id = result.get("orderID") or result.get("id", "")
                     gs.bid_price = bid_price
                     gs.bid_size = bid_size
 
             # Ask: sell home token at ask_price
             if not gs.ask_order_id:
                 result = await self._place_order(
-                    home_token, "SELL", ask_price, ask_size, key, "ASK"
+                    home_token, "SELL", ask_price, ask_size, key, "ASK", neg_risk
                 )
                 if result:
-                    gs.ask_order_id = result.get("orderID", "")
+                    gs.ask_order_id = result.get("orderID") or result.get("id", "")
                     gs.ask_price = ask_price
                     gs.ask_size = ask_size
 
     async def _place_order(
         self, token_id: str, side: str, price: float, size: float,
-        game_key: str, label: str
+        game_key: str, label: str, neg_risk: bool = False,
     ) -> dict | None:
-        """Place a single order via polymir or log in dry-run mode."""
+        """Place a single order via py-clob-client or log in dry-run mode."""
         if self.config.dry_run:
             print(f"    [DRY RUN] {game_key} {label}: {side} {size:.0f} @ {price:.2f}")
             return {"orderID": f"dry_{game_key}_{label}_{time.time():.0f}"}
 
         if self._clob_client:
             try:
-                result = await self._clob_client.place_order(
-                    token_id=token_id,
-                    side=side,
+                from py_clob_client.clob_types import OrderArgs, OrderType
+
+                order_args = OrderArgs(
                     price=price,
                     size=size,
+                    side=side,
+                    token_id=token_id,
                 )
-                order_id = result.get("orderID", "")
+                order_type = OrderType.GTC
+                result = await asyncio.to_thread(
+                    self._clob_client.create_and_post_order,
+                    order_args,
+                    order_type,
+                    neg_risk,
+                )
+                order_id = result.get("orderID") or result.get("id", "")
                 print(f"    ORDER: {game_key} {label}: {side} {size:.0f} @ {price:.2f} -> {order_id}")
                 return result
             except Exception as e:
@@ -1355,13 +1375,15 @@ class MLBMarketMaker:
         """Cancel all open orders for a game."""
         for attr in ("bid_order_id", "ask_order_id"):
             order_id = getattr(gs, attr)
-            if not order_id:
+            if not order_id or order_id.startswith("dry_"):
                 continue
             if not self.config.dry_run and self._clob_client:
                 try:
-                    await self._clob_client.cancel_order(order_id)
-                except Exception:
-                    pass
+                    await asyncio.to_thread(
+                        self._clob_client.cancel, order_id=order_id
+                    )
+                except Exception as e:
+                    _debug(f"Cancel failed for {order_id}: {e}")
             setattr(gs, attr, None)
 
         gs.bid_price = None
@@ -1511,22 +1533,35 @@ class MLBMarketMaker:
 
         # Step 4: Initialize trading client
         print("\n[4/4] Initializing trading systems...")
-        if not self.config.dry_run and self.config.use_polymir:
+        if not self.config.dry_run:
             try:
-                from polymir.config import APIConfig
-                from polymir.live_client import LiveClobClient
-                api_config = APIConfig.from_env()
-                self._clob_client = LiveClobClient(api_config)
-                await self._clob_client.__aenter__()
+                from py_clob_client.client import ClobClient
+                from py_clob_client.clob_types import ApiCreds
+
+                creds = ApiCreds(
+                    api_key=os.environ["POLYMARKET_API_KEY"],
+                    api_secret=os.environ["POLYMARKET_API_SECRET"],
+                    api_passphrase=os.environ["POLYMARKET_API_PASSPHRASE"],
+                )
+                self._clob_client = ClobClient(
+                    host="https://clob.polymarket.com",
+                    key=os.environ["POLYMARKET_PRIVATE_KEY"],
+                    chain_id=137,
+                    creds=creds,
+                )
                 print("  Connected to Polymarket CLOB (live trading)")
             except Exception as e:
-                print(f"  WARNING: Could not init live client: {e}")
+                print(f"  WARNING: Could not init CLOB client: {e}")
                 print("  Falling back to dry-run mode")
                 self.config.dry_run = True
+                self._clob_client = None
 
         # Launch concurrent risk monitors
         self._trade_flow = TradeFlowMonitor(self.games)
-        self._mlb_monitor = FastMLBMonitor(self.games, self.config.target_date)
+        self._mlb_monitor = FastMLBMonitor(
+            self.games, self.config.target_date,
+            cancel_callback=self._cancel_game_orders,
+        )
         self._wind_down = PrePitchWindDown(self.games)
 
         monitor_tasks = []
@@ -1556,6 +1591,15 @@ class MLBMarketMaker:
                 if self._killed:
                     break
 
+                # Auto-shutdown: if every game is done or in-progress, exit
+                all_done = all(
+                    gs.quote_halted or gs.poly_market is None
+                    for gs in self.games.values()
+                )
+                if all_done and self._cycle_count > 1:
+                    print("\n  All games started or halted. Shutting down.")
+                    break
+
                 # Wait
                 await asyncio.sleep(self.config.poll_interval_s)
 
@@ -1574,9 +1618,6 @@ class MLBMarketMaker:
             print("  Cancelling all open orders...")
             for gs in self.games.values():
                 await self._cancel_game_orders(gs)
-
-            if self._clob_client and not self.config.dry_run:
-                await self._clob_client.__aexit__(None, None, None)
 
             print("  Bot stopped.")
 
@@ -1779,6 +1820,16 @@ def main():
     if args.sizing_only:
         print_sizing_table(args.date, args.bankroll)
         return
+
+    # Validate env vars for live trading
+    if not args.dry_run:
+        required = ["POLYMARKET_PRIVATE_KEY", "POLYMARKET_API_KEY",
+                     "POLYMARKET_API_SECRET", "POLYMARKET_API_PASSPHRASE"]
+        missing = [v for v in required if not os.environ.get(v)]
+        if missing:
+            print(f"ERROR: Missing env vars for live trading: {', '.join(missing)}")
+            print("Set these or use --dry-run")
+            sys.exit(1)
 
     config = BotConfig(
         target_date=args.date,
