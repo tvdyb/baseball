@@ -73,17 +73,18 @@ def _check_file_freshness(path: Path, max_age_hours: float = MAX_DATA_AGE_HOURS,
 
 
 def validate_live_data_freshness(target_date: str, max_age_hours: float = MAX_DATA_AGE_HOURS):
-    """Validate that all parquet files needed for live prediction are fresh.
+    """Validate that all data files needed for live prediction are fresh.
 
-    Checks:
-      - xRV for current + prior year
-      - Games file for current year (for team history/form)
+    Two-level check:
+      1. File mtime: parquet files must have been written within max_age_hours
+      2. Content currency: games file must contain data through yesterday at minimum
 
-    Raises StaleDataError with actionable message if any file is stale.
+    Raises StaleDataError with actionable message if any check fails.
     """
     year = int(target_date[:4])
     issues = []
 
+    # ── mtime checks ──
     for yr in [year - 1, year]:
         xrv_path = XRV_DIR / f"statcast_xrv_{yr}.parquet"
         if xrv_path.exists():
@@ -93,7 +94,6 @@ def validate_live_data_freshness(target_date: str, max_age_hours: float = MAX_DA
             except StaleDataError as e:
                 issues.append(str(e))
         elif yr == year:
-            # Current-year xRV is optional early in the season
             print(f"  xRV {yr}: not found (OK if early in season)")
         else:
             issues.append(f"Prior-year xRV ({yr}) not found: {xrv_path}")
@@ -105,6 +105,22 @@ def validate_live_data_freshness(target_date: str, max_age_hours: float = MAX_DA
             print(f"  Games {year}: {age:.1f}h old ✓")
         except StaleDataError as e:
             issues.append(str(e))
+
+        # ── Content currency check: games file should cover through yesterday ──
+        try:
+            games_df = pd.read_parquet(games_path, columns=["game_date"])
+            if len(games_df) > 0:
+                latest = str(games_df["game_date"].max())
+                yesterday = (date.today() - __import__("datetime").timedelta(days=2)).isoformat()
+                if latest < yesterday:
+                    issues.append(
+                        f"Games {year} data ends at {latest}, expected through at least "
+                        f"{yesterday}. Run: make scrape-games"
+                    )
+                else:
+                    print(f"  Games {year}: data through {latest} ✓")
+        except Exception as e:
+            issues.append(f"Could not read games file for content check: {e}")
     else:
         print(f"  Games {year}: not found (OK for opening day)")
 
@@ -550,9 +566,17 @@ def build_live_features(
         row["home_team_games_played"] = len(team_history.get(home_team, []))
         row["away_team_games_played"] = len(team_history.get(away_team, []))
 
-        # Tag lineup status so downstream can decide to suppress trades
-        row["_lineup_home_status"] = lineup.get("home_status", LineupStatus.NOT_POSTED)
-        row["_lineup_away_status"] = lineup.get("away_status", LineupStatus.NOT_POSTED)
+        # Tag lineup status so downstream can suppress trades on degraded games
+        home_st = lineup.get("home_status", LineupStatus.NOT_POSTED)
+        away_st = lineup.get("away_status", LineupStatus.NOT_POSTED)
+        row["_lineup_home_status"] = home_st
+        row["_lineup_away_status"] = away_st
+
+        # Suppress game if either side had an API or parse error
+        # NOT_POSTED is fine (normal pre-game), but errors mean we can't trust features
+        is_error = home_st in (LineupStatus.API_ERROR, LineupStatus.PARSE_ERROR) or \
+                   away_st in (LineupStatus.API_ERROR, LineupStatus.PARSE_ERROR)
+        row["_lineup_degraded"] = is_error
 
         feature_rows.append(row)
         display_meta.append({

@@ -228,8 +228,8 @@ def generate_picks(target_date: str, lr_only: bool = False) -> pd.DataFrame:
         features_df, w_lr, train_medians,
     )
 
-    # Attach SP names and confidence
-    for col in ["home_sp_name", "away_sp_name", "game_time", "status"]:
+    # Attach SP names, confidence, and lineup degradation flag
+    for col in ["home_sp_name", "away_sp_name", "game_time", "status", "_lineup_degraded"]:
         if col in features_df.columns:
             results[col] = features_df[col].values
     if "home_sp_info_confidence" in features_df.columns:
@@ -425,6 +425,7 @@ def save_picks(picks: pd.DataFrame, target_date: str):
             "quote_bid": round(float(r["quote_bid"]), 4),
             "quote_ask": round(float(r["quote_ask"]), 4),
             "market_ticker": r.get("market_ticker", ""),
+            "lineup_degraded": bool(r.get("_lineup_degraded", False)),
         }
         records.append(rec)
 

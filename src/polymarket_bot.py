@@ -955,9 +955,10 @@ class MLBMarketMaker:
         with open(picks_path) as f:
             data = json.load(f)
 
+        degraded = 0
         for p in data.get("picks", []):
             key = self._game_key(p["home_team"], p["away_team"])
-            self.games[key] = GameState(
+            gs = GameState(
                 home_team=p["home_team"],
                 away_team=p["away_team"],
                 model_fair=p["model_fair"],
@@ -965,7 +966,17 @@ class MLBMarketMaker:
                 away_sp=p.get("away_sp", ""),
             )
 
+            # Suppress trading on games with degraded lineup data
+            if p.get("lineup_degraded", False):
+                gs.quote_halted = True
+                gs.halt_reason = "lineup error"
+                degraded += 1
+
+            self.games[key] = gs
+
         print(f"  Loaded {len(self.games)} game picks")
+        if degraded > 0:
+            print(f"  WARNING: {degraded} games suppressed due to lineup fetch errors")
         return len(self.games)
 
     def match_poly_markets(self, poly_markets: list[PolyMarket]) -> int:
@@ -1426,9 +1437,9 @@ class MLBMarketMaker:
         """Cancel all open orders for a game."""
         for attr in ("bid_order_id", "ask_order_id"):
             order_id = getattr(gs, attr)
-            if not order_id or order_id.startswith("dry_"):
+            if not order_id:
                 continue
-            if not self.config.dry_run and self._clob_client:
+            if not order_id.startswith("dry_") and not self.config.dry_run and self._clob_client:
                 try:
                     await asyncio.to_thread(
                         self._clob_client.cancel, order_id
