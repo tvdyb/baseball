@@ -21,8 +21,8 @@ Usage:
     # Only trade strong-conviction games
     python src/polymarket_bot.py --date 2026-03-30 --min-edge 0.05
 
-    # Custom poll interval
-    python src/polymarket_bot.py --date 2026-03-30 --interval 30
+    # Debug market discovery chain
+    python src/polymarket_bot.py --date 2026-03-30 --sizing-only --debug-discovery
 """
 
 from __future__ import annotations
@@ -58,6 +58,31 @@ MIN_EDGE_TO_QUOTE = 0.01        # don't quote if edge < 1%
 TICK_SIZE = 0.01                 # Polymarket cent precision
 MAX_POSITION_PER_GAME = 0.10    # max 10% of bankroll per game
 
+# Risk management: volume spike detection
+VOL_SPIKE_WINDOW_S = 30         # rolling window for volume tracking
+VOL_SPIKE_THRESHOLD = 500       # contracts traded in window → pull quotes
+VOL_SPIKE_COOLDOWN_S = 60       # stay pulled for this long after spike
+
+# Risk management: pre-pitch wind-down
+WIDEN_SPREAD_MINS = 30          # widen spreads this many min before first pitch
+PULL_QUOTES_MINS = 10           # pull all quotes this many min before first pitch
+
+# Risk management: adverse selection / fill tracking
+MAX_CONSECUTIVE_FILLS = 3       # if same side fills 3x in a row → pull & reprice
+POSITION_LIMIT_CONTRACTS = 0    # 0 = use Kelly sizing, >0 = hard cap per game
+
+# Fast MLB monitoring
+MLB_FAST_POLL_S = 8             # poll MLB API every 8s for SP/lineup changes
+
+# Global debug flag (set by --debug-discovery)
+DEBUG_DISCOVERY = False
+
+
+def _debug(msg: str):
+    """Print debug message if debug mode is enabled."""
+    if DEBUG_DISCOVERY:
+        print(f"  [DEBUG] {msg}")
+
 
 # ── Data Models ────────────────────────────────────────────────────────────────
 
@@ -72,6 +97,11 @@ class PolyMarket:
     condition_id: str
     question: str
     volume: float = 0.0
+    # Gamma-level price hints (may be stale, use CLOB book as source of truth)
+    gamma_best_bid: float | None = None
+    gamma_best_ask: float | None = None
+    neg_risk: bool = False
+    accepting_orders: bool = True
 
 
 @dataclass
@@ -89,6 +119,9 @@ class GameState:
     poly_home_bid: float | None = None  # best bid for home token
     poly_home_ask: float | None = None  # best ask for home token
     poly_home_mid: float | None = None
+    poly_spread: float | None = None
+    poly_bid_depth: float = 0.0  # $ depth at top 5 levels
+    poly_ask_depth: float = 0.0
     poly_volume: float = 0.0
 
     # Lineup tracking
@@ -106,7 +139,14 @@ class GameState:
     ask_price: float | None = None
     bid_size: float = 0.0
     ask_size: float = 0.0
+    bid_filled: float = 0.0   # how much of current bid order has filled
+    ask_filled: float = 0.0   # how much of current ask order has filled
     net_position: float = 0.0  # +ve = long home, -ve = short home (long away)
+
+    # P&L tracking (from confirmed fills)
+    realized_pnl: float = 0.0    # realized P&L from round-trip fills
+    cost_basis: float = 0.0      # total $ spent on current position
+    fill_history: list = field(default_factory=list)  # [{side, price, size, ts}]
 
     # Computed
     edge: float = 0.0
@@ -116,13 +156,60 @@ class GameState:
     quote_halted: bool = False  # halt on SP change until model re-runs
     halt_reason: str = ""
 
+    # Risk management: trade flow / volume spike
+    recent_trades: list = field(default_factory=list)  # [(timestamp, size, side)]
+    vol_spike_until: float = 0.0  # unix timestamp when cooldown expires
+    last_mid: float | None = None  # for mid-move detection
+    mid_move_3s: float = 0.0      # mid price change over last snapshot
+
+    # Risk management: fill tracking / adverse selection
+    consecutive_bid_fills: int = 0
+    consecutive_ask_fills: int = 0
+    total_bought: float = 0.0    # contracts bought (home token)
+    total_sold: float = 0.0      # contracts sold (home token)
+    adverse_halted: bool = False
+    adverse_halt_until: float = 0.0  # unix ts
+
+    # Risk management: pre-pitch wind-down
+    spread_widened: bool = False
+    pre_pitch_pulled: bool = False
+
     @property
     def lineups_confirmed(self) -> bool:
         return self.home_lineup_confirmed and self.away_lineup_confirmed
 
     @property
     def half_spread(self) -> float:
+        if self.spread_widened:
+            return PRE_LINEUP_HALF_SPREAD * 1.5  # 4.5¢ in wind-down zone
         return POST_LINEUP_HALF_SPREAD if self.lineups_confirmed else PRE_LINEUP_HALF_SPREAD
+
+    @property
+    def is_vol_spiking(self) -> bool:
+        return time.time() < self.vol_spike_until
+
+    @property
+    def is_adverse_halted(self) -> bool:
+        return self.adverse_halted and time.time() < self.adverse_halt_until
+
+    @property
+    def minutes_to_first_pitch(self) -> float | None:
+        """Minutes until game start. None if unknown."""
+        if not self.game_time_utc:
+            return None
+        try:
+            gst = self.game_time_utc
+            if gst.endswith("Z"):
+                gst = gst.replace("Z", "+00:00")
+            elif " " in gst and "T" not in gst:
+                gst = gst.replace(" ", "T", 1)
+            if gst.endswith("+00"):
+                gst += ":00"
+            dt = datetime.fromisoformat(gst)
+            delta = (dt - datetime.now(timezone.utc)).total_seconds() / 60
+            return delta
+        except (ValueError, TypeError):
+            return None
 
     @property
     def game_time_et(self) -> str:
@@ -130,7 +217,15 @@ class GameState:
         if not self.game_time_utc:
             return "TBD"
         try:
-            dt = datetime.fromisoformat(self.game_time_utc.replace("Z", "+00:00"))
+            gst = self.game_time_utc
+            if gst.endswith("Z"):
+                gst = gst.replace("Z", "+00:00")
+            elif "+" not in gst and gst[-3:-2] != "-":
+                # Handle Polymarket format "2026-03-30 20:10:00+00"
+                gst = gst.replace(" ", "T") if "T" not in gst else gst
+                if gst.endswith("+00"):
+                    gst += ":00"
+            dt = datetime.fromisoformat(gst)
             et = dt - timedelta(hours=4)  # EDT offset
             return et.strftime("%-I:%M%p ET")
         except (ValueError, TypeError):
@@ -147,23 +242,75 @@ class BotConfig:
     dry_run: bool = True
     max_games: int = 15
     use_polymir: bool = True  # use polymir LiveClobClient for orders
+    debug_discovery: bool = False
+    max_loss: float = 500.0  # kill switch: halt all trading if total P&L < -max_loss
 
 
 # ── Polymarket Market Discovery ────────────────────────────────────────────────
 
+def discover_mlb_series_id() -> str | None:
+    """Discover MLB series_id dynamically from /sports endpoint."""
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            resp = client.get(f"{GAMMA_API}/sports")
+            resp.raise_for_status()
+            sports = resp.json()
+
+        for s in sports:
+            if s.get("sport", "").lower() == "mlb":
+                series_id = str(s.get("series", ""))
+                tags = s.get("tags", "")
+                _debug(f"/sports → MLB: series={series_id}, tags={tags}")
+                return series_id
+
+        _debug(f"/sports → MLB not found in {len(sports)} sports")
+    except Exception as e:
+        _debug(f"/sports failed: {e}")
+    return None
+
+
+def _json_parse(val):
+    """Safely parse a JSON-encoded string field (clobTokenIds, outcomes, etc.)."""
+    if isinstance(val, str):
+        try:
+            return json.loads(val)
+        except (json.JSONDecodeError, TypeError):
+            return []
+    return val if isinstance(val, list) else []
+
+
 def fetch_poly_mlb_markets(target_date: str) -> list[PolyMarket]:
-    """Fetch active Polymarket MLB game markets for the target date."""
+    """Fetch active Polymarket MLB moneyline game markets for the target date.
+
+    Discovery chain:
+      1. GET /sports → find MLB series_id
+      2. GET /events?series_id=...&active=true&closed=false → all active MLB events
+      3. Filter markets by: gameStartTime matches target_date, sportsMarketType=moneyline,
+         2 team outcomes, acceptingOrders=true
+      4. Parse clobTokenIds via json.loads (they're JSON strings)
+    """
+    # Step 1: Discover series_id
+    series_id = discover_mlb_series_id()
+    if not series_id:
+        print("  WARNING: Could not discover MLB series_id from /sports, falling back to series_id=3")
+        series_id = "3"
+
+    # Step 2: Fetch all active MLB events
     markets = []
     offset = 0
+    total_events = 0
+    total_markets_scanned = 0
 
     with httpx.Client(timeout=30.0) as client:
         while True:
             params = {
-                "tag_slug": "mlb",
+                "series_id": series_id,
                 "active": "true",
                 "closed": "false",
                 "limit": 100,
                 "offset": offset,
+                "order": "startTime",
+                "ascending": "true",
             }
             resp = client.get(f"{GAMMA_API}/events", params=params)
             resp.raise_for_status()
@@ -172,20 +319,38 @@ def fetch_poly_mlb_markets(target_date: str) -> list[PolyMarket]:
             if not events:
                 break
 
+            total_events += len(events)
+
             for event in events:
                 title = event.get("title", "")
-                # Skip futures, props, etc.
+
+                # Skip futures, props, series-level markets
                 skip_words = [
                     "Series Winner", "Champion", "MVP", "Cy Young",
                     "Division", "Home Run", "sweep", "record", "props",
+                    "CBA", "sale", "Jersey",
                 ]
                 if any(w.lower() in title.lower() for w in skip_words):
+                    _debug(f"SKIP event (title filter): {title}")
                     continue
 
                 for mkt in event.get("markets", []):
-                    outcomes = mkt.get("outcomes", [])
-                    if isinstance(outcomes, str):
-                        outcomes = json.loads(outcomes)
+                    total_markets_scanned += 1
+
+                    # Filter: must be a moneyline game market
+                    smt = mkt.get("sportsMarketType", "")
+                    if smt and smt != "moneyline":
+                        continue
+
+                    # Filter: must be accepting orders and not closed
+                    if mkt.get("closed", False):
+                        continue
+                    if not mkt.get("acceptingOrders", True):
+                        _debug(f"SKIP market (not accepting orders): {mkt.get('question', '')}")
+                        continue
+
+                    # Filter: must have exactly 2 team outcomes
+                    outcomes = _json_parse(mkt.get("outcomes", []))
                     if len(outcomes) != 2:
                         continue
                     if "Yes" in outcomes or "No" in outcomes:
@@ -194,38 +359,58 @@ def fetch_poly_mlb_markets(target_date: str) -> list[PolyMarket]:
                     t0 = resolve_team_abbr(outcomes[0])
                     t1 = resolve_team_abbr(outcomes[1])
                     if not t0 or not t1 or t0 == t1:
+                        _debug(f"SKIP market (team resolve failed): outcomes={outcomes}")
                         continue
 
-                    # Check date
+                    # Filter: game date must match target
                     game_date = _parse_game_date(event, mkt)
                     if game_date != target_date:
                         continue
 
-                    clob_ids = mkt.get("clobTokenIds", [])
-                    if isinstance(clob_ids, str) and clob_ids:
-                        clob_ids = json.loads(clob_ids)
+                    # Parse clobTokenIds (JSON string!)
+                    clob_ids = _json_parse(mkt.get("clobTokenIds", []))
                     if len(clob_ids) != 2:
+                        _debug(f"SKIP market (bad clobTokenIds): {mkt.get('clobTokenIds')}")
                         continue
 
-                    # t0 maps to clob_ids[0], t1 maps to clob_ids[1]
-                    # We need to figure out which is home/away
-                    # We'll resolve this later when matching to model picks
-                    markets.append(PolyMarket(
-                        home_team=t0,  # tentative — will fix in matching
+                    neg_risk = bool(mkt.get("negRisk", False))
+
+                    # Extract Gamma-level price hints
+                    gamma_bid = mkt.get("bestBid")
+                    gamma_ask = mkt.get("bestAsk")
+                    try:
+                        gamma_bid = float(gamma_bid) if gamma_bid else None
+                        gamma_ask = float(gamma_ask) if gamma_ask else None
+                    except (ValueError, TypeError):
+                        gamma_bid = gamma_ask = None
+
+                    pm = PolyMarket(
+                        home_team=t0,  # tentative — resolved in matching
                         away_team=t1,
                         home_token_id=clob_ids[0],
                         away_token_id=clob_ids[1],
                         game_start_time=mkt.get("gameStartTime", ""),
                         condition_id=mkt.get("conditionId", mkt.get("condition_id", "")),
-                        question=mkt.get("question", ""),
+                        question=mkt.get("question", title),
                         volume=float(mkt.get("volumeNum") or mkt.get("volume") or 0),
-                    ))
+                        gamma_best_bid=gamma_bid,
+                        gamma_best_ask=gamma_ask,
+                        neg_risk=neg_risk,
+                        accepting_orders=True,
+                    )
+                    markets.append(pm)
+
+                    _debug(f"FOUND: {t0} vs {t1} | date={game_date} | "
+                           f"gammaBid={gamma_bid} gammaAsk={gamma_ask} | "
+                           f"negRisk={neg_risk} | vol=${pm.volume:,.0f} | "
+                           f"tokens=[{clob_ids[0][:20]}..., {clob_ids[1][:20]}...]")
 
             if len(events) < 100:
                 break
             offset += 100
 
-    print(f"  Found {len(markets)} Polymarket MLB game markets for {target_date}")
+    print(f"  Discovery: scanned {total_events} events, {total_markets_scanned} markets → "
+          f"found {len(markets)} moneyline games for {target_date}")
     return markets
 
 
@@ -234,47 +419,105 @@ def _parse_game_date(event: dict, market: dict) -> str:
     gst = market.get("gameStartTime")
     if gst:
         try:
-            dt = datetime.fromisoformat(gst.replace("Z", "+00:00") if gst.endswith("Z") else gst)
+            # Handle formats: "2026-03-30T20:10:00Z" and "2026-03-30 20:10:00+00"
+            gst_clean = gst.replace("Z", "+00:00") if gst.endswith("Z") else gst
+            if " " in gst_clean and "T" not in gst_clean:
+                gst_clean = gst_clean.replace(" ", "T", 1)
+            if gst_clean.endswith("+00"):
+                gst_clean += ":00"
+            dt = datetime.fromisoformat(gst_clean)
             return dt.strftime("%Y-%m-%d")
         except (ValueError, TypeError):
             pass
     end = market.get("endDate") or event.get("endDate")
     if end:
         try:
-            dt = datetime.fromisoformat(end.replace("Z", "+00:00") if end.endswith("Z") else end)
+            end_clean = end.replace("Z", "+00:00") if end.endswith("Z") else end
+            dt = datetime.fromisoformat(end_clean)
             return dt.strftime("%Y-%m-%d")
         except (ValueError, TypeError):
             pass
     return ""
 
 
+# ── CLOB Orderbook Fetching ───────────────────────────────────────────────────
+
 def fetch_orderbook(client: httpx.Client, token_id: str) -> dict:
-    """Fetch CLOB orderbook for a token. Returns {bids, asks, midpoint, spread}."""
+    """Fetch CLOB orderbook for a token.
+
+    IMPORTANT: The CLOB /book endpoint returns bids in ascending price order
+    and asks in descending price order. We must sort to find the real
+    top-of-book: best bid = highest bid, best ask = lowest ask.
+
+    Returns {best_bid, best_ask, midpoint, spread, bid_depth, ask_depth}.
+    """
     try:
         resp = client.get(f"{CLOB_API}/book", params={"token_id": token_id})
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
-        return {"bids": [], "asks": [], "midpoint": None, "spread": None, "error": str(e)}
+        return {"best_bid": None, "best_ask": None, "midpoint": None,
+                "spread": None, "error": str(e)}
 
-    bids = [(float(b["price"]), float(b["size"])) for b in data.get("bids", [])]
-    asks = [(float(a["price"]), float(a["size"])) for a in data.get("asks", [])]
+    if "error" in data:
+        return {"best_bid": None, "best_ask": None, "midpoint": None,
+                "spread": None, "error": data["error"]}
+
+    raw_bids = data.get("bids", [])
+    raw_asks = data.get("asks", [])
+
+    # Sort bids descending (highest first), asks ascending (lowest first)
+    bids = sorted(
+        [(float(b["price"]), float(b["size"])) for b in raw_bids],
+        key=lambda x: x[0],
+        reverse=True,
+    )
+    asks = sorted(
+        [(float(a["price"]), float(a["size"])) for a in raw_asks],
+        key=lambda x: x[0],
+    )
 
     best_bid = bids[0][0] if bids else None
     best_ask = asks[0][0] if asks else None
-    mid = (best_bid + best_ask) / 2 if best_bid and best_ask else None
-    spread = (best_ask - best_bid) if best_bid and best_ask else None
+
+    # Compute midpoint and spread from top-of-book
+    if best_bid is not None and best_ask is not None:
+        mid = (best_bid + best_ask) / 2
+        spread = best_ask - best_bid
+    else:
+        mid = None
+        spread = None
+
+    # Depth: sum $ value (price * size) of top 5 levels
+    bid_depth = sum(p * s for p, s in bids[:5]) if bids else 0.0
+    ask_depth = sum(p * s for p, s in asks[:5]) if asks else 0.0
 
     return {
-        "bids": bids,
-        "asks": asks,
         "best_bid": best_bid,
         "best_ask": best_ask,
         "midpoint": mid,
         "spread": spread,
-        "bid_depth": sum(s for _, s in bids[:5]),
-        "ask_depth": sum(s for _, s in asks[:5]),
+        "bid_depth": bid_depth,
+        "ask_depth": ask_depth,
+        "n_bid_levels": len(bids),
+        "n_ask_levels": len(asks),
     }
+
+
+def fetch_clob_midpoint(client: httpx.Client, token_id: str) -> float | None:
+    """Fetch CLOB midpoint for a token (cross-check with orderbook).
+
+    The /midpoint endpoint aggregates both the direct book and the complement
+    token book, so it may differ from the raw orderbook midpoint.
+    """
+    try:
+        resp = client.get(f"{CLOB_API}/midpoint", params={"token_id": token_id})
+        resp.raise_for_status()
+        data = resp.json()
+        mid = data.get("mid")
+        return float(mid) if mid else None
+    except Exception:
+        return None
 
 
 # ── MLB API Monitoring ─────────────────────────────────────────────────────────
@@ -369,6 +612,263 @@ def round_to_tick(price: float) -> float:
     return round(round(price / TICK_SIZE) * TICK_SIZE, 2)
 
 
+# ── Risk Management: Volume Spike Detection ───────────────────────────────────
+
+class TradeFlowMonitor:
+    """Monitors Polymarket WebSocket trade feed for volume spikes.
+
+    When trade volume in a rolling window exceeds the threshold for any game,
+    it triggers an immediate quote pull for that game. This protects against
+    adverse selection when informed flow hits the book.
+
+    Runs as a concurrent async task alongside the main bot loop.
+    """
+
+    def __init__(self, games: dict[str, GameState]):
+        self._games = games
+        self._token_to_game: dict[str, str] = {}  # token_id → game_key
+        self._running = False
+        self._ws = None
+
+    def build_token_map(self):
+        """Map token IDs to game keys for fast lookup on trade events."""
+        self._token_to_game.clear()
+        for key, gs in self._games.items():
+            if gs.poly_market:
+                self._token_to_game[gs.poly_market.home_token_id] = key
+                self._token_to_game[gs.poly_market.away_token_id] = key
+
+    async def run(self):
+        """Connect to WS and monitor trade flow. Pull quotes on volume spikes."""
+        self.build_token_map()
+        if not self._token_to_game:
+            return
+
+        token_ids = list(self._token_to_game.keys())
+        self._running = True
+
+        try:
+            import websockets
+        except ImportError:
+            print("  WARNING: websockets not installed, trade flow monitoring disabled")
+            return
+
+        ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+
+        while self._running:
+            try:
+                async with websockets.connect(ws_url) as ws:
+                    self._ws = ws
+                    # Subscribe to all game tokens
+                    sub_msg = json.dumps({
+                        "type": "subscribe",
+                        "assets_ids": token_ids,
+                    })
+                    await ws.send(sub_msg)
+                    print(f"  [FLOW] WebSocket connected, monitoring {len(token_ids)} tokens")
+
+                    async for raw in ws:
+                        if not self._running:
+                            break
+                        try:
+                            data = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
+
+                        # Process trade messages
+                        msg_type = data.get("type", "")
+                        if msg_type not in ("trade", "last_trade_price"):
+                            continue
+
+                        trades = data.get("trades", [data]) if "trades" in data else [data]
+                        for t in trades:
+                            self._process_trade(t)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                if self._running:
+                    print(f"  [FLOW] WebSocket error: {e}, reconnecting in 5s...")
+                    await asyncio.sleep(5)
+
+    def _process_trade(self, trade: dict):
+        """Process a single trade event and check for volume spikes."""
+        asset_id = trade.get("asset_id", trade.get("market", ""))
+        game_key = self._token_to_game.get(asset_id)
+        if not game_key:
+            return
+
+        gs = self._games.get(game_key)
+        if not gs:
+            return
+
+        now = time.time()
+        size = float(trade.get("size", 0))
+        side = trade.get("side", "")
+
+        # Record trade
+        gs.recent_trades.append((now, size, side))
+
+        # Trim old trades outside window
+        cutoff = now - VOL_SPIKE_WINDOW_S
+        gs.recent_trades = [(t, s, sd) for t, s, sd in gs.recent_trades if t > cutoff]
+
+        # Check total volume in window
+        window_vol = sum(s for _, s, _ in gs.recent_trades)
+
+        if window_vol >= VOL_SPIKE_THRESHOLD and not gs.is_vol_spiking:
+            gs.vol_spike_until = now + VOL_SPIKE_COOLDOWN_S
+            print(f"\n  *** VOL SPIKE: {game_key} — {window_vol:.0f} contracts in {VOL_SPIKE_WINDOW_S}s → PULLING QUOTES")
+
+    def stop(self):
+        self._running = False
+
+
+# ── Risk Management: Fast MLB Monitoring ──────────────────────────────────────
+
+class FastMLBMonitor:
+    """Polls MLB API at high frequency for SP changes and lineup drops.
+
+    Runs as a concurrent async task. On detection of a change, immediately
+    sets the halt flag on the affected game so the quoting loop cancels orders
+    on its next iteration (which should be near-instant since we use asyncio).
+    """
+
+    def __init__(self, games: dict[str, GameState], target_date: str):
+        self._games = games
+        self._target_date = target_date
+        self._running = False
+        self._game_pks: dict[str, int] = {}  # game_key → game_pk
+
+    async def run(self):
+        """High-frequency MLB API polling loop."""
+        self._running = True
+        cycle = 0
+        print(f"  [MLB] Fast monitor started (poll every {MLB_FAST_POLL_S}s)")
+
+        while self._running:
+            try:
+                await asyncio.sleep(MLB_FAST_POLL_S)
+                cycle += 1
+
+                # Fetch schedule (SP + status)
+                mlb_games = await asyncio.to_thread(
+                    fetch_mlb_game_status, self._target_date
+                )
+
+                for mg in mlb_games:
+                    key = f"{mg['away_team']}@{mg['home_team']}"
+                    gs = self._games.get(key)
+                    if not gs:
+                        continue
+
+                    # Cache game_pk for lineup checks
+                    if mg.get("game_pk"):
+                        self._game_pks[key] = mg["game_pk"]
+
+                    # SP change detection
+                    new_home_sp = mg.get("home_sp", "")
+                    new_away_sp = mg.get("away_sp", "")
+
+                    if gs.last_home_sp and new_home_sp and new_home_sp != gs.last_home_sp:
+                        print(f"\n  *** [MLB] SP CHANGE: {key} home: "
+                              f"{gs.last_home_sp} → {new_home_sp} → HALTING")
+                        gs.quote_halted = True
+                        gs.halt_reason = f"SP: {new_home_sp}"
+
+                    if gs.last_away_sp and new_away_sp and new_away_sp != gs.last_away_sp:
+                        print(f"\n  *** [MLB] SP CHANGE: {key} away: "
+                              f"{gs.last_away_sp} → {new_away_sp} → HALTING")
+                        gs.quote_halted = True
+                        gs.halt_reason = f"SP: {new_away_sp}"
+
+                    gs.last_home_sp = new_home_sp or gs.last_home_sp
+                    gs.last_away_sp = new_away_sp or gs.last_away_sp
+                    if new_home_sp:
+                        gs.home_sp_confirmed = True
+                    if new_away_sp:
+                        gs.away_sp_confirmed = True
+
+                    gs.game_time_utc = gs.game_time_utc or mg.get("game_time", "")
+
+                    # Game started
+                    if mg.get("status") in ("Live", "Final"):
+                        if not gs.quote_halted:
+                            print(f"\n  *** [MLB] GAME {mg['status'].upper()}: {key} → HALTING")
+                        gs.quote_halted = True
+                        gs.halt_reason = f"Game {mg['status']}"
+
+                # Lineup checks (every 3rd cycle to limit API calls)
+                if cycle % 3 == 0:
+                    for key, game_pk in self._game_pks.items():
+                        gs = self._games.get(key)
+                        if not gs or gs.lineups_confirmed:
+                            continue
+
+                        status = await asyncio.to_thread(check_lineup_status, game_pk)
+                        if status.get("home_lineup") and not gs.home_lineup_confirmed:
+                            gs.home_lineup_confirmed = True
+                            print(f"  [MLB] LINEUP: {key} home lineup confirmed")
+                        if status.get("away_lineup") and not gs.away_lineup_confirmed:
+                            gs.away_lineup_confirmed = True
+                            print(f"  [MLB] LINEUP: {key} away lineup confirmed")
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print(f"  [MLB] Monitor error: {e}")
+                await asyncio.sleep(5)
+
+    def stop(self):
+        self._running = False
+
+
+# ── Risk Management: Pre-Pitch Wind-Down ──────────────────────────────────────
+
+class PrePitchWindDown:
+    """Monitors time-to-first-pitch and progressively reduces exposure.
+
+    - WIDEN_SPREAD_MINS before pitch: widen spreads (set spread_widened flag)
+    - PULL_QUOTES_MINS before pitch: pull all quotes (set pre_pitch_pulled flag)
+    - After first pitch: halt (handled by FastMLBMonitor game status check)
+    """
+
+    def __init__(self, games: dict[str, GameState]):
+        self._games = games
+        self._running = False
+
+    async def run(self):
+        self._running = True
+        while self._running:
+            try:
+                await asyncio.sleep(10)  # check every 10s
+
+                for key, gs in self._games.items():
+                    mins = gs.minutes_to_first_pitch
+                    if mins is None:
+                        continue
+
+                    # Progressive wind-down
+                    if mins <= PULL_QUOTES_MINS and not gs.pre_pitch_pulled:
+                        gs.pre_pitch_pulled = True
+                        gs.quote_halted = True
+                        gs.halt_reason = f"<{PULL_QUOTES_MINS}m to pitch"
+                        print(f"\n  *** [RISK] PRE-PITCH PULL: {key} — "
+                              f"{mins:.0f}min to first pitch → PULLING ALL QUOTES")
+
+                    elif mins <= WIDEN_SPREAD_MINS and not gs.spread_widened:
+                        gs.spread_widened = True
+                        print(f"  [RISK] WIDEN: {key} — {mins:.0f}min to pitch → widening spreads")
+
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                await asyncio.sleep(5)
+
+    def stop(self):
+        self._running = False
+
+
 # ── Core Bot ───────────────────────────────────────────────────────────────────
 
 class MLBMarketMaker:
@@ -376,11 +876,15 @@ class MLBMarketMaker:
 
     def __init__(self, config: BotConfig):
         self.config = config
-        self.games: dict[str, GameState] = {}  # keyed by "HOME_AWAY"
+        self.games: dict[str, GameState] = {}  # keyed by "AWAY@HOME"
         self._running = False
+        self._killed = False  # kill switch tripped
         self._cycle_count = 0
         self._clob_client = None  # polymir LiveClobClient or None in dry-run
         self._mlb_games: list[dict] = []  # raw MLB API data for lineup checks
+        self._trade_flow: TradeFlowMonitor | None = None
+        self._mlb_monitor: FastMLBMonitor | None = None
+        self._wind_down: PrePitchWindDown | None = None
 
     def _game_key(self, home: str, away: str) -> str:
         return f"{away}@{home}"
@@ -411,10 +915,15 @@ class MLBMarketMaker:
         return len(self.games)
 
     def match_poly_markets(self, poly_markets: list[PolyMarket]) -> int:
-        """Match Polymarket markets to model picks, resolving home/away orientation."""
+        """Match Polymarket markets to model picks, resolving home/away orientation.
+
+        Polymarket outcomes list teams as [team_A, team_B] where team_A is
+        typically the away team (Polymarket uses "away @ home" ordering from
+        the /sports endpoint). We match by team pair regardless of order.
+        """
         matched = 0
         for pm in poly_markets:
-            # Try both orientations
+            # Try both orientations: pm might have (away, home) or (home, away)
             key1 = self._game_key(pm.home_team, pm.away_team)
             key2 = self._game_key(pm.away_team, pm.home_team)
 
@@ -423,8 +932,9 @@ class MLBMarketMaker:
                 self.games[key1].poly_market = pm
                 self.games[key1].game_time_utc = pm.game_start_time
                 matched += 1
+                _debug(f"MATCH: {key1} → token0={pm.home_team} (home)")
             elif key2 in self.games:
-                # pm's team order is flipped — swap token IDs
+                # pm's team order is flipped — swap token IDs so home_token = home team
                 pm_fixed = PolyMarket(
                     home_team=pm.away_team,
                     away_team=pm.home_team,
@@ -434,10 +944,17 @@ class MLBMarketMaker:
                     condition_id=pm.condition_id,
                     question=pm.question,
                     volume=pm.volume,
+                    gamma_best_bid=1 - pm.gamma_best_ask if pm.gamma_best_ask else None,
+                    gamma_best_ask=1 - pm.gamma_best_bid if pm.gamma_best_bid else None,
+                    neg_risk=pm.neg_risk,
+                    accepting_orders=pm.accepting_orders,
                 )
                 self.games[key2].poly_market = pm_fixed
                 self.games[key2].game_time_utc = pm.game_start_time
                 matched += 1
+                _debug(f"MATCH (swapped): {key2} → token1={pm.away_team} (home)")
+            else:
+                _debug(f"UNMATCHED: {pm.home_team} vs {pm.away_team} (no model pick)")
 
         print(f"  Matched {matched}/{len(self.games)} games to Polymarket markets")
         return matched
@@ -445,19 +962,61 @@ class MLBMarketMaker:
     # ── Price & Sizing Updates ─────────────────────────────────────────
 
     def update_prices(self):
-        """Fetch live orderbook prices for all matched games."""
+        """Fetch live CLOB prices for all matched games.
+
+        Uses the CLOB /book endpoint with proper bid/ask sorting, plus
+        /midpoint as a cross-check (it aggregates complement token books).
+        """
         with httpx.Client(timeout=15.0) as client:
             for key, gs in self.games.items():
                 if not gs.poly_market:
                     continue
 
-                book = fetch_orderbook(client, gs.poly_market.home_token_id)
+                home_token = gs.poly_market.home_token_id
+
+                # Primary: fetch sorted orderbook
+                book = fetch_orderbook(client, home_token)
                 if book.get("error"):
+                    _debug(f"Book error for {key}: {book['error']}")
                     continue
 
-                gs.poly_home_bid = book["best_bid"]
-                gs.poly_home_ask = book["best_ask"]
-                gs.poly_home_mid = book["midpoint"]
+                # Secondary: CLOB /midpoint as cross-check
+                clob_mid = fetch_clob_midpoint(client, home_token)
+
+                # Use book top-of-book if available, else fall back to CLOB midpoint
+                book_bid = book["best_bid"]
+                book_ask = book["best_ask"]
+                book_mid = book["midpoint"]
+
+                # If book mid is wildly off from CLOB mid, prefer CLOB mid
+                # (CLOB /midpoint aggregates across complement books)
+                if book_mid and clob_mid and abs(book_mid - clob_mid) > 0.05:
+                    _debug(f"{key}: book mid {book_mid:.3f} differs from CLOB mid {clob_mid:.3f}, using CLOB")
+                    gs.poly_home_mid = clob_mid
+                    # Estimate bid/ask from CLOB mid
+                    gs.poly_home_bid = clob_mid - 0.005
+                    gs.poly_home_ask = clob_mid + 0.005
+                elif book_mid:
+                    gs.poly_home_bid = book_bid
+                    gs.poly_home_ask = book_ask
+                    gs.poly_home_mid = book_mid
+                elif clob_mid:
+                    gs.poly_home_mid = clob_mid
+                    gs.poly_home_bid = clob_mid - 0.005
+                    gs.poly_home_ask = clob_mid + 0.005
+                else:
+                    # Last resort: Gamma hints
+                    gamma_bid = gs.poly_market.gamma_best_bid
+                    gamma_ask = gs.poly_market.gamma_best_ask
+                    if gamma_bid and gamma_ask:
+                        gs.poly_home_bid = gamma_bid
+                        gs.poly_home_ask = gamma_ask
+                        gs.poly_home_mid = (gamma_bid + gamma_ask) / 2
+                        _debug(f"{key}: using Gamma hints bid={gamma_bid} ask={gamma_ask}")
+
+                gs.poly_spread = book.get("spread")
+                gs.poly_bid_depth = book.get("bid_depth", 0)
+                gs.poly_ask_depth = book.get("ask_depth", 0)
 
                 # Compute edge and sizing using mid price
                 if gs.poly_home_mid:
@@ -542,8 +1101,20 @@ class MLBMarketMaker:
 
         Returns (bid_price, bid_size, ask_price, ask_size) for the HOME token,
         or None if no quote should be posted.
+
+        Risk checks (in order of priority):
+          1. quote_halted (SP change, game started, pre-pitch pull)
+          2. is_vol_spiking (WebSocket volume spike detected)
+          3. is_adverse_halted (consecutive same-side fills)
+          4. pre_pitch_pulled (< PULL_QUOTES_MINS before pitch)
         """
         if not gs.poly_market or gs.quote_halted:
+            return None
+        if gs.is_vol_spiking:
+            return None
+        if gs.is_adverse_halted:
+            return None
+        if gs.pre_pitch_pulled:
             return None
         if gs.poly_home_mid is None:
             return None
@@ -587,8 +1158,129 @@ class MLBMarketMaker:
 
         return bid_price, bid_size, ask_price, ask_size
 
+    async def _poll_order_status(self):
+        """Poll CLOB API for order status on all active orders.
+
+        Detects fills by comparing size_matched to previously recorded fill amount.
+        Updates position, P&L, and adverse selection tracking from real fill data.
+        """
+        if self.config.dry_run or not self._clob_client:
+            return
+
+        for key, gs in self.games.items():
+            for side_label, order_attr, filled_attr, price_attr in [
+                ("BID", "bid_order_id", "bid_filled", "bid_price"),
+                ("ASK", "ask_order_id", "ask_filled", "ask_price"),
+            ]:
+                order_id = getattr(gs, order_attr)
+                if not order_id:
+                    continue
+
+                try:
+                    order = await self._clob_client.get_order(order_id)
+                except Exception as e:
+                    _debug(f"get_order failed for {key} {side_label}: {e}")
+                    continue
+
+                if not order:
+                    continue
+
+                # Parse fill amount from CLOB response
+                # Polymarket returns: size_matched (filled), original_size, status
+                size_matched = float(order.get("size_matched", 0) or 0)
+                prev_filled = getattr(gs, filled_attr)
+                new_fill = size_matched - prev_filled
+
+                if new_fill > 0.01:  # meaningful fill
+                    fill_price = float(order.get("price", 0) or getattr(gs, price_attr) or 0)
+                    setattr(gs, filled_attr, size_matched)
+
+                    # Update position and P&L
+                    if side_label == "BID":
+                        # Bought home tokens
+                        gs.net_position += new_fill
+                        gs.total_bought += new_fill
+                        gs.cost_basis += new_fill * fill_price
+                        gs.consecutive_bid_fills += 1
+                        gs.consecutive_ask_fills = 0
+                    else:
+                        # Sold home tokens
+                        gs.net_position -= new_fill
+                        gs.total_sold += new_fill
+                        gs.cost_basis -= new_fill * fill_price
+                        gs.consecutive_ask_fills += 1
+                        gs.consecutive_bid_fills = 0
+
+                    gs.fill_history.append({
+                        "side": side_label,
+                        "price": fill_price,
+                        "size": new_fill,
+                        "ts": time.time(),
+                    })
+
+                    print(f"  [FILL] {key} {side_label}: {new_fill:.1f} @ {fill_price:.2f} "
+                          f"| pos={gs.net_position:+.1f} | bought={gs.total_bought:.1f} sold={gs.total_sold:.1f}")
+
+                # Handle fully filled or cancelled orders — clear the order ID
+                status = str(order.get("status", "")).upper()
+                original_size = float(order.get("original_size", order.get("size", 0)) or 0)
+                if status in ("MATCHED", "CANCELLED", "EXPIRED") or (
+                    original_size > 0 and size_matched >= original_size - 0.01
+                ):
+                    setattr(gs, order_attr, None)
+                    setattr(gs, filled_attr, 0.0)
+
+            # Adverse selection check: consecutive same-side fills
+            if (gs.consecutive_bid_fills >= MAX_CONSECUTIVE_FILLS or
+                    gs.consecutive_ask_fills >= MAX_CONSECUTIVE_FILLS):
+                side = "BID" if gs.consecutive_bid_fills >= MAX_CONSECUTIVE_FILLS else "ASK"
+                gs.adverse_halted = True
+                gs.adverse_halt_until = time.time() + 30
+                gs.consecutive_bid_fills = 0
+                gs.consecutive_ask_fills = 0
+                print(f"\n  *** [RISK] ADVERSE SELECTION: {key} — "
+                      f"{MAX_CONSECUTIVE_FILLS}x consecutive {side} fills → "
+                      f"halting 30s to reprice")
+
+    def _compute_unrealized_pnl(self, gs: GameState) -> float:
+        """Compute unrealized P&L for current position using mid price."""
+        if gs.net_position == 0 or gs.poly_home_mid is None:
+            return 0.0
+        # Mark-to-market: position * mid - cost_basis
+        mark = gs.net_position * gs.poly_home_mid
+        return mark - gs.cost_basis
+
+    def _check_kill_switch(self) -> bool:
+        """Check if total P&L has breached max-loss threshold.
+
+        Returns True if bot should halt all trading.
+        """
+        total_pnl = 0.0
+        for gs in self.games.values():
+            total_pnl += gs.realized_pnl + self._compute_unrealized_pnl(gs)
+
+        if total_pnl < -self.config.max_loss:
+            print(f"\n  ******* KILL SWITCH: Total P&L ${total_pnl:+,.2f} "
+                  f"breached max loss -${self.config.max_loss:,.0f} *******")
+            print(f"  ******* HALTING ALL GAMES *******")
+            for gs in self.games.values():
+                gs.quote_halted = True
+                gs.halt_reason = "KILL SWITCH"
+            self._killed = True
+            return True
+        return False
+
     async def place_or_update_quotes(self):
         """Place or update two-sided quotes for all active games."""
+        # Poll real order status and detect fills
+        await self._poll_order_status()
+
+        # Check kill switch
+        if getattr(self, "_killed", False):
+            return
+        if self._check_kill_switch():
+            return
+
         for key, gs in self.games.items():
             if not gs.poly_market:
                 continue
@@ -652,7 +1344,7 @@ class MLBMarketMaker:
                     size=size,
                 )
                 order_id = result.get("orderID", "")
-                print(f"    ORDER: {game_key} {label}: {side} {size:.0f} @ {price:.2f} → {order_id}")
+                print(f"    ORDER: {game_key} {label}: {side} {size:.0f} @ {price:.2f} -> {order_id}")
                 return result
             except Exception as e:
                 print(f"    ERROR: {game_key} {label}: {e}")
@@ -674,6 +1366,8 @@ class MLBMarketMaker:
 
         gs.bid_price = None
         gs.ask_price = None
+        gs.bid_filled = 0.0
+        gs.ask_filled = 0.0
 
     # ── Display ────────────────────────────────────────────────────────
 
@@ -682,18 +1376,18 @@ class MLBMarketMaker:
         now = datetime.now(timezone.utc)
         now_et = now - timedelta(hours=4)
 
-        print(f"\n{'='*110}")
+        print(f"\n{'='*125}")
         print(f"  MLB Market Maker — {self.config.target_date} — "
               f"Cycle #{self._cycle_count} — {now_et.strftime('%I:%M:%S%p')} ET — "
               f"{'DRY RUN' if self.config.dry_run else 'LIVE'}")
         print(f"  Bankroll: ${self.config.bankroll:,.0f} | Min edge: {self.config.min_edge:.0%} | "
               f"Poll: {self.config.poll_interval_s:.0f}s")
-        print(f"{'='*110}")
+        print(f"{'='*125}")
 
-        print(f"\n  {'Game':<14s} {'Time':>9s} {'Model':>6s} {'Poly':>6s} {'Edge':>6s} "
-              f"{'½K%':>5s} {'Side':>10s} {'Conv':>7s} {'Lineup':>7s} "
-              f"{'Bid':>6s} {'Ask':>6s} {'Status':>12s}")
-        print(f"  {'-'*108}")
+        print(f"\n  {'Game':<14s} {'Time':>9s} {'Model':>6s} {'Poly':>6s} {'Sprd':>5s} {'Edge':>6s} "
+              f"{'½K%':>5s} {'Side':>6s} {'Conv':>7s} {'LU':>3s} "
+              f"{'Bid':>6s} {'Ask':>6s} {'$BidDp':>7s} {'$AskDp':>7s} {'Risk':>8s} {'Status':>12s}")
+        print(f"  {'-'*122}")
 
         # Sort by game time
         sorted_games = sorted(
@@ -709,6 +1403,7 @@ class MLBMarketMaker:
             time_str = gs.game_time_et
             model_str = f"{gs.model_fair:.1%}"
             poly_str = f"{gs.poly_home_mid:.1%}" if gs.poly_home_mid else "  ---"
+            sprd_str = f"{gs.poly_spread:.2f}" if gs.poly_spread is not None else " ---"
             edge_str = f"{gs.edge:+.1%}" if gs.poly_home_mid else "  ---"
             kelly_str = f"{gs.half_kelly:.1%}" if gs.half_kelly > 0 else "  ---"
             side_str = gs.side.replace("BUY_", "") if gs.side else "---"
@@ -716,56 +1411,106 @@ class MLBMarketMaker:
             lineup_str = "Y" if gs.lineups_confirmed else ("P" if gs.home_lineup_confirmed or gs.away_lineup_confirmed else "N")
             bid_str = f"{gs.bid_price:.2f}" if gs.bid_price else "  ---"
             ask_str = f"{gs.ask_price:.2f}" if gs.ask_price else "  ---"
+            bd_str = f"${gs.poly_bid_depth:,.0f}" if gs.poly_bid_depth else "  ---"
+            ad_str = f"${gs.poly_ask_depth:,.0f}" if gs.poly_ask_depth else "  ---"
+
+            # Risk flags
+            risk_flags = []
+            if gs.is_vol_spiking:
+                risk_flags.append("VOL")
+            if gs.is_adverse_halted:
+                risk_flags.append("ADV")
+            if gs.spread_widened and not gs.pre_pitch_pulled:
+                risk_flags.append("WIDE")
+            if gs.pre_pitch_pulled:
+                risk_flags.append("PULL")
+            mins = gs.minutes_to_first_pitch
+            if mins is not None and mins <= 60:
+                risk_flags.append(f"{mins:.0f}m")
+            risk_str = "|".join(risk_flags) if risk_flags else "OK"
 
             if gs.quote_halted:
-                status = f"HALTED:{gs.halt_reason[:8]}"
+                status = f"HALT:{gs.halt_reason[:9]}"
+            elif gs.is_vol_spiking:
+                status = "VOL_SPIKE"
+            elif gs.is_adverse_halted:
+                status = "ADVERSE"
             elif gs.bid_order_id or gs.ask_order_id:
                 status = "QUOTING"
                 active_quotes += 1
                 total_exposure += gs.half_kelly * self.config.bankroll
             elif gs.poly_market is None:
                 status = "NO_MKT"
+            elif gs.poly_home_mid is None:
+                status = "NO_BOOK"
             elif abs(gs.edge) < self.config.min_edge:
                 status = "THIN_EDGE"
             else:
                 status = "READY"
 
-            print(f"  {game:<14s} {time_str:>9s} {model_str:>6s} {poly_str:>6s} {edge_str:>6s} "
-                  f"{kelly_str:>5s} {side_str:>10s} {conv_str:>7s} {lineup_str:>7s} "
-                  f"{bid_str:>6s} {ask_str:>6s} {status:>12s}")
+            print(f"  {game:<14s} {time_str:>9s} {model_str:>6s} {poly_str:>6s} {sprd_str:>5s} {edge_str:>6s} "
+                  f"{kelly_str:>5s} {side_str:>6s} {conv_str:>7s} {lineup_str:>3s} "
+                  f"{bid_str:>6s} {ask_str:>6s} {bd_str:>7s} {ad_str:>7s} {risk_str:>8s} {status:>12s}")
+
+        # P&L summary
+        total_realized = sum(g.realized_pnl for g in self.games.values())
+        total_unrealized = sum(self._compute_unrealized_pnl(g) for g in self.games.values())
+        total_pnl = total_realized + total_unrealized
+        total_bought = sum(g.total_bought for g in self.games.values())
+        total_sold = sum(g.total_sold for g in self.games.values())
+
+        # Count active risk events
+        vol_spikes = sum(1 for g in self.games.values() if g.is_vol_spiking)
+        adverse = sum(1 for g in self.games.values() if g.is_adverse_halted)
+        widened = sum(1 for g in self.games.values() if g.spread_widened and not g.pre_pitch_pulled)
+        pulled = sum(1 for g in self.games.values() if g.pre_pitch_pulled)
 
         print(f"\n  Active quotes: {active_quotes} | "
               f"Total exposure: ${total_exposure:,.0f} / ${self.config.bankroll:,.0f}")
+        print(f"  P&L: ${total_pnl:+,.2f} (realized ${total_realized:+,.2f} + "
+              f"unrealized ${total_unrealized:+,.2f}) | "
+              f"Fills: {total_bought:.0f} bought, {total_sold:.0f} sold | "
+              f"Kill: -${self.config.max_loss:,.0f}")
+        print(f"  Risk: {vol_spikes} vol spikes | {adverse} adverse | "
+              f"{widened} widened | {pulled} pre-pitch pulled")
 
     # ── Main Loop ──────────────────────────────────────────────────────
 
     async def run(self):
-        """Main bot loop."""
+        """Main bot loop with concurrent risk monitors.
+
+        Launches three background async tasks:
+          - TradeFlowMonitor: WebSocket volume spike detection
+          - FastMLBMonitor: 8s SP/lineup polling
+          - PrePitchWindDown: time-based spread widening & quote pulling
+        """
         print(f"\n{'='*70}")
         print(f"  MLB Polymarket Market Maker")
         print(f"  Date: {self.config.target_date}")
         print(f"  Mode: {'DRY RUN' if self.config.dry_run else 'LIVE TRADING'}")
         print(f"  Bankroll: ${self.config.bankroll:,.0f}")
+        print(f"  Kill switch: -${self.config.max_loss:,.0f}")
         print(f"{'='*70}")
 
         # Step 1: Load model picks
-        print("\n[1/3] Loading model picks...")
+        print("\n[1/4] Loading model picks...")
         n = self.load_model_picks()
         if n == 0:
             return
 
         # Step 2: Discover Polymarket markets
-        print("\n[2/3] Discovering Polymarket markets...")
+        print("\n[2/4] Discovering Polymarket markets...")
         poly_markets = fetch_poly_mlb_markets(self.config.target_date)
         self.match_poly_markets(poly_markets)
 
-        # Step 3: Initial price fetch
-        print("\n[3/3] Fetching initial prices...")
+        # Step 3: Initial price fetch & MLB status
+        print("\n[3/4] Fetching initial prices & MLB status...")
         self.update_prices()
         self.update_mlb_status()
         self.print_dashboard()
 
-        # Initialize trading client
+        # Step 4: Initialize trading client
+        print("\n[4/4] Initializing trading systems...")
         if not self.config.dry_run and self.config.use_polymir:
             try:
                 from polymir.config import APIConfig
@@ -773,32 +1518,43 @@ class MLBMarketMaker:
                 api_config = APIConfig.from_env()
                 self._clob_client = LiveClobClient(api_config)
                 await self._clob_client.__aenter__()
-                print("\n  Connected to Polymarket CLOB (live trading)")
+                print("  Connected to Polymarket CLOB (live trading)")
             except Exception as e:
-                print(f"\n  WARNING: Could not init live client: {e}")
+                print(f"  WARNING: Could not init live client: {e}")
                 print("  Falling back to dry-run mode")
                 self.config.dry_run = True
+
+        # Launch concurrent risk monitors
+        self._trade_flow = TradeFlowMonitor(self.games)
+        self._mlb_monitor = FastMLBMonitor(self.games, self.config.target_date)
+        self._wind_down = PrePitchWindDown(self.games)
+
+        monitor_tasks = []
+        monitor_tasks.append(asyncio.create_task(self._trade_flow.run()))
+        monitor_tasks.append(asyncio.create_task(self._mlb_monitor.run()))
+        monitor_tasks.append(asyncio.create_task(self._wind_down.run()))
 
         # Main loop
         self._running = True
         print(f"\n  Starting main loop (poll every {self.config.poll_interval_s}s, Ctrl+C to stop)...")
+        print(f"  Risk monitors: WebSocket flow | MLB {MLB_FAST_POLL_S}s poll | Pre-pitch wind-down")
 
         try:
-            while self._running:
+            while self._running and not self._killed:
                 self._cycle_count += 1
 
-                # Update prices
+                # Update CLOB prices (MLB monitoring is handled by FastMLBMonitor)
                 self.update_prices()
 
-                # Check MLB API for changes (every 3rd cycle to avoid hammering)
-                if self._cycle_count % 3 == 0:
-                    self.update_mlb_status()
-
-                # Place/update quotes
+                # Place/update quotes (polls order status, checks kill switch)
                 await self.place_or_update_quotes()
 
                 # Display
                 self.print_dashboard()
+
+                # If killed, break after displaying final state
+                if self._killed:
+                    break
 
                 # Wait
                 await asyncio.sleep(self.config.poll_interval_s)
@@ -806,6 +1562,14 @@ class MLBMarketMaker:
         except (KeyboardInterrupt, asyncio.CancelledError):
             print("\n\n  Shutting down...")
         finally:
+            # Stop all risk monitors
+            self._trade_flow.stop()
+            self._mlb_monitor.stop()
+            self._wind_down.stop()
+            for t in monitor_tasks:
+                t.cancel()
+            await asyncio.gather(*monitor_tasks, return_exceptions=True)
+
             # Cancel all open orders
             print("  Cancelling all open orders...")
             for gs in self.games.values():
@@ -838,14 +1602,14 @@ def print_sizing_table(target_date: str, bankroll: float = 5000.0):
     print(f"\nFetching Polymarket MLB markets for {target_date}...")
     poly_markets = fetch_poly_mlb_markets(target_date)
 
-    # Build lookup by team pair
+    # Build lookup by team pair (both orientations)
     poly_lookup: dict[tuple, PolyMarket] = {}
     for pm in poly_markets:
         poly_lookup[(pm.home_team, pm.away_team)] = pm
         poly_lookup[(pm.away_team, pm.home_team)] = pm
 
     # Fetch orderbooks and compute sizing
-    print("Fetching orderbooks...\n")
+    print("Fetching CLOB orderbooks...\n")
     rows = []
 
     with httpx.Client(timeout=15.0) as client:
@@ -877,8 +1641,30 @@ def print_sizing_table(target_date: str, bankroll: float = 5000.0):
             else:
                 home_token = pm.away_token_id
 
+            # Primary: CLOB orderbook (properly sorted)
             book = fetch_orderbook(client, home_token)
-            mid = book.get("midpoint")
+
+            # Secondary: CLOB /midpoint (aggregates complement book)
+            clob_mid = fetch_clob_midpoint(client, home_token)
+
+            # Determine best mid price
+            book_mid = book.get("midpoint")
+            if book_mid and clob_mid and abs(book_mid - clob_mid) > 0.05:
+                mid = clob_mid  # prefer CLOB mid if book is stale
+                _debug(f"{at}@{ht}: book_mid={book_mid:.3f} != clob_mid={clob_mid:.3f}, using CLOB")
+            elif book_mid:
+                mid = book_mid
+            elif clob_mid:
+                mid = clob_mid
+            elif pm.gamma_best_bid and pm.gamma_best_ask:
+                # Last resort: Gamma hints
+                if pm.home_team == ht:
+                    mid = (pm.gamma_best_bid + pm.gamma_best_ask) / 2
+                else:
+                    mid = 1 - (pm.gamma_best_bid + pm.gamma_best_ask) / 2
+                _debug(f"{at}@{ht}: using Gamma hint mid={mid:.3f}")
+            else:
+                mid = None
 
             if mid is None:
                 rows.append({
@@ -927,7 +1713,7 @@ def print_sizing_table(target_date: str, bankroll: float = 5000.0):
 
     print(f"\n  {'ET Time':>9s} {'Game':<14s} {'Model':>6s} {'Poly':>6s} {'Bid':>5s} {'Ask':>5s} "
           f"{'Sprd':>5s} {'Edge':>6s} {'Side':>6s} {'½Kelly':>7s} "
-          f"{'$Size':>7s} {'BidDpth':>8s} {'AskDpth':>8s}")
+          f"{'$Size':>7s} {'$BidDp':>7s} {'$AskDp':>7s}")
     print(f"  {'-'*125}")
 
     total_size = 0.0
@@ -935,7 +1721,12 @@ def print_sizing_table(target_date: str, bankroll: float = 5000.0):
         gt = r.get("game_time", "")
         if gt:
             try:
-                dt = datetime.fromisoformat(gt.replace("Z", "+00:00") if gt.endswith("Z") else gt)
+                gt_clean = gt.replace("Z", "+00:00") if gt.endswith("Z") else gt
+                if " " in gt_clean and "T" not in gt_clean:
+                    gt_clean = gt_clean.replace(" ", "T", 1)
+                if gt_clean.endswith("+00"):
+                    gt_clean += ":00"
+                dt = datetime.fromisoformat(gt_clean)
                 et = dt - timedelta(hours=4)
                 time_str = et.strftime("%-I:%M%p")
             except (ValueError, TypeError):
@@ -960,7 +1751,7 @@ def print_sizing_table(target_date: str, bankroll: float = 5000.0):
 
         print(f"  {time_str:>9s} {game:<14s} {model_str:>6s} {poly_str:>6s} {bid_str:>5s} {ask_str:>5s} "
               f"{sprd_str:>5s} {edge_str:>6s} {side_str:>6s} {hk_str:>7s} "
-              f"{size_str:>7s} {bd_str:>8s} {ad_str:>8s}")
+              f"{size_str:>7s} {bd_str:>7s} {ad_str:>7s}")
 
     print(f"\n  Total desired exposure: ${total_size:,.0f} / ${bankroll:,.0f} bankroll")
     print(f"  Max per game: ${bankroll * MAX_POSITION_PER_GAME:,.0f}")
@@ -976,7 +1767,14 @@ def main():
     parser.add_argument("--interval", type=float, default=30.0, help="Poll interval in seconds")
     parser.add_argument("--dry-run", action="store_true", default=False, help="Dry run (no real orders)")
     parser.add_argument("--sizing-only", action="store_true", help="Just print sizing table, don't run bot")
+    parser.add_argument("--max-loss", type=float, default=500.0,
+                        help="Kill switch: halt all trading if total P&L drops below -$X (default: 500)")
+    parser.add_argument("--debug-discovery", action="store_true",
+                        help="Print full discovery chain (sports, events, books)")
     args = parser.parse_args()
+
+    global DEBUG_DISCOVERY
+    DEBUG_DISCOVERY = args.debug_discovery
 
     if args.sizing_only:
         print_sizing_table(args.date, args.bankroll)
@@ -988,6 +1786,8 @@ def main():
         min_edge=args.min_edge,
         poll_interval_s=args.interval,
         dry_run=args.dry_run,
+        debug_discovery=args.debug_discovery,
+        max_loss=args.max_loss,
     )
 
     bot = MLBMarketMaker(config)
@@ -998,6 +1798,11 @@ def main():
 
     def _signal_handler(sig, frame):
         bot.stop()
+        # Also stop risk monitors if they exist
+        for attr in ("_trade_flow", "_mlb_monitor", "_wind_down"):
+            monitor = getattr(bot, attr, None)
+            if monitor:
+                monitor.stop()
 
     signal.signal(signal.SIGINT, _signal_handler)
 
