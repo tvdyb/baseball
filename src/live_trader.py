@@ -248,15 +248,23 @@ class LiveGame:
 
         This is the Kelly-optimal position at the current state.
         The rebalancing logic trades toward this target.
+        Caps both cost AND notional (settlement) exposure at target_size_usd.
         """
         if self.target_size_usd <= 0 or not self.poly_home_mid:
             return 0.0
+        max_notional = self.target_size_usd  # cap settlement risk too
         if self.side == "BUY_HOME":
             price = self.poly_home_ask or self.poly_home_mid
-            return self.target_size_usd / price if price > 0 else 0.0
+            if price <= 0:
+                return 0.0
+            contracts = self.target_size_usd / price
+            return min(contracts, max_notional)
         elif self.side == "BUY_AWAY":
             price = (1 - self.poly_home_bid) if self.poly_home_bid else (1 - self.poly_home_mid)
-            return -(self.target_size_usd / price) if price > 0 else 0.0
+            if price <= 0:
+                return 0.0
+            contracts = self.target_size_usd / price
+            return -min(contracts, max_notional)
         return 0.0
 
 

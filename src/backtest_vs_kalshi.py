@@ -948,11 +948,15 @@ def compute_kelly_rebalancing(
                         full_kelly = edge / (1 - mkt_price) if mkt_price < 1 else 0
                         dollar_size = min(bankroll * full_kelly * kf, max_exposure)
                         target = dollar_size / mkt_price  # contracts
+                        # Cap notional (settlement) exposure too
+                        target = min(target, max_exposure)
                     else:
                         # Short home YES: Kelly = |edge| / price
                         full_kelly = abs_edge / mkt_price if mkt_price > 0 else 0
                         dollar_size = min(bankroll * full_kelly * kf, max_exposure)
                         target = -dollar_size / (1 - mkt_price)
+                        # Cap notional (settlement) exposure too
+                        target = max(target, -max_exposure)
 
                     # Rebalance: buy/sell to reach target
                     delta = target - position
@@ -986,9 +990,9 @@ def compute_kelly_rebalancing(
             total_capital = bankroll * n_games
             roi = total_pnl / total_capital if total_capital > 0 else 0
 
-            # Sharpe (annualized assuming ~6 months of games)
+            # Per-game Sharpe (NOT annualized — report the raw ratio)
             if n_games > 1 and pnls.std() > 0:
-                sharpe = (pnls.mean() / pnls.std()) * np.sqrt(n_games)
+                sharpe = pnls.mean() / pnls.std()
             else:
                 sharpe = 0.0
 

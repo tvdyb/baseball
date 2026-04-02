@@ -88,6 +88,8 @@ class GameState:
     away_pitcher: str = "sp"
     home_sp_pitches: int = 0
     away_sp_pitches: int = 0
+    home_rp_pitches: float = 0.0  # current reliever pitch count
+    away_rp_pitches: float = 0.0
     home_reliever_idx: int = 0    # index into bullpen reliever order
     away_reliever_idx: int = 0
 
@@ -510,9 +512,13 @@ def simulate_half_inning(
         if pitching_side == "home":
             if state.home_pitcher == "sp":
                 state.home_sp_pitches += est_pitches
+            else:
+                state.home_rp_pitches += est_pitches
         else:
             if state.away_pitcher == "sp":
                 state.away_sp_pitches += est_pitches
+            else:
+                state.away_rp_pitches += est_pitches
 
         # Walk-off check: bottom of 9th+ and home team takes the lead
         if (batting_side == "home" and state.inning >= 9
@@ -568,6 +574,8 @@ def simulate_game(
         away_pitcher=initial_state.away_pitcher,
         home_sp_pitches=initial_state.home_sp_pitches,
         away_sp_pitches=initial_state.away_sp_pitches,
+        home_rp_pitches=initial_state.home_rp_pitches,
+        away_rp_pitches=initial_state.away_rp_pitches,
         home_reliever_idx=initial_state.home_reliever_idx,
         away_reliever_idx=initial_state.away_reliever_idx,
     )
@@ -578,9 +586,7 @@ def simulate_game(
     home_sp_limit = rng.normal(config.sp_pitch_limit_mean, config.sp_pitch_limit_std)
     away_sp_limit = rng.normal(config.sp_pitch_limit_mean, config.sp_pitch_limit_std)
 
-    # Track reliever pitch counts per-game
-    home_rp_pitches = 0.0
-    away_rp_pitches = 0.0
+    # Reliever pitch limits (pitch counts are tracked in state.home_rp_pitches / away_rp_pitches)
     home_rp_limit = rng.normal(config.reliever_pitch_limit_mean, config.reliever_pitch_limit_std)
     away_rp_limit = rng.normal(config.reliever_pitch_limit_mean, config.reliever_pitch_limit_std)
 
@@ -609,37 +615,33 @@ def simulate_game(
             _advance_reliever(state, "away", away_ctx, rng, config)
             away_rp_limit = rng.normal(config.reliever_pitch_limit_mean,
                                        config.reliever_pitch_limit_std)
-            away_rp_pitches = 0.0
+            state.away_rp_pitches = 0.0
         if state.home_pitcher == "sp" and state.home_sp_pitches >= home_sp_limit:
             _advance_reliever(state, "home", home_ctx, rng, config)
             home_rp_limit = rng.normal(config.reliever_pitch_limit_mean,
                                        config.reliever_pitch_limit_std)
-            home_rp_pitches = 0.0
+            state.home_rp_pitches = 0.0
 
         # Reliever→reliever transition (check if current reliever is gassed)
-        if state.away_pitcher.startswith("rp") and away_rp_pitches >= away_rp_limit:
+        if state.away_pitcher.startswith("rp") and state.away_rp_pitches >= away_rp_limit:
             _advance_reliever(state, "away", away_ctx, rng, config)
             away_rp_limit = rng.normal(config.reliever_pitch_limit_mean,
                                        config.reliever_pitch_limit_std)
-            away_rp_pitches = 0.0
-        if state.home_pitcher.startswith("rp") and home_rp_pitches >= home_rp_limit:
+            state.away_rp_pitches = 0.0
+        if state.home_pitcher.startswith("rp") and state.home_rp_pitches >= home_rp_limit:
             _advance_reliever(state, "home", home_ctx, rng, config)
             home_rp_limit = rng.normal(config.reliever_pitch_limit_mean,
                                        config.reliever_pitch_limit_std)
-            home_rp_pitches = 0.0
+            state.home_rp_pitches = 0.0
 
         # Top of inning: away team bats
         if state.top_bottom == "Top":
             if state.inning >= 10:
                 state.bases = (False, True, False)
 
-            pre_pitches_home = state.home_sp_pitches
             simulate_half_inning(
                 state, "away", "home", dists, transition_matrix, config, rng,
             )
-            # Track reliever pitches for home pitcher
-            if state.home_pitcher.startswith("rp"):
-                home_rp_pitches += (state.home_sp_pitches - pre_pitches_home)  # approximation
 
             state.outs = 0
             state.bases = (False, False, False)
@@ -1295,20 +1297,57 @@ def fetch_live_game_state(client: httpx.Client, game_pk: int) -> GameState:
     home_team_box = boxscore.get("teams", {}).get("home", {})
     away_team_box = boxscore.get("teams", {}).get("away", {})
 
-    # Check if SP is still pitching
+    # Check if SP is still pitching, and map to actual reliever index
     home_pitcher = "sp"
     away_pitcher = "sp"
-    for side, team_box, pitcher_var in [
-        ("home", home_team_box, "home"),
-        ("away", away_team_box, "away"),
-    ]:
+    home_reliever_idx = 0
+    away_reliever_idx = 0
+    home_sp_pitches = 0
+    away_sp_pitches = 0
+    home_rp_pitches = 0.0
+    away_rp_pitches = 0.0
+
+    for side, team_box in [("home", home_team_box), ("away", away_team_box)]:
         pitchers = team_box.get("pitchers", [])
-        if len(pitchers) > 1:
-            # More than one pitcher has been used → bullpen is active
-            if side == "home":
-                home_pitcher = "bp"
+        n_relievers_used = max(0, len(pitchers) - 1)  # first pitcher is SP
+        if n_relievers_used > 0:
+            # Map to reliever index: rp0, rp1, rp2, then bp
+            ri = n_relievers_used - 1  # 0-indexed current reliever
+            if ri <= 2:
+                pitcher_state = f"rp{ri}"
+                reliever_idx = ri + 1  # next reliever to advance to
             else:
-                away_pitcher = "bp"
+                pitcher_state = "bp"
+                reliever_idx = ri + 1
+            if side == "home":
+                home_pitcher = pitcher_state
+                home_reliever_idx = reliever_idx
+            else:
+                away_pitcher = pitcher_state
+                away_reliever_idx = reliever_idx
+
+        # Estimate pitch counts from boxscore player stats
+        players = team_box.get("players", {})
+        if pitchers:
+            sp_id = f"ID{pitchers[0]}"
+            sp_stats = players.get(sp_id, {}).get("stats", {})
+            pitching_stats = sp_stats.get("pitching", {})
+            sp_pc = int(pitching_stats.get("numberOfPitches", 0))
+            if side == "home":
+                home_sp_pitches = sp_pc
+            else:
+                away_sp_pitches = sp_pc
+
+            # Current reliever pitch count
+            if n_relievers_used > 0:
+                current_rp_id = f"ID{pitchers[-1]}"
+                rp_stats = players.get(current_rp_id, {}).get("stats", {})
+                rp_pitching = rp_stats.get("pitching", {})
+                rp_pc = float(rp_pitching.get("numberOfPitches", 0))
+                if side == "home":
+                    home_rp_pitches = rp_pc
+                else:
+                    away_rp_pitches = rp_pc
 
     # Determine lineup positions from batting order
     home_lineup_pos = 0
@@ -1339,6 +1378,12 @@ def fetch_live_game_state(client: httpx.Client, game_pk: int) -> GameState:
         away_lineup_pos=away_lineup_pos,
         home_pitcher=home_pitcher,
         away_pitcher=away_pitcher,
+        home_sp_pitches=home_sp_pitches,
+        away_sp_pitches=away_sp_pitches,
+        home_rp_pitches=home_rp_pitches,
+        away_rp_pitches=away_rp_pitches,
+        home_reliever_idx=home_reliever_idx,
+        away_reliever_idx=away_reliever_idx,
     )
 
 
