@@ -19,6 +19,7 @@ Usage:
 """
 
 import argparse
+import functools
 import pickle
 import sys
 from collections import Counter
@@ -38,11 +39,20 @@ from build_transition_matrix import (
 from feature_engineering import (
     _preindex_xrv,
     _precompute_pitcher_bases,
+    _compute_pitcher_arsenal_live,
+    _standardize_arsenal,
     compute_matchup_xrv,
     _load_hand_models,
     _sp_features_fast,
     _bp_features_fast,
     _get_before,
+)
+from multi_output_matchup_model import (
+    load_multi_output_models,
+    predict_matchup_distribution,
+    PITCH_TYPES as MO_PITCH_TYPES,
+    PTYPE_MAP as MO_PTYPE_MAP,
+    N_PTYPES as MO_N_PTYPES,
 )
 from predict import fetch_todays_games, fetch_lineup, MLB_API
 from utils import DATA_DIR, XRV_DIR, MODEL_DIR
@@ -78,6 +88,16 @@ class GameState:
     away_pitcher: str = "sp"
     home_sp_pitches: int = 0
     away_sp_pitches: int = 0
+    home_reliever_idx: int = 0    # index into bullpen reliever order
+    away_reliever_idx: int = 0
+
+
+@dataclass
+class RelieverInfo:
+    """A single reliever's identity and outcome distributions vs each hitter."""
+    pitcher_id: int
+    outcome_dists: list[np.ndarray]  # per-hitter, 9 arrays of shape (N_OUTCOMES,)
+    pitches_per_pa: float = 3.9      # K-heavy pitchers throw more per PA
 
 
 @dataclass
@@ -86,12 +106,16 @@ class TeamContext:
 
     Outcome distributions are per-hitter, per-pitcher-state numpy arrays
     in OUTCOME_ORDER, derived from batter/pitcher empirical rates combined
-    via log5 and adjusted by the Bayesian matchup model.
+    via log5 and adjusted by the multi-output matchup model.
     """
     team: str                                    # abbreviation
     lineup: list[tuple[int, str]]                # [(player_id, bat_side), ...] x9
     # Per-hitter outcome distributions: list of 9 numpy arrays, one per lineup slot
     sp_outcome_dists: list[np.ndarray] = field(default_factory=list)   # vs opposing SP
+    sp_pitches_per_pa: float = 3.9               # SP-specific pitches/PA estimate
+    # Individual relievers (ordered by expected usage: high-leverage first)
+    relievers: list[RelieverInfo] = field(default_factory=list)
+    # Fallback composite bullpen dists (used when no reliever data available)
     bp_outcome_dists: list[np.ndarray] = field(default_factory=list)   # vs opposing bullpen
 
 
@@ -101,15 +125,17 @@ class SimConfig:
 
     Defaults are based on 2017-2024 MLB averages:
     - SP pitch limit: 92 ± 10 (MLB avg ~91 pitches/start, Gaussian for variance)
-    - Pitches per PA: 3.9 (MLB avg 3.87-3.93 over 2017-2024)
     - Max PA per half-inning: 25 (safety limit; MLB record is 23 batters)
+    - Reliever pitch limit: 20 ± 5 (typical reliever outing ~15-25 pitches)
     """
     n_sims: int = 10_000
     sp_pitch_limit_mean: int = 92
     sp_pitch_limit_std: int = 10
-    pitches_per_pa: float = 3.9
+    reliever_pitch_limit_mean: int = 20
+    reliever_pitch_limit_std: int = 5
     max_pa_per_half_inning: int = 25
     random_seed: int | None = None
+    model_blend_weight: float = 0.6  # weight for multi-output model vs log5
 
 
 # ── Outcome Distribution ──────────────────────────────────
@@ -120,25 +146,38 @@ class SimConfig:
 #   4. Bayesian matchup model interaction adjustment
 
 # Minimum PA thresholds before trusting individual rates over league avg.
-# Below these thresholds, we use league averages to avoid small-sample noise.
+# Below these thresholds, we try MiLB stats, then fall back to league averages.
 # 50 PAs ≈ 2 weeks of games for a regular starter.
 _MIN_BATTER_PA = 50
 _MIN_PITCHER_PA = 100
 
-# Clamps to prevent extreme outcome rates
-_OUTCOME_CLAMPS = {"K": 0.50, "HR": 0.10, "BB": 0.25, "HBP": 0.05,
-                   "3B": 0.03, "dp": 0.08}
+# Estimated pitches per PA by outcome (high-K pitchers throw more per PA)
+_PITCHES_PER_PA_BY_OUTCOME = {
+    "K": 4.8, "BB": 5.6, "HBP": 2.5, "1B": 3.5, "2B": 3.4, "3B": 3.3,
+    "HR": 3.6, "dp": 3.0, "out_ground": 3.4, "out_fly": 3.6, "out_line": 3.3,
+}
+
+# MiLB level adjustment factors (scale MiLB stats to approximate MLB equivalents)
+# sportId: 11=AAA, 12=AA, 13=A+, 14=A
+_MILB_LEVEL_ADJUSTMENTS = {
+    11: {"K": 1.05, "BB": 0.97, "HR": 0.82, "1B": 0.98, "2B": 0.95, "3B": 0.90,
+         "HBP": 1.0, "dp": 1.0, "out_ground": 1.02, "out_fly": 1.02, "out_line": 1.02},
+    12: {"K": 1.10, "BB": 0.95, "HR": 0.72, "1B": 0.95, "2B": 0.90, "3B": 0.85,
+         "HBP": 1.0, "dp": 1.0, "out_ground": 1.05, "out_fly": 1.05, "out_line": 1.05},
+    13: {"K": 1.15, "BB": 0.92, "HR": 0.62, "1B": 0.92, "2B": 0.85, "3B": 0.80,
+         "HBP": 1.0, "dp": 1.0, "out_ground": 1.08, "out_fly": 1.08, "out_line": 1.08},
+    14: {"K": 1.20, "BB": 0.90, "HR": 0.55, "1B": 0.90, "2B": 0.80, "3B": 0.75,
+         "HBP": 1.0, "dp": 1.0, "out_ground": 1.10, "out_fly": 1.10, "out_line": 1.10},
+}
 
 
-def load_sim_artifacts() -> tuple[dict, dict, dict]:
-    """Load pre-computed simulation artifacts."""
+def load_sim_artifacts() -> tuple[dict, dict]:
+    """Load pre-computed simulation artifacts (base rates + transition matrix)."""
     with open(SIM_DIR / "league_base_rates.pkl", "rb") as f:
         base_rates = pickle.load(f)
-    with open(SIM_DIR / "xrv_calibration.pkl", "rb") as f:
-        calibration = pickle.load(f)
     with open(SIM_DIR / "transition_matrix.pkl", "rb") as f:
         transition_matrix = pickle.load(f)
-    return base_rates, calibration, transition_matrix
+    return base_rates, transition_matrix
 
 
 def _classify_pa_events(df: pd.DataFrame) -> pd.Series:
@@ -224,45 +263,8 @@ def log5_combine(
     return combined
 
 
-def apply_matchup_adjustment(
-    combined_rates: dict[str, float],
-    matchup_xrv: float,
-    calibration: dict,
-) -> dict[str, float]:
-    """Apply Bayesian matchup model interaction as a final adjustment.
-
-    The matchup xRV captures pitcher-hitter specifics that log5 misses:
-    how a particular hitter handles this pitcher's specific arsenal,
-    pitch sequencing, and movement profile.
-
-    Uses the fitted log-linear calibration:
-      P(outcome) *= exp(alpha_outcome * xrv * scale)
-    then renormalizes.
-    """
-    if np.isnan(matchup_xrv) or matchup_xrv == 0.0:
-        return combined_rates
-
-    alphas = calibration["alphas"]
-    scale = calibration["scale"]
-
-    adjusted = {}
-    for o in OUTCOME_ORDER:
-        alpha = alphas.get(o, 0.0)
-        adjusted[o] = combined_rates[o] * np.exp(alpha * matchup_xrv * scale)
-
-    # Normalize
-    total = sum(adjusted.values())
-    if total > 0:
-        adjusted = {o: v / total for o, v in adjusted.items()}
-    return adjusted
-
-
 def rates_to_probs(rates: dict[str, float]) -> np.ndarray:
-    """Convert outcome rate dict to numpy prob array, applying clamps."""
-    rates = dict(rates)  # avoid mutating caller's dict
-    for o, cap in _OUTCOME_CLAMPS.items():
-        if rates.get(o, 0) > cap:
-            rates[o] = cap
+    """Convert outcome rate dict to numpy probability array."""
     total = sum(rates.values())
     if total <= 0:
         return np.full(_N_OUTCOMES, 1.0 / _N_OUTCOMES)
@@ -273,8 +275,8 @@ def build_matchup_distribution(
     batter_rates: dict[str, float] | None,
     pitcher_rates: dict[str, float] | None,
     league_rates: dict[str, float],
-    matchup_xrv: float,
-    calibration: dict,
+    model_probs: np.ndarray | None = None,
+    model_weight: float = 0.6,
 ) -> np.ndarray:
     """Build a full per-batter-pitcher outcome distribution.
 
@@ -282,16 +284,22 @@ def build_matchup_distribution(
       1. Batter's empirical outcome rates (or league avg if unknown)
       2. Pitcher's empirical outcome rates (or league avg if unknown)
       3. Log5 odds-ratio combination
-      4. Bayesian matchup model interaction adjustment
+      4. Blend with multi-output matchup model predictions (if available)
 
     Returns numpy probability array in OUTCOME_ORDER.
     """
     b_rates = batter_rates if batter_rates is not None else league_rates
     p_rates = pitcher_rates if pitcher_rates is not None else league_rates
 
-    combined = log5_combine(b_rates, p_rates, league_rates)
-    adjusted = apply_matchup_adjustment(combined, matchup_xrv, calibration)
-    return rates_to_probs(adjusted)
+    log5_probs = rates_to_probs(log5_combine(b_rates, p_rates, league_rates))
+
+    if model_probs is None:
+        return log5_probs
+
+    # Blend model prediction with log5 baseline
+    blended = model_weight * model_probs + (1.0 - model_weight) * log5_probs
+    blended /= blended.sum()
+    return blended
 
 
 def _make_no_dp_dist(probs: np.ndarray) -> np.ndarray:
@@ -313,25 +321,34 @@ def precompute_all_distributions(
     Pre-build outcome distributions for all hitter/pitcher combinations.
 
     Uses the per-hitter distributions already computed in TeamContext.
+    Supports individual relievers: (side, pos, "rp", reliever_idx) keys.
 
-    Returns dict with two keys per combo:
+    Returns dict with keys:
       (side, lineup_pos, pitcher_state) -> prob_array (normal)
       (side, lineup_pos, pitcher_state, "no_dp") -> prob_array (dp redistributed)
+      For relievers: pitcher_state = "rp0", "rp1", etc.
     """
     dists = {}
+    uniform = np.full(_N_OUTCOMES, 1.0 / _N_OUTCOMES)
+
     for side, ctx in [("home", home_ctx), ("away", away_ctx)]:
         for pos in range(len(ctx.lineup)):
-            for ps in ["sp", "bp"]:
-                if ps == "sp":
-                    dist_list = ctx.sp_outcome_dists
-                else:
-                    dist_list = ctx.bp_outcome_dists
-                if pos < len(dist_list):
-                    probs = dist_list[pos]
-                else:
-                    probs = np.full(_N_OUTCOMES, 1.0 / _N_OUTCOMES)
-                dists[(side, pos, ps)] = probs
-                dists[(side, pos, ps, "no_dp")] = _make_no_dp_dist(probs)
+            # SP distributions
+            sp_probs = ctx.sp_outcome_dists[pos] if pos < len(ctx.sp_outcome_dists) else uniform
+            dists[(side, pos, "sp")] = sp_probs
+            dists[(side, pos, "sp", "no_dp")] = _make_no_dp_dist(sp_probs)
+
+            # Individual reliever distributions
+            for ri, reliever in enumerate(ctx.relievers):
+                rp_key = f"rp{ri}"
+                rp_probs = reliever.outcome_dists[pos] if pos < len(reliever.outcome_dists) else uniform
+                dists[(side, pos, rp_key)] = rp_probs
+                dists[(side, pos, rp_key, "no_dp")] = _make_no_dp_dist(rp_probs)
+
+            # Fallback composite bullpen
+            bp_probs = ctx.bp_outcome_dists[pos] if pos < len(ctx.bp_outcome_dists) else uniform
+            dists[(side, pos, "bp")] = bp_probs
+            dists[(side, pos, "bp", "no_dp")] = _make_no_dp_dist(bp_probs)
     return dists
 
 
@@ -374,6 +391,38 @@ def apply_transition(
 
 # ── Simulation Core ───────────────────────────────────────
 
+# Pre-computed pitch count estimates per outcome for real pitch tracking
+_PITCHES_PER_OUTCOME = np.array(
+    [_PITCHES_PER_PA_BY_OUTCOME[o] for o in OUTCOME_ORDER], dtype=np.float64,
+)
+
+
+def _sample_outcome_python(probs, r):
+    """Sample an outcome index from probability array using cumulative sum."""
+    cumsum = 0.0
+    n = probs.shape[0]
+    for i in range(n):
+        cumsum += probs[i]
+        if r < cumsum:
+            return i
+    return n - 1
+
+
+# Lazy numba JIT -- compiled on first use to avoid torch+numba import conflict
+_sample_outcome_jit = None
+
+
+def _sample_outcome(probs, r):
+    global _sample_outcome_jit
+    if _sample_outcome_jit is None:
+        try:
+            import numba as nb
+            _sample_outcome_jit = nb.njit(_sample_outcome_python)
+        except ImportError:
+            _sample_outcome_jit = _sample_outcome_python
+    return _sample_outcome_jit(probs, r)
+
+
 def simulate_plate_appearance(
     state: GameState,
     batting_side: str,
@@ -381,11 +430,11 @@ def simulate_plate_appearance(
     dists: dict,
     transition_matrix: dict,
     rng: np.random.Generator,
-) -> tuple[str, int, tuple[bool, bool, bool], int]:
+) -> tuple[str, int, tuple[bool, bool, bool], int, float]:
     """
     Simulate a single plate appearance.
 
-    Returns (outcome, runs_scored, new_bases, outs_added).
+    Returns (outcome, runs_scored, new_bases, outs_added, est_pitches).
     """
     if batting_side == "home":
         pos = state.home_lineup_pos
@@ -405,22 +454,17 @@ def simulate_plate_appearance(
     if probs is None:
         probs = np.full(_N_OUTCOMES, 1.0 / _N_OUTCOMES)
 
-    # Weighted random selection using cumulative sum (faster than rng.choice for small arrays)
-    r = rng.random()
-    cumsum = 0.0
-    outcome_idx = _N_OUTCOMES - 1  # fallback
-    for i in range(_N_OUTCOMES):
-        cumsum += probs[i]
-        if r < cumsum:
-            outcome_idx = i
-            break
+    outcome_idx = _sample_outcome(probs, rng.random())
     outcome = OUTCOME_ORDER[outcome_idx]
+
+    # Per-outcome pitch count estimate (K~4.8, BB~5.6, contact~3.3-3.6)
+    est_pitches = _PITCHES_PER_OUTCOME[outcome_idx]
 
     new_bases, runs, outs_added = apply_transition(
         outcome, state.bases, state.outs, transition_matrix, rng,
     )
 
-    return outcome, runs, new_bases, outs_added
+    return outcome, runs, new_bases, outs_added, est_pitches
 
 
 def simulate_half_inning(
@@ -442,7 +486,7 @@ def simulate_half_inning(
         if state.outs >= 3:
             break
 
-        outcome, runs, new_bases, outs_added = simulate_plate_appearance(
+        outcome, runs, new_bases, outs_added, est_pitches = simulate_plate_appearance(
             state, batting_side, pitching_side, dists, transition_matrix, rng,
         )
 
@@ -462,13 +506,13 @@ def simulate_half_inning(
         else:
             state.away_lineup_pos = (state.away_lineup_pos + 1) % 9
 
-        # Track pitcher pitch count (estimate)
+        # Track pitcher pitch count using per-outcome estimates
         if pitching_side == "home":
             if state.home_pitcher == "sp":
-                state.home_sp_pitches += config.pitches_per_pa
+                state.home_sp_pitches += est_pitches
         else:
             if state.away_pitcher == "sp":
-                state.away_sp_pitches += config.pitches_per_pa
+                state.away_sp_pitches += est_pitches
 
         # Walk-off check: bottom of 9th+ and home team takes the lead
         if (batting_side == "home" and state.inning >= 9
@@ -476,6 +520,25 @@ def simulate_half_inning(
             break
 
     return runs_total
+
+
+def _advance_reliever(state: GameState, side: str, ctx: TeamContext,
+                      rng: np.random.Generator, config: SimConfig) -> None:
+    """Advance to the next reliever for a team. Modifies state in-place."""
+    if side == "home":
+        ri = state.home_reliever_idx
+        if ri < len(ctx.relievers):
+            state.home_pitcher = f"rp{ri}"
+            state.home_reliever_idx = ri + 1
+        else:
+            state.home_pitcher = "bp"  # exhausted relievers, fall back to composite
+    else:
+        ri = state.away_reliever_idx
+        if ri < len(ctx.relievers):
+            state.away_pitcher = f"rp{ri}"
+            state.away_reliever_idx = ri + 1
+        else:
+            state.away_pitcher = "bp"
 
 
 def simulate_game(
@@ -505,6 +568,8 @@ def simulate_game(
         away_pitcher=initial_state.away_pitcher,
         home_sp_pitches=initial_state.home_sp_pitches,
         away_sp_pitches=initial_state.away_sp_pitches,
+        home_reliever_idx=initial_state.home_reliever_idx,
+        away_reliever_idx=initial_state.away_reliever_idx,
     )
 
     max_innings = 15  # safety limit
@@ -512,6 +577,12 @@ def simulate_game(
     # SP pull thresholds for this game (sampled once per game)
     home_sp_limit = rng.normal(config.sp_pitch_limit_mean, config.sp_pitch_limit_std)
     away_sp_limit = rng.normal(config.sp_pitch_limit_mean, config.sp_pitch_limit_std)
+
+    # Track reliever pitch counts per-game
+    home_rp_pitches = 0.0
+    away_rp_pitches = 0.0
+    home_rp_limit = rng.normal(config.reliever_pitch_limit_mean, config.reliever_pitch_limit_std)
+    away_rp_limit = rng.normal(config.reliever_pitch_limit_mean, config.reliever_pitch_limit_std)
 
     # If resuming mid-inning, finish the current half-inning first
     if state.outs > 0 or any(state.bases):
@@ -533,39 +604,58 @@ def simulate_game(
         state.bases = (False, False, False)
 
     while state.inning <= max_innings:
-        # SP pull check at inning boundaries
+        # SP→reliever transition at inning boundaries
         if state.away_pitcher == "sp" and state.away_sp_pitches >= away_sp_limit:
-            state.away_pitcher = "bp"
+            _advance_reliever(state, "away", away_ctx, rng, config)
+            away_rp_limit = rng.normal(config.reliever_pitch_limit_mean,
+                                       config.reliever_pitch_limit_std)
+            away_rp_pitches = 0.0
         if state.home_pitcher == "sp" and state.home_sp_pitches >= home_sp_limit:
-            state.home_pitcher = "bp"
+            _advance_reliever(state, "home", home_ctx, rng, config)
+            home_rp_limit = rng.normal(config.reliever_pitch_limit_mean,
+                                       config.reliever_pitch_limit_std)
+            home_rp_pitches = 0.0
+
+        # Reliever→reliever transition (check if current reliever is gassed)
+        if state.away_pitcher.startswith("rp") and away_rp_pitches >= away_rp_limit:
+            _advance_reliever(state, "away", away_ctx, rng, config)
+            away_rp_limit = rng.normal(config.reliever_pitch_limit_mean,
+                                       config.reliever_pitch_limit_std)
+            away_rp_pitches = 0.0
+        if state.home_pitcher.startswith("rp") and home_rp_pitches >= home_rp_limit:
+            _advance_reliever(state, "home", home_ctx, rng, config)
+            home_rp_limit = rng.normal(config.reliever_pitch_limit_mean,
+                                       config.reliever_pitch_limit_std)
+            home_rp_pitches = 0.0
 
         # Top of inning: away team bats
         if state.top_bottom == "Top":
-            # Extra innings: Manfred runner on 2B
             if state.inning >= 10:
                 state.bases = (False, True, False)
 
+            pre_pitches_home = state.home_sp_pitches
             simulate_half_inning(
                 state, "away", "home", dists, transition_matrix, config, rng,
             )
+            # Track reliever pitches for home pitcher
+            if state.home_pitcher.startswith("rp"):
+                home_rp_pitches += (state.home_sp_pitches - pre_pitches_home)  # approximation
+
             state.outs = 0
             state.bases = (False, False, False)
             state.top_bottom = "Bot"
 
-            # Bottom of 9th+ is skipped if home already leads
             if state.inning >= 9 and state.home_score > state.away_score:
                 return state.home_score, state.away_score
 
         # Bottom of inning: home team bats
         if state.top_bottom == "Bot":
-            # Extra innings: Manfred runner on 2B
             if state.inning >= 10:
                 state.bases = (False, True, False)
 
             simulate_half_inning(
                 state, "home", "away", dists, transition_matrix, config, rng,
             )
-            # Walk-off check
             if state.inning >= 9 and state.home_score > state.away_score:
                 return state.home_score, state.away_score
 
@@ -574,11 +664,9 @@ def simulate_game(
             state.top_bottom = "Top"
             state.inning += 1
 
-        # End of regulation check
         if state.inning > 9 and state.top_bottom == "Top" and state.home_score != state.away_score:
             return state.home_score, state.away_score
 
-    # Tie after max innings — rare; call it a tie (split result)
     return state.home_score, state.away_score
 
 
@@ -739,19 +827,99 @@ def ensure_batter_index(idx: dict) -> None:
     idx["batter"] = {bid: grp for bid, grp in xrv_df.groupby("batter")}
 
 
+@functools.lru_cache(maxsize=512)
+def _fetch_milb_outcome_rates(
+    player_id: int,
+    season: int = 2025,
+) -> dict[str, float] | None:
+    """Fetch minor league stats from MLB Stats API and convert to outcome rates.
+
+    Tries AAA first, then AA, A+, A. Returns None if no MiLB data found.
+    """
+    for sport_id in [11, 12, 13, 14]:  # AAA, AA, A+, A
+        try:
+            url = (f"{MLB_API}/people/{player_id}/stats"
+                   f"?stats=season&group=hitting&gameType=R&season={season}&sportId={sport_id}")
+            resp = httpx.get(url, timeout=10.0)
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            splits = data.get("stats", [{}])[0].get("splits", [])
+            if not splits:
+                continue
+            stat = splits[0].get("stat", {})
+            pa = stat.get("plateAppearances", 0)
+            if pa < _MIN_BATTER_PA:
+                continue
+
+            # Extract counting stats
+            k = stat.get("strikeOuts", 0)
+            bb = stat.get("baseOnBalls", 0)
+            hbp = stat.get("hitByPitch", 0)
+            hr = stat.get("homeRuns", 0)
+            doubles = stat.get("doubles", 0)
+            triples = stat.get("triples", 0)
+            hits = stat.get("hits", 0)
+            singles = hits - doubles - triples - hr
+            gidp = stat.get("groundIntoDoublePlay", 0)
+            go = stat.get("groundOuts", 0)
+            ao = stat.get("airOuts", 0)
+
+            # Estimate out types (API gives groundOuts + airOuts)
+            total_outs = pa - k - bb - hbp - hits - gidp
+            out_ground = max(go - gidp, 0)
+            out_fly = int(ao * 0.75)  # ~75% fly outs, 25% line outs
+            out_line = max(ao - out_fly, 0)
+
+            raw_rates = {
+                "K": k / pa, "BB": bb / pa, "HBP": hbp / pa,
+                "1B": max(singles, 0) / pa, "2B": doubles / pa, "3B": triples / pa,
+                "HR": hr / pa, "dp": gidp / pa,
+                "out_ground": out_ground / pa, "out_fly": out_fly / pa,
+                "out_line": out_line / pa,
+            }
+
+            # Apply level adjustment
+            adj = _MILB_LEVEL_ADJUSTMENTS.get(sport_id, {})
+            adjusted = {o: raw_rates[o] * adj.get(o, 1.0) for o in OUTCOME_ORDER}
+
+            # Normalize
+            total = sum(adjusted.values())
+            if total > 0:
+                adjusted = {o: v / total for o, v in adjusted.items()}
+            return adjusted
+
+        except Exception:
+            continue
+    return None
+
+
 def _compute_batter_outcome_rates(
     idx: dict,
     batter_id: int,
     game_date: str,
     n_pa: int = 500,
+    season: int | None = None,
 ) -> dict[str, float] | None:
-    """Compute a batter's empirical PA outcome rates from recent history."""
+    """Compute a batter's empirical PA outcome rates.
+
+    Fallback chain: MLB stats (>= 50 PAs) -> MiLB stats -> None (league avg).
+    """
     if batter_id == 0:
         return None
     batter_df = idx.get("batter", {}).get(batter_id)
-    if batter_df is None:
-        return None
-    return compute_outcome_rates(batter_df, game_date, n_pa)
+    if batter_df is not None:
+        rates = compute_outcome_rates(batter_df, game_date, n_pa)
+        if rates is not None:
+            return rates
+
+    # Try MiLB stats
+    if season is not None:
+        milb_rates = _fetch_milb_outcome_rates(batter_id, season)
+        if milb_rates is not None:
+            return milb_rates
+
+    return None
 
 
 def _compute_pitcher_outcome_rates(
@@ -795,6 +963,115 @@ def _compute_bp_outcome_rates(
     return compute_outcome_rates(reliever_pitches, game_date, n_pa=2000)
 
 
+def _identify_top_relievers(
+    idx: dict,
+    team: str,
+    game_date: str,
+    lookback_days: int = 30,
+    max_relievers: int = 7,
+) -> list[int]:
+    """Identify top relievers by recent usage (pitch count), ordered by usage.
+
+    Returns list of pitcher IDs, most-used first.
+    """
+    team_pitches = idx.get("pitching_team", {}).get(team)
+    if team_pitches is None:
+        return []
+
+    before = _get_before(team_pitches, game_date)
+    cutoff = np.datetime64(pd.Timestamp(game_date) - pd.Timedelta(days=lookback_days))
+    recent = before[before["game_date"] >= cutoff]
+
+    if len(recent) == 0:
+        return []
+
+    # Exclude starters
+    starters = set(recent.groupby("game_pk").first()["pitcher"].values)
+    reliever_pitches = recent[~recent["pitcher"].isin(starters)]
+
+    if len(reliever_pitches) == 0:
+        return []
+
+    # Top relievers by pitch count
+    usage = reliever_pitches.groupby("pitcher").size().sort_values(ascending=False)
+    return usage.head(max_relievers).index.tolist()
+
+
+def _estimate_pitcher_pitches_per_pa(
+    idx: dict,
+    pitcher_id: int,
+    game_date: str,
+    n_pa: int = 200,
+) -> float:
+    """Estimate a pitcher's average pitches per PA from recent data."""
+    pitcher_df = idx.get("pitcher", {}).get(pitcher_id)
+    if pitcher_df is None:
+        return 3.9
+
+    before = _get_before(pitcher_df, game_date)
+    if len(before) == 0:
+        return 3.9
+
+    recent = before.iloc[-2000:]  # last 2000 pitches max
+    pa_count = recent["events"].notna().sum()
+    if pa_count < 20:
+        return 3.9
+
+    return len(recent) / pa_count
+
+
+def _compute_pitcher_arsenal_and_mix(
+    idx: dict,
+    pitcher_id: int,
+    game_date: str,
+    arsenal_stats: dict | None,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Compute standardized arsenal features and pitch-type mix for a pitcher."""
+    pitcher_df = idx.get("pitcher", {}).get(pitcher_id)
+    if pitcher_df is None:
+        return None, None
+
+    arsenal_raw = _compute_pitcher_arsenal_live(pitcher_df, game_date)
+    if arsenal_raw is None:
+        return None, None
+
+    arsenal_z = _standardize_arsenal(arsenal_raw, arsenal_stats) if arsenal_stats else None
+
+    # Compute pitch-type mix
+    before = _get_before(pitcher_df, game_date)
+    recent = before.iloc[-2000:] if len(before) > 2000 else before
+    pt_counts = recent["pitch_type"].value_counts()
+    n = len(recent)
+    mix = np.zeros(MO_N_PTYPES)
+    for pt, count in pt_counts.items():
+        if pt in MO_PTYPE_MAP:
+            mix[MO_PTYPE_MAP[pt]] = count / n
+
+    return arsenal_z, mix
+
+
+def _predict_matchup_probs_for_lineup(
+    mo_models: dict,
+    arsenal_z: np.ndarray,
+    pitch_mix: np.ndarray,
+    lineup: list[tuple[int, str]],
+) -> list[np.ndarray | None]:
+    """Get multi-output model predictions for each hitter in a lineup vs a pitcher."""
+    results = []
+    for batter_id, bat_side in lineup[:9]:
+        if batter_id == 0 or arsenal_z is None:
+            results.append(None)
+            continue
+        hand = bat_side if bat_side in ("L", "R") else "R"
+        model_art = mo_models.get(hand)
+        if model_art is None:
+            results.append(None)
+            continue
+        probs = predict_matchup_distribution(model_art, arsenal_z, pitch_mix, batter_id)
+        results.append(probs)
+    return results
+
+
 def load_simulation_context(
     game: dict,
     target_date: str,
@@ -802,17 +1079,21 @@ def load_simulation_context(
     idx: dict,
     matchup_models: dict,
     base_rates: dict = None,
-    calibration: dict = None,
+    mo_models: dict | None = None,
+    config: SimConfig | None = None,
 ) -> tuple[TeamContext, TeamContext]:
     """
     Build TeamContext objects for home and away teams.
 
     For each batter-pitcher matchup, builds a full outcome distribution from:
-      1. Batter's empirical outcome rates (K%, BB%, HR%, etc.)
+      1. Batter's empirical outcome rates (MLB or MiLB fallback)
       2. Pitcher's empirical outcome rates
       3. Log5 odds-ratio combination
-      4. Bayesian matchup model interaction adjustment
+      4. Multi-output matchup model direct predictions (blended with log5)
     """
+    if config is None:
+        config = SimConfig()
+
     home_team = game["home_team"]
     away_team = game["away_team"]
     home_sp = game.get("home_sp_id")
@@ -827,15 +1108,20 @@ def load_simulation_context(
         away_lineup.append((0, "R"))
 
     gdate = str(target_date)
+    season = int(gdate[:4])
 
-    # Ensure batter index exists for fast per-batter lookups
     ensure_batter_index(idx)
 
-    # Use league average as fallback
     if base_rates is None:
         base_rates = {o: 1.0 / _N_OUTCOMES for o in OUTCOME_ORDER}
-    if calibration is None:
-        calibration = {"alphas": {o: 0.0 for o in OUTCOME_ORDER}, "scale": 8.0}
+
+    # Get arsenal stats from multi-output model for standardization
+    arsenal_stats = None
+    if mo_models:
+        for hand_art in mo_models.values():
+            arsenal_stats = hand_art.get("arsenal_stats")
+            if arsenal_stats:
+                break
 
     # ── Compute pitcher outcome rates ──
     away_sp_rates = None
@@ -845,70 +1131,131 @@ def load_simulation_context(
     if pd.notna(home_sp):
         home_sp_rates = _compute_pitcher_outcome_rates(idx, int(home_sp), gdate)
 
-    # Bullpen outcome rates
+    # Bullpen composite rates (fallback)
     home_bp_rates = _compute_bp_outcome_rates(idx, home_team, gdate)
     away_bp_rates = _compute_bp_outcome_rates(idx, away_team, gdate)
 
-    # ── Compute Bayesian matchup interaction xRVs ──
-    home_vs_away_sp_xrv = [0.0] * 9  # home hitters vs away SP
-    away_vs_home_sp_xrv = [0.0] * 9  # away hitters vs home SP
+    # ── Multi-output model predictions for SP matchups ──
+    home_vs_away_sp_probs = [None] * 9
+    away_vs_home_sp_probs = [None] * 9
 
-    if matchup_models and pd.notna(away_sp) and int(away_sp) in idx["pitcher"]:
-        home_vs_away_sp_xrv = _compute_per_hitter_matchup_xrv(
-            matchup_models, idx["pitcher"][int(away_sp)],
-            int(away_sp), gdate, home_lineup,
-        )
-    if matchup_models and pd.notna(home_sp) and int(home_sp) in idx["pitcher"]:
-        away_vs_home_sp_xrv = _compute_per_hitter_matchup_xrv(
-            matchup_models, idx["pitcher"][int(home_sp)],
-            int(home_sp), gdate, away_lineup,
-        )
+    away_sp_arsenal_z, away_sp_mix = None, None
+    home_sp_arsenal_z, home_sp_mix = None, None
+
+    if mo_models and pd.notna(away_sp):
+        away_sp_arsenal_z, away_sp_mix = _compute_pitcher_arsenal_and_mix(
+            idx, int(away_sp), gdate, arsenal_stats)
+        if away_sp_arsenal_z is not None:
+            home_vs_away_sp_probs = _predict_matchup_probs_for_lineup(
+                mo_models, away_sp_arsenal_z, away_sp_mix, home_lineup)
+
+    if mo_models and pd.notna(home_sp):
+        home_sp_arsenal_z, home_sp_mix = _compute_pitcher_arsenal_and_mix(
+            idx, int(home_sp), gdate, arsenal_stats)
+        if home_sp_arsenal_z is not None:
+            away_vs_home_sp_probs = _predict_matchup_probs_for_lineup(
+                mo_models, home_sp_arsenal_z, home_sp_mix, away_lineup)
+
+    # ── SP pitches-per-PA estimates ──
+    home_sp_ppa = 3.9
+    away_sp_ppa = 3.9
+    if pd.notna(home_sp):
+        home_sp_ppa = _estimate_pitcher_pitches_per_pa(idx, int(home_sp), gdate)
+    if pd.notna(away_sp):
+        away_sp_ppa = _estimate_pitcher_pitches_per_pa(idx, int(away_sp), gdate)
 
     # ── Build per-hitter outcome distributions ──
-    def _build_dists_for_lineup(
-        lineup, opposing_sp_rates, opposing_bp_rates,
-        matchup_xrvs,
-    ):
+    model_weight = config.model_blend_weight
+
+    def _build_dists_for_lineup(lineup, opposing_sp_rates, opposing_bp_rates,
+                                model_probs_vs_sp):
         sp_dists = []
         bp_dists = []
         for pos, (batter_id, _hand) in enumerate(lineup[:9]):
-            batter_rates = _compute_batter_outcome_rates(idx, batter_id, gdate)
+            batter_rates = _compute_batter_outcome_rates(idx, batter_id, gdate,
+                                                         season=season)
 
-            # vs SP: log5(batter, pitcher) + matchup interaction
+            sp_model_probs = model_probs_vs_sp[pos] if pos < len(model_probs_vs_sp) else None
             sp_dist = build_matchup_distribution(
                 batter_rates, opposing_sp_rates, base_rates,
-                matchup_xrvs[pos] if pos < len(matchup_xrvs) else 0.0,
-                calibration,
+                model_probs=sp_model_probs, model_weight=model_weight,
             )
             sp_dists.append(sp_dist)
 
-            # vs BP: log5(batter, bp_composite), no matchup interaction
             bp_dist = build_matchup_distribution(
                 batter_rates, opposing_bp_rates, base_rates,
-                0.0,  # no specific matchup model for bullpen
-                calibration,
             )
             bp_dists.append(bp_dist)
 
         return sp_dists, bp_dists
 
     home_sp_dists, home_bp_dists = _build_dists_for_lineup(
-        home_lineup, away_sp_rates, away_bp_rates, home_vs_away_sp_xrv,
+        home_lineup, away_sp_rates, away_bp_rates, home_vs_away_sp_probs,
     )
     away_sp_dists, away_bp_dists = _build_dists_for_lineup(
-        away_lineup, home_sp_rates, home_bp_rates, away_vs_home_sp_xrv,
+        away_lineup, home_sp_rates, home_bp_rates, away_vs_home_sp_probs,
     )
+
+    # ── Build individual reliever distributions ──
+    def _build_relievers(team, opposing_lineup, opposing_bp_rates):
+        reliever_ids = _identify_top_relievers(idx, team, gdate)
+        relievers = []
+        for rp_id in reliever_ids:
+            rp_rates = _compute_pitcher_outcome_rates(idx, rp_id, gdate)
+            rp_ppa = _estimate_pitcher_pitches_per_pa(idx, rp_id, gdate)
+
+            # Get model predictions for this reliever vs lineup
+            rp_arsenal_z, rp_mix = None, None
+            if mo_models and arsenal_stats:
+                rp_arsenal_z, rp_mix = _compute_pitcher_arsenal_and_mix(
+                    idx, rp_id, gdate, arsenal_stats)
+
+            rp_dists = []
+            for pos, (batter_id, _hand) in enumerate(opposing_lineup[:9]):
+                batter_rates = _compute_batter_outcome_rates(idx, batter_id, gdate,
+                                                             season=season)
+
+                # Model predictions for this reliever
+                rp_model_probs = None
+                if mo_models and rp_arsenal_z is not None:
+                    hand = _hand if _hand in ("L", "R") else "R"
+                    model_art = mo_models.get(hand)
+                    if model_art:
+                        rp_model_probs = predict_matchup_distribution(
+                            model_art, rp_arsenal_z, rp_mix, batter_id)
+
+                dist = build_matchup_distribution(
+                    batter_rates, rp_rates if rp_rates else opposing_bp_rates,
+                    base_rates, model_probs=rp_model_probs, model_weight=model_weight,
+                )
+                rp_dists.append(dist)
+
+            relievers.append(RelieverInfo(
+                pitcher_id=rp_id,
+                outcome_dists=rp_dists,
+                pitches_per_pa=rp_ppa,
+            ))
+        return relievers
+
+    # Home team's relievers face away lineup
+    home_relievers = _build_relievers(home_team, away_lineup, home_bp_rates)
+    # Away team's relievers face home lineup
+    away_relievers = _build_relievers(away_team, home_lineup, away_bp_rates)
 
     home_ctx = TeamContext(
         team=home_team,
         lineup=home_lineup[:9],
         sp_outcome_dists=home_sp_dists,
+        sp_pitches_per_pa=home_sp_ppa,
+        relievers=home_relievers,
         bp_outcome_dists=home_bp_dists,
     )
     away_ctx = TeamContext(
         team=away_team,
         lineup=away_lineup[:9],
         sp_outcome_dists=away_sp_dists,
+        sp_pitches_per_pa=away_sp_ppa,
+        relievers=away_relievers,
         bp_outcome_dists=away_bp_dists,
     )
 
@@ -924,7 +1271,7 @@ def fetch_live_game_state(client: httpx.Client, game_pk: int) -> GameState:
     Returns a GameState populated with current inning, outs, bases, score,
     and pitcher state.
     """
-    resp = client.get(f"{MLB_API}/game/{game_pk}/feed/live")
+    resp = client.get(f"https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live")
     resp.raise_for_status()
     data = resp.json()
 
@@ -1000,7 +1347,6 @@ def fetch_live_game_state(client: httpx.Client, game_pk: int) -> GameState:
 def run_backtest(
     season: int,
     base_rates: dict,
-    calibration: dict,
     transition_matrix: dict,
     config: SimConfig,
 ):
@@ -1016,7 +1362,6 @@ def run_backtest(
         return
 
     games_df = pd.read_parquet(games_path)
-    # Filter to completed regular-season games with known SPs
     games_df = games_df[
         (games_df["home_win"].notna()) &
         (games_df["home_sp_id"].notna()) &
@@ -1045,6 +1390,13 @@ def run_backtest(
     if not matchup_models:
         matchup_models = _load_hand_models("matchup_model", season)
 
+    # Load multi-output models
+    mo_models = load_multi_output_models(model_year)
+    if not mo_models:
+        mo_models = load_multi_output_models(season)
+    if not mo_models:
+        print("  No multi-output models found; using log5 only.")
+
     # Load lineups
     lineups_path = DATA_DIR / "games" / f"lineups_{season}.json"
     lineups = {}
@@ -1072,7 +1424,7 @@ def run_backtest(
         try:
             home_ctx, away_ctx = load_simulation_context(
                 game, str(game["game_date"]), lu, idx, matchup_models,
-                base_rates, calibration,
+                base_rates, mo_models=mo_models, config=config,
             )
             result = monte_carlo_win_prob(
                 home_ctx, away_ctx, GameState(),
@@ -1092,7 +1444,6 @@ def run_backtest(
     preds = np.array(preds)
     actuals = np.array(actuals)
 
-    # Clip to avoid log(0)
     preds_clipped = np.clip(preds, 0.01, 0.99)
 
     ll = log_loss(actuals, preds_clipped)
@@ -1111,7 +1462,6 @@ def run_backtest(
     print(f"  Mean pred:   {preds.mean():.4f}")
     print(f"  Home win%:   {actuals.mean():.4f}")
 
-    # Calibration bins
     print(f"\n  Calibration:")
     for lo in np.arange(0.3, 0.75, 0.05):
         hi = lo + 0.05
@@ -1126,7 +1476,6 @@ def run_backtest(
 def predict_date(
     target_date: str,
     base_rates: dict,
-    calibration: dict,
     transition_matrix: dict,
     config: SimConfig,
     game_pk_filter: int = None,
@@ -1148,7 +1497,6 @@ def predict_date(
 
     print(f"  {len(games)} games found")
 
-    # Load data
     year = int(target_date[:4])
     xrv_frames = []
     for yr in range(year - 1, year + 1):
@@ -1169,8 +1517,10 @@ def predict_date(
     matchup_models = _load_hand_models("matchup_model", model_year)
     if not matchup_models:
         matchup_models = _load_hand_models("matchup_model", year)
-    if not matchup_models:
-        print("No matchup models found. Using league-average xRV.")
+
+    mo_models = load_multi_output_models(model_year)
+    if not mo_models:
+        mo_models = load_multi_output_models(year)
 
     print(f"\n{'='*70}")
     print(f"{'Game':<35} {'Home WP':>8} {'Away WP':>8} {'Runs':>8} {'Status'}")
@@ -1181,14 +1531,12 @@ def predict_date(
         is_live = status in ("Live", "In Progress")
         is_final = status == "Final"
 
-        # Fetch lineup
         lu = fetch_lineup(client, game["game_pk"])
         if not lu.get("home") or not lu.get("away"):
             label = f"{game['away_team']:>3} @ {game['home_team']:<3}"
             print(f"  {label:<35} {'---':>8} {'---':>8} {'---':>8} No lineups")
             continue
 
-        # Determine initial state
         if is_live:
             try:
                 initial_state = fetch_live_game_state(client, game["game_pk"])
@@ -1201,7 +1549,7 @@ def predict_date(
         try:
             home_ctx, away_ctx = load_simulation_context(
                 game, target_date, lu, idx, matchup_models or {},
-                base_rates, calibration,
+                base_rates, mo_models=mo_models, config=config,
             )
             result = monte_carlo_win_prob(
                 home_ctx, away_ctx, initial_state,
@@ -1261,7 +1609,7 @@ def main():
     # Load simulation artifacts
     print("Loading simulation artifacts...")
     try:
-        base_rates, calibration, transition_matrix = load_sim_artifacts()
+        base_rates, transition_matrix = load_sim_artifacts()
     except FileNotFoundError as e:
         print(f"Simulation data not found: {e}")
         print("Run `python src/build_transition_matrix.py` first.")
@@ -1269,11 +1617,11 @@ def main():
 
     if args.backtest:
         config.n_sims = min(config.n_sims, 1000)  # faster for backtest
-        run_backtest(args.backtest, base_rates, calibration, transition_matrix, config)
+        run_backtest(args.backtest, base_rates, transition_matrix, config)
         return
 
     target_date = args.date or date.today().isoformat()
-    predict_date(target_date, base_rates, calibration, transition_matrix,
+    predict_date(target_date, base_rates, transition_matrix,
                  config, game_pk_filter=args.game_pk)
 
 

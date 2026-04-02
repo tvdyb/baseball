@@ -28,9 +28,21 @@ from pathlib import Path
 import httpx
 import numpy as np
 import pandas as pd
-from sklearn.metrics import log_loss, brier_score_loss, roc_auc_score
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+# torch/multi-output model must be imported BEFORE sklearn to avoid segfault
+from multi_output_matchup_model import load_multi_output_models
+from simulate import (
+    GameState,
+    SimConfig,
+    load_sim_artifacts,
+    load_simulation_context,
+    monte_carlo_win_prob,
+    ensure_batter_index,
+)
+
+from sklearn.metrics import log_loss, brier_score_loss, roc_auc_score
 
 from build_transition_matrix import OUTCOME_ORDER
 from feature_engineering import _preindex_xrv, _load_hand_models
@@ -42,14 +54,6 @@ from scrape_kalshi import (
     _extract_candle_close,
     _fetch_candles_with_retry,
     API_BASE as KALSHI_API_BASE,
-)
-from simulate import (
-    GameState,
-    SimConfig,
-    load_sim_artifacts,
-    load_simulation_context,
-    monte_carlo_win_prob,
-    ensure_batter_index,
 )
 from utils import DATA_DIR, XRV_DIR, MODEL_DIR
 
@@ -387,12 +391,12 @@ def load_backtest_data(season: int) -> tuple[dict, dict, dict] | None:
 def run_pregame_backtest(
     season: int,
     base_rates: dict,
-    calibration: dict,
     transition_matrix: dict,
     config: SimConfig,
     idx: dict | None = None,
     matchup_models: dict | None = None,
     lineups: dict | None = None,
+    mo_models: dict | None = None,
 ) -> pd.DataFrame:
     """Run MC simulator pregame on all games with Kalshi data.
 
@@ -476,7 +480,8 @@ def run_pregame_backtest(
         try:
             home_ctx, away_ctx = load_simulation_context(
                 game, str(game["game_date"]), lu, idx,
-                matchup_models or {}, base_rates, calibration,
+                matchup_models or {}, base_rates,
+                mo_models=mo_models, config=config,
             )
             result = monte_carlo_win_prob(
                 home_ctx, away_ctx, GameState(),
@@ -549,7 +554,6 @@ def _load_kalshi_market_tickers(season: int) -> dict[tuple[str, str, str], dict]
 def run_ingame_backtest(
     season: int,
     base_rates: dict,
-    calibration: dict,
     transition_matrix: dict,
     config: SimConfig,
     max_games: int = 100,
@@ -557,6 +561,7 @@ def run_ingame_backtest(
     idx: dict | None = None,
     matchup_models: dict | None = None,
     lineups: dict | None = None,
+    mo_models: dict | None = None,
 ) -> pd.DataFrame:
     """Run in-game backtest: reconstruct states, match to Kalshi candles, simulate.
 
@@ -640,7 +645,8 @@ def run_ingame_backtest(
             try:
                 home_ctx, away_ctx = load_simulation_context(
                     game, str(game["game_date"]), lu, idx,
-                    matchup_models or {}, base_rates, calibration,
+                    matchup_models or {}, base_rates,
+                    mo_models=mo_models, config=config,
                 )
             except Exception as e:
                 log(f"    SKIP game {gpk} (context): {type(e).__name__}: {e}")
@@ -1104,10 +1110,21 @@ def main():
 
     AUDIT_DIR.mkdir(parents=True, exist_ok=True)
 
+    # Load multi-output matchup models FIRST (torch must init before large data)
+    mo_season = args.season - 1
+    log(f"Loading multi-output matchup models (trained on {mo_season})...")
+    try:
+        mo_models = load_multi_output_models(mo_season)
+        log(f"  Loaded multi-output models: {list(mo_models.keys())}")
+    except Exception as e:
+        log(f"  Warning: Could not load multi-output models: {e}")
+        log("  Falling back to log5-only predictions")
+        mo_models = None
+
     # Load simulation artifacts
     log("Loading simulation artifacts...")
     try:
-        base_rates, calibration, transition_matrix = load_sim_artifacts()
+        base_rates, transition_matrix = load_sim_artifacts()
     except FileNotFoundError as e:
         log(f"Simulation data not found: {e}")
         log("Run `python src/build_transition_matrix.py` first.")
@@ -1128,8 +1145,9 @@ def main():
 
         pregame_config = SimConfig(n_sims=args.n_sims, random_seed=args.seed)
         pregame_df = run_pregame_backtest(
-            args.season, base_rates, calibration, transition_matrix, pregame_config,
+            args.season, base_rates, transition_matrix, pregame_config,
             idx=idx, matchup_models=matchup_models, lineups=lineups,
+            mo_models=mo_models,
         )
 
     if len(pregame_df) > 0:
@@ -1178,9 +1196,10 @@ def main():
 
         ingame_config = SimConfig(n_sims=args.n_sims_ingame, random_seed=args.seed)
         ingame_df = run_ingame_backtest(
-            args.season, base_rates, calibration, transition_matrix,
+            args.season, base_rates, transition_matrix,
             ingame_config, max_games=args.max_games, pregame_df=pregame_df,
             idx=idx, matchup_models=matchup_models, lineups=lineups,
+            mo_models=mo_models,
         )
 
         if len(ingame_df) > 0:

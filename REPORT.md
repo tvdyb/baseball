@@ -16,8 +16,8 @@ The core idea: instead of predicting a single pregame P(home_win) from features,
                     │  (built once from historical data)   │
                     ├─────────────────────────────────────┤
                     │  1. League base rates (11 outcomes)  │
-                    │  2. xRV calibration (α coefficients) │
-                    │  3. Transition matrix (880+ states)  │
+                    │  2. Transition matrix (880+ states)  │
+                    │  3. Multi-output matchup model (PT)  │
                     └─────────────┬───────────────────────┘
                                   │
     ┌──────────────┐              │              ┌──────────────┐
@@ -42,7 +42,7 @@ The core idea: instead of predicting a single pregame P(home_win) from features,
 
 ## 3. Pre-computed Artifacts
 
-Three lookup tables are built once from 5+ years of Statcast data (`build_transition_matrix.py`):
+Two lookup tables are built once from 5+ years of Statcast data (`build_transition_matrix.py`):
 
 ### 3.1 League-Average Base Rates
 
@@ -64,24 +64,7 @@ From every plate appearance in the Statcast dataset, we compute the unconditiona
 
 These serve as the "prior" — the starting point before we incorporate batter-specific, pitcher-specific, and matchup-specific information.
 
-### 3.2 xRV-to-Outcome Calibration
-
-The Bayesian matchup model produces a single number per hitter-pitcher pair: the **matchup xRV** (expected run value interaction). This captures how well a specific hitter handles a specific pitcher's arsenal. But we need to convert this continuous value into shifts across all 11 outcome categories.
-
-We do this via a log-linear model fitted on binned historical data:
-
-```
-P(outcome | matchup_xrv) = base_rate(outcome) × exp(α_outcome × xrv × scale) / Z
-```
-
-Where:
-- `α_outcome` is a fitted sensitivity coefficient per outcome type
-- `scale = 8.0` amplifies the per-pitch xRV (±0.005) to PA-level effects
-- `Z` is the normalizing constant
-
-The `α` coefficients are fitted by binning all PAs into xRV deciles and minimizing squared error between observed and predicted outcome rates. For example, a positive HR alpha means that higher xRV (hitter-favorable matchup) increases home run probability, while strikeout alpha is negative (favorable matchups reduce strikeouts).
-
-### 3.3 Base-Running Transition Matrix
+### 3.2 Base-Running Transition Matrix
 
 For every combination of `(PA outcome, base state, outs)` — 11 × 8 × 3 = 264 possible situations — we compute the empirical distribution over `(new base state, runs scored)` from historical data.
 
@@ -103,50 +86,52 @@ For combinations with fewer than 20 observations, we fall back to **deterministi
 
 ## 4. Per-Hitter Outcome Distributions
 
-The heart of the simulator is building a custom 11-category probability distribution for every hitter-pitcher matchup in the game. This happens in four stages:
+The heart of the simulator is building a custom 11-category probability distribution for every hitter-pitcher matchup in the game. This combines two independent sources:
 
-### 4.1 Stage 1: Empirical Outcome Rates
+### 4.1 Source A: Log5 Baseline
 
-For each batter, we compute their recent PA outcome frequencies from the last ~500 PAs. For the pitcher, the last ~800 PAs as pitcher. These capture individual tendencies:
-
-- A high-K pitcher will have elevated K% in their rate vector
-- A power hitter will have elevated HR% and 2B%
-- A contact hitter will have elevated 1B% and lower K%
-
-**Minimum data thresholds:** 50 PAs for batters, 100 for pitchers. Below these, we fall back to league averages to avoid small-sample noise.
-
-### 4.2 Stage 2: Log5 Combination
-
-We combine batter and pitcher rates using the **log5 / odds-ratio method** (Bill James):
+For each batter, we compute their recent PA outcome frequencies from the last ~500 PAs. For the pitcher, the last ~800 PAs. These are combined using the **log5 / odds-ratio method** (Bill James):
 
 ```
 P(outcome | batter, pitcher) ∝ (batter_rate × pitcher_rate) / league_rate
 ```
 
-This is the standard baseball approach: each player's rate is expressed as a deviation from league average, and the deviations combine multiplicatively. A high-K pitcher facing a high-K batter produces even more strikeouts than either individually, but not as many as naively multiplying their rates would suggest.
+This captures individual tendencies — a high-K pitcher facing a high-K batter produces even more strikeouts than either individually.
 
-### 4.3 Stage 3: Bayesian Matchup Interaction
+**Data fallback chain for batters:**
+1. MLB empirical rates (>= 50 PAs)
+2. MiLB stats from the MLB Stats API (AAA → AA → A+ → A, with level adjustment multipliers)
+3. League average (last resort)
 
-The log5 combination treats batter and pitcher as independent. But in reality, there are interaction effects: how a specific hitter handles a specific pitcher's arsenal mix, movement profile, pitch sequencing, and release point.
+### 4.2 Source B: Multi-Output Matchup Model
 
-The **Bayesian hierarchical matchup model** (trained separately in `matchup_model.py` using PyMC/ADVI) captures these interactions. It works in **arsenal feature space** — characterizing each pitcher along 13 dimensions (velo, movement, mix, spin, extension, release spread) and learning per-hitter sensitivities to these dimensions. This avoids the sparse pitcher×hitter estimation problem.
+The **multi-output matchup model** (`multi_output_matchup_model.py`, PyTorch) directly predicts the 11-category outcome distribution for each hitter-pitcher pair. Unlike the previous scalar xRV approach, this preserves matchup-specific outcome profiles.
 
-For each hitter-pitcher pair, the model produces a **matchup xRV**: the expected run value interaction — the deviation from what you'd predict knowing only the batter's overall ability and the pitcher's overall ability. This is then converted to outcome probability shifts via the calibration coefficients from §3.2.
+**Architecture:**
+```
+logits[c] = intercept[c]
+           + beta_arsenal[k,c] · arsenal_z[k]        # population arsenal effect
+           + beta_ptmix[p,c] · pitch_mix[p]           # population pitch-type effect
+           + hitter_base[h,c]                          # per-hitter baseline
+           + hitter_arsenal[h,k,c] · arsenal_z[k]     # per-hitter arsenal sensitivity
+           + hitter_ptype[h,p,c] · pitch_mix[p]       # per-hitter pitch-type response
 
-### 4.4 Stage 4: Clamping and Normalization
+probs = softmax(logits)  →  11-category distribution
+```
 
-After all adjustments, we clamp extreme outcome rates to prevent unrealistic distributions:
+The model works in **arsenal feature space** (13 dimensions: velo, movement, mix, spin, extension, release spread), so it generalizes to pitchers not seen in training. Per-hitter parameters are regularized via L2 penalties (equivalent to hierarchical Bayesian shrinkage), meaning unknown hitters get population-average predictions while well-observed hitters get personalized outcome distributions.
 
-| Outcome | Max Rate |
-|---------|----------|
-| K | 50% |
-| HR | 10% |
-| BB | 25% |
-| HBP | 5% |
-| 3B | 3% |
-| dp | 8% |
+**Why this is better than scalar xRV:** A hitter who crushes fastballs but whiffs on sliders will have elevated HR/XBH probabilities against fastball-heavy pitchers but elevated K% against slider-heavy pitchers. The old approach collapsed this to a single number and applied uniform outcome shifts.
 
-Finally, all rates are normalized to sum to 1.0 and stored as a numpy probability array.
+### 4.3 Blending
+
+The final distribution is a weighted average:
+
+```
+P(outcome) = w × model_probs + (1 - w) × log5_probs
+```
+
+Where `w = 0.6` (tunable). The log5 baseline provides robustness when the model has limited data for a hitter. The softmax output guarantees valid probability distributions without any need for clamping.
 
 ### 4.5 Double Play Adjustment
 
@@ -177,10 +162,10 @@ simulate_half_inning(state, batting_side, pitching_side, dists, transition_matri
 Loop plate appearances until 3 outs (or walk-off in bottom of 9th+). Each PA:
 - Updates bases, outs, score
 - Advances the lineup position (cycles through 9 batters)
-- Tracks estimated pitch count for the pitcher (PAs × 3.9 pitches/PA)
+- Tracks pitch count using **per-outcome estimates** (K~4.8, BB~5.6, contact~3.3-3.6 pitches) rather than a flat average
 - Checks for walk-off condition
 
-Safety limit of 25 PAs per half-inning (MLB record is 23 batters in a half-inning).
+Safety limit of 25 PAs per half-inning (MLB record is 23 batters in a half-inning). Outcome sampling uses a Numba JIT-compiled cumulative sum for performance.
 
 ### 5.3 Full Game
 
@@ -190,11 +175,12 @@ simulate_game(home_ctx, away_ctx, initial_state, dists, transition_matrix, confi
 
 Alternates half-innings from the initial state:
 
-1. **SP → BP transition:** At each inning boundary, check if the starter's estimated pitch count exceeds a Gaussian-sampled limit (mean=92, σ=10). This varies per-simulation, capturing the randomness of when a manager pulls the starter.
-2. **Manfred runner:** From the 10th inning on, place a ghost runner on 2B at the start of each half-inning.
-3. **Walk-off:** If the home team takes the lead in the bottom of the 9th or later, the game ends immediately.
-4. **Skip bottom:** If the home team leads after the top of the 9th or later, skip the bottom half.
-5. **Extra innings:** Continue until one team leads after a complete inning (max 15 innings safety limit).
+1. **SP → reliever transition:** At each inning boundary, check if the starter's accumulated pitch count exceeds a Gaussian-sampled limit (mean=92, σ=10). Pitch counts accumulate per-outcome (a K costs ~4.8 pitches, a ground out ~3.4), so high-K starters reach their limit sooner.
+2. **Individual relievers:** When the SP is pulled, the simulator cycles through the team's top relievers (up to 7, ordered by recent usage). Each reliever has their own per-hitter outcome distributions from the matchup model. Relievers are pulled after ~20 ± 5 pitches (one inning typical), then the next reliever enters. This captures late-game dynamics far better than the previous single bullpen composite.
+3. **Manfred runner:** From the 10th inning on, place a ghost runner on 2B at the start of each half-inning.
+4. **Walk-off:** If the home team takes the lead in the bottom of the 9th or later, the game ends immediately.
+5. **Skip bottom:** If the home team leads after the top of the 9th or later, skip the bottom half.
+6. **Extra innings:** Continue until one team leads after a complete inning (max 15 innings safety limit).
 
 ### 5.4 Monte Carlo Aggregation
 
@@ -272,7 +258,7 @@ This rebalancing strategy is powerful because:
 
 ## 7. Backtest Results
 
-*Results populated from the 2025 season backtest (re-run with 2000 pregame sims, 1000 in-game sims):*
+*Results from the 2025 season backtest (2,000 pregame sims, 1,000 in-game sims):*
 
 ### 7.1 Pregame Performance
 
@@ -310,7 +296,15 @@ This rebalancing strategy is powerful because:
 | Mid (Inn 4-6) | 2,952 | 0.5155 | 0.4916 | +0.024 | 75.2% |
 | Late (Inn 7-9+) | 2,833 | 0.3230 | 0.3242 | **-0.001** | 85.8% |
 
-**In-game takeaway:** The simulator tracks Kalshi closely, with a log loss gap of just +0.019 overall. In late innings (7th+), the simulator **matches or slightly beats** Kalshi (LL delta -0.001). Convergence analysis shows MAE drops from 0.079 (early) to 0.042 (late) and correlation rises from 0.863 to 0.980.
+**By inning (late game):**
+
+| Inning | N | Sim LL | Kalshi LL | Delta | Sim Acc |
+|--------|---|--------|-----------|-------|---------|
+| 7 | 983 | 0.3766 | 0.3749 | +0.002 | 83.5% |
+| 8 | 982 | 0.2978 | 0.2943 | +0.004 | 87.2% |
+| 9 | 758 | **0.2426** | 0.2593 | **-0.017** | 90.4% |
+
+**In-game takeaway:** The simulator tracks Kalshi closely, with a log loss gap of just +0.019 overall. In late innings (7th+), the simulator **matches or slightly beats** Kalshi (LL delta -0.001). In the 9th inning specifically, the simulator **beats Kalshi by 1.7 points** of log loss with 90.4% accuracy. Convergence analysis shows MAE drops from 0.079 (early) to 0.042 (late) and correlation rises from 0.863 to 0.980.
 
 **Calibration (in-game):** Much better than pregame. The extremes (below 35% and above 65%) are well-calibrated (gaps of 3.0 and 1.4 points). The mid-range (40-60%) shows a modest underestimation bias of 4-8 points.
 
@@ -354,29 +348,19 @@ Assigns a run value to every pitch. Two components:
 
 Trained on prior-season data only (no lookahead). The xRV values are the inputs to the matchup model.
 
-### 8.2 Bayesian Matchup Model
+### 8.2 Multi-Output Matchup Model
 
-**File:** `matchup_model.py`
+**File:** `multi_output_matchup_model.py`
 
-Hierarchical model (PyMC, fitted via ADVI) that learns pitcher-hitter interactions in arsenal feature space:
+PyTorch model that directly predicts 11-category outcome distributions per hitter-pitcher matchup. Replaces the previous scalar xRV model + log-linear calibration with a single end-to-end prediction.
 
-```
-xRV(hitter, pitch) = β₀ + pitcher_bases[pitch_type]
-                    + hitter_effect[hitter_id]
-                    + hitter_ptype_effect[hitter_id, pitch_type]
-```
-
-Where `pitcher_bases` are computed from the pitcher's arsenal features (13 dimensions) and recent pitch data. The hitter effects are shrunk toward zero via hierarchical priors, meaning unknown hitters get population-average estimates while well-observed hitters get personalized predictions.
+Works in arsenal feature space (13 dimensions). Per-hitter parameters are L2-regularized (equivalent to hierarchical Bayesian shrinkage). Trained on ~160K PA-level observations pooled across 2024-2025 seasons (vsL: 65K PAs, 240 hitters; vsR: 95K PAs, 357 hitters). Intercepts initialized from empirical outcome rates and regularized toward that prior to prevent degenerate population averages. Softmax output guarantees valid probability distributions.
 
 ### 8.3 Feature Engineering
 
 **File:** `feature_engineering.py`
 
-Computes per-hitter matchup xRV values by:
-1. Pre-indexing all pitch data by pitcher and batter
-2. Computing pitcher pitch-base vectors from their recent arsenal
-3. Applying the Bayesian model to get per-hitter xRV predictions
-4. Extracting the interaction term (deviation from population average)
+Computes pitcher arsenal profiles (13 dimensions), pitch-type mixes, and per-hitter matchup predictions. Pre-indexes all pitch data by pitcher and batter for fast lookup.
 
 ---
 
@@ -384,25 +368,23 @@ Computes per-hitter matchup xRV values by:
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `simulate.py` | ~1275 | Core MC simulator: data structures, outcome distributions, game simulation, CLI |
-| `build_transition_matrix.py` | ~490 | Build base rates, xRV calibration, and transition matrix from Statcast |
-| `backtest_vs_kalshi.py` | ~1225 | Full backtest framework: pregame, in-game, metrics, Kelly analysis |
-| `matchup_model.py` | ~300 | Bayesian hierarchical matchup model (PyMC/ADVI) |
-| `feature_engineering.py` | ~2375 | Feature computation including matchup xRV extraction |
+| `simulate.py` | ~1630 | Core MC simulator: data structures, outcome distributions, game simulation, CLI |
+| `multi_output_matchup_model.py` | ~700 | PyTorch multi-output matchup model: direct outcome prediction |
+| `build_transition_matrix.py` | ~500 | Build base rates and transition matrix from Statcast |
+| `backtest_vs_kalshi.py` | ~1260 | Full backtest framework: pregame, in-game, metrics, Kelly analysis |
+| `plot_game_trace.py` | ~270 | Live game win probability trace: model vs Kalshi visualization |
+| `matchup_model.py` | ~420 | Legacy Bayesian matchup model (PyMC/ADVI, used for feature engineering) |
+| `feature_engineering.py` | ~2375 | Feature computation including arsenal profiles and matchup predictions |
 | `build_xrv.py` | ~400 | Pitch-level expected run value model |
 
 ---
 
 ## 10. Limitations & Future Work
 
-1. **Bullpen is one composite:** We model bullpen as a single aggregate outcome distribution. In reality, specific relievers have very different profiles. Incorporating reliever-level modeling with bullpen usage patterns would improve late-game accuracy.
+1. **No defensive positioning:** The transition matrix doesn't account for fielding quality (OAA) or shift strategies. A team with elite outfield defense will turn more fly balls into outs than the league-average transition matrix assumes.
 
-2. **No defensive positioning:** The transition matrix doesn't account for fielding quality (OAA) or shift strategies. A team with elite outfield defense will turn more fly balls into outs than the league-average transition matrix assumes.
+2. **No pinch hitting:** The simulator doesn't model in-game substitutions (pinch hitters, defensive replacements). This matters most in late-game NL situations.
 
-3. **Pitch count is estimated:** We estimate pitch count as PAs × 3.9. Actual pitch counts vary significantly (high-K pitchers throw more pitches per PA). Using real pitch count data when available would improve SP→BP transition timing.
+3. **Market microstructure:** The Kelly backtest assumes we can trade at the last-traded price with no slippage or fees. Real execution on Kalshi involves bid-ask spreads (~2-5¢) and 7% fee on profits, which would reduce realized PnL.
 
-4. **No pinch hitting:** The simulator doesn't model in-game substitutions (pinch hitters, defensive replacements). This matters most in late-game NL situations.
-
-5. **Python speed:** The simulation loop runs in pure Python. At 10,000 sims × ~70 PAs/game, this is ~700K Python function calls per game. Porting the inner loop to Numba or Cython would give 10-50× speedup, enabling real-time in-game predictions with 50K+ sims.
-
-6. **Market microstructure:** The Kelly backtest assumes we can trade at the last-traded price with no slippage or fees. Real execution on Kalshi involves bid-ask spreads (~2-5¢) and 7% fee on profits, which would reduce realized PnL.
+4. **MiLB level adjustments are approximate:** The factors translating MiLB stats to MLB equivalents are rough estimates. A proper calibration using historical MiLB→MLB promotion data would improve accuracy for callups.

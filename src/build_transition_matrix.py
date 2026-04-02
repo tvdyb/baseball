@@ -480,15 +480,9 @@ def main():
     print("=" * 60)
     base_rates = compute_base_rates(df)
 
-    # Step 2: xRV calibration
+    # Step 2: Transition matrix
     print("\n" + "=" * 60)
-    print("Step 2: xRV-to-outcome calibration")
-    print("=" * 60)
-    calibration = compute_xrv_calibration(df, base_rates)
-
-    # Step 3: Transition matrix
-    print("\n" + "=" * 60)
-    print("Step 3: Base-running transition matrix")
+    print("Step 2: Base-running transition matrix")
     print("=" * 60)
     transition_matrix = compute_transition_matrix(df)
 
@@ -498,10 +492,6 @@ def main():
     with open(SIM_DIR / "league_base_rates.pkl", "wb") as f:
         pickle.dump(base_rates, f)
     print(f"\n  Saved league_base_rates.pkl")
-
-    with open(SIM_DIR / "xrv_calibration.pkl", "wb") as f:
-        pickle.dump(calibration, f)
-    print(f"  Saved xrv_calibration.pkl")
 
     with open(SIM_DIR / "transition_matrix.pkl", "wb") as f:
         pickle.dump(transition_matrix, f)

@@ -9,3 +9,5 @@ scipy>=1.11
 pybaseball>=2.3
 httpx>=0.25
 matplotlib>=3.8
+torch>=2.0
+numba>=0.59
