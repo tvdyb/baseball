@@ -16,7 +16,6 @@ from simulate import (
     SimConfig,
     build_matchup_distribution,
     log5_combine,
-    apply_matchup_adjustment,
     rates_to_probs,
     precompute_all_distributions,
     apply_transition,
@@ -34,27 +33,6 @@ def base_rates():
         "K": 0.224, "BB": 0.082, "HBP": 0.012,
         "1B": 0.146, "2B": 0.043, "3B": 0.004, "HR": 0.031,
         "dp": 0.025, "out_ground": 0.240, "out_fly": 0.160, "out_line": 0.033,
-    }
-
-
-@pytest.fixture
-def calibration():
-    return {
-        "alphas": {o: 0.0 for o in OUTCOME_ORDER},  # neutral calibration
-        "scale": 8.0,
-    }
-
-
-@pytest.fixture
-def active_calibration():
-    """Calibration with non-zero alphas for testing matchup effects."""
-    return {
-        "alphas": {
-            "K": -2.0, "BB": 0.5, "HBP": 0.1,
-            "1B": 1.0, "2B": 1.5, "3B": 1.5, "HR": 2.0,
-            "dp": -0.8, "out_ground": -0.5, "out_fly": -0.3, "out_line": 0.0,
-        },
-        "scale": 8.0,
     }
 
 
@@ -140,60 +118,57 @@ class TestOutcomeDistribution:
         combined = log5_combine(slugger, base_rates, base_rates)
         assert combined["HR"] > base_rates["HR"]
 
-    def test_matchup_distribution_sums_to_one(self, base_rates, calibration):
+    def test_matchup_distribution_sums_to_one(self, base_rates):
         probs = build_matchup_distribution(
-            base_rates, base_rates, base_rates, 0.0, calibration,
+            base_rates, base_rates, base_rates,
         )
         assert abs(probs.sum() - 1.0) < 1e-9
 
-    def test_matchup_distribution_with_shift(self, base_rates, active_calibration):
-        for xrv in [-0.01, -0.005, 0.005, 0.01]:
+    def test_matchup_distribution_with_model_probs(self, base_rates):
+        """Blending with model_probs should still sum to one and stay non-negative."""
+        # Create a model prediction that shifts weight toward HR
+        model_probs = rates_to_probs(dict(base_rates))
+        hr_idx = OUTCOME_ORDER.index("HR")
+        model_probs[hr_idx] += 0.05
+        model_probs /= model_probs.sum()
+
+        for weight in [0.0, 0.3, 0.6, 1.0]:
             probs = build_matchup_distribution(
-                base_rates, base_rates, base_rates, xrv, active_calibration,
+                base_rates, base_rates, base_rates,
+                model_probs=model_probs, model_weight=weight,
             )
             assert abs(probs.sum() - 1.0) < 1e-9
             assert (probs >= 0).all()
 
-    def test_matchup_distribution_nan_xrv(self, base_rates, calibration):
-        """NaN matchup xRV should use base log5 rates without adjustment."""
-        probs_nan = build_matchup_distribution(
-            base_rates, base_rates, base_rates, float("nan"), calibration,
+    def test_matchup_distribution_none_model_probs(self, base_rates):
+        """None model_probs should use base log5 rates without blending."""
+        probs_none = build_matchup_distribution(
+            base_rates, base_rates, base_rates, model_probs=None,
         )
-        probs_zero = build_matchup_distribution(
-            base_rates, base_rates, base_rates, 0.0, calibration,
+        probs_default = build_matchup_distribution(
+            base_rates, base_rates, base_rates,
         )
-        np.testing.assert_array_almost_equal(probs_nan, probs_zero)
+        np.testing.assert_array_almost_equal(probs_none, probs_default)
 
-    def test_matchup_adjustment_positive_xrv(self, base_rates, active_calibration):
-        """Positive xRV (hitter-favorable) should increase hit rates."""
-        combined = log5_combine(base_rates, base_rates, base_rates)
-        adjusted = apply_matchup_adjustment(combined, 0.01, active_calibration)
-        hr_idx = OUTCOME_ORDER.index("HR")
-        k_idx = OUTCOME_ORDER.index("K")
-        probs_neutral = rates_to_probs(dict(combined))
-        probs_positive = rates_to_probs(adjusted)
-        assert probs_positive[hr_idx] > probs_neutral[hr_idx]
-        assert probs_positive[k_idx] < probs_neutral[k_idx]
-
-    def test_none_batter_rates_uses_league_avg(self, base_rates, calibration):
+    def test_none_batter_rates_uses_league_avg(self, base_rates):
         """None batter rates should fall back to league average."""
         probs_none = build_matchup_distribution(
-            None, base_rates, base_rates, 0.0, calibration,
+            None, base_rates, base_rates,
         )
         probs_league = build_matchup_distribution(
-            base_rates, base_rates, base_rates, 0.0, calibration,
+            base_rates, base_rates, base_rates,
         )
         np.testing.assert_array_almost_equal(probs_none, probs_league)
 
-    def test_rates_to_probs_clamping(self):
-        """Extreme rates should be clamped."""
+    def test_rates_to_probs_normalizes(self):
+        """rates_to_probs should normalize to sum=1."""
         rates = {o: 0.0 for o in OUTCOME_ORDER}
-        rates["K"] = 0.90  # way too high
+        rates["K"] = 0.90
         rates["out_ground"] = 0.10
         probs = rates_to_probs(rates)
+        assert abs(probs.sum() - 1.0) < 1e-9
         k_idx = OUTCOME_ORDER.index("K")
-        # After clamping K to 0.50 and renormalizing
-        assert probs[k_idx] < 0.90
+        assert abs(probs[k_idx] - 0.90) < 1e-9
 
 
 # ── Deterministic Transition Tests ────────────────────────
@@ -329,7 +304,7 @@ class TestSimulation:
         # Home team should win almost every sim
         assert result["home_wp"] > 0.95
 
-    def test_strong_hitter_advantage(self, base_rates, active_calibration, transition_matrix):
+    def test_strong_hitter_advantage(self, base_rates, transition_matrix):
         """Team with better hitters (higher hit rates) should win more often."""
         lineup = [(100000 + i, "R") for i in range(9)]
 

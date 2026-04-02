@@ -39,16 +39,24 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
 import signal
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import httpx
 import numpy as np
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+
+log = logging.getLogger("live_trader")
+
+ET = ZoneInfo("America/New_York")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -102,6 +110,32 @@ EXTRAS_CONFIDENCE = 1.00
 # Polymarket sports taker fee: C × 0.03 × p × (1-p)
 # Symmetric around 50%, near-zero at extremes (where our late-game trades are)
 TAKER_FEE_RATE = 0.03
+
+MAX_RETRIES = 3
+RETRY_BACKOFF = [1.0, 2.0, 4.0]
+
+
+async def _retry_async(func, *args, label: str = "", retries: int = MAX_RETRIES, **kwargs):
+    """Run a sync function via asyncio.to_thread with retry + exponential backoff."""
+    for attempt in range(retries):
+        try:
+            if kwargs:
+                return await asyncio.to_thread(lambda: func(*args, **kwargs))
+            return await asyncio.to_thread(func, *args)
+        except Exception as e:
+            if attempt < retries - 1:
+                wait = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
+                log.warning("%s attempt %d failed (%s), retrying in %.0fs",
+                            label, attempt + 1, e, wait)
+                await asyncio.sleep(wait)
+            else:
+                log.error("%s failed after %d attempts: %s", label, retries, e)
+                raise
+
+
+def _polymarket_fee(price: float) -> float:
+    """Per-contract Polymarket taker fee at a given price level."""
+    return TAKER_FEE_RATE * price * (1 - price)
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -242,9 +276,10 @@ class LiveTrader:
         self._transition_matrix = None
         self._idx = None
         self._matchup_models = None
-        self._sim_config = SimConfig(n_sims=config.n_sims, random_seed=42)
+        # No fixed seed — each sim must be independent for live trading
+        self._sim_config = SimConfig(n_sims=config.n_sims, random_seed=None)
 
-        # Shared HTTP client
+        # Per-thread HTTP clients to avoid sharing a single client across threads
         self._http = httpx.Client(timeout=30.0)
 
     # ── Initialization ────────────────────────────────────────────────────
@@ -449,7 +484,7 @@ class LiveTrader:
             game.away_ctx = away_ctx
             game.context_ready = True
         except Exception as e:
-            print(f"    {game.game_key}: context build failed: {e}")
+            log.error("%s: context build failed: %s", game.game_key, e)
 
     # ── Core Loop ─────────────────────────────────────────────────────────
 
@@ -473,7 +508,7 @@ class LiveTrader:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                print(f"\n  ERROR in cycle {self._cycle_count}: {e}")
+                log.error("Error in cycle %d: %s", self._cycle_count, e)
                 await asyncio.sleep(5)
 
         # Cleanup
@@ -538,20 +573,17 @@ class LiveTrader:
     # ── State Updates ─────────────────────────────────────────────────────
 
     async def _update_game_states(self):
-        """Poll MLB API for current game states."""
+        """Poll MLB API for current game states (with retry)."""
         for key, game in list(self.games.items()):
             if game.game_status == "Final":
                 continue
 
             try:
-                resp = await asyncio.to_thread(
+                resp = await _retry_async(
                     self._http.get,
                     f"{MLB_API}/schedule",
-                    params={
-                        "sportId": 1,
-                        "gamePk": game.game_pk,
-                        "hydrate": "linescore",
-                    },
+                    label=f"{key} schedule",
+                    params={"sportId": 1, "gamePk": game.game_pk, "hydrate": "linescore"},
                 )
                 resp.raise_for_status()
                 data = resp.json()
@@ -559,17 +591,18 @@ class LiveTrader:
                     for g in d.get("games", []):
                         status = g.get("status", {}).get("abstractGameState", "")
                         game.game_status = status
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning("%s: schedule poll failed: %s", key, e)
 
             if game.game_status == "Live":
                 try:
-                    state = await asyncio.to_thread(
-                        fetch_live_game_state, self._http, game.game_pk
+                    state = await _retry_async(
+                        fetch_live_game_state, self._http, game.game_pk,
+                        label=f"{key} live state",
                     )
                     game.sim_state = state
                 except Exception as e:
-                    print(f"    {key}: live state fetch failed: {e}")
+                    log.warning("%s: live state fetch failed: %s", key, e)
 
     async def _run_simulation(self, game: LiveGame):
         """Run MC simulation at current game state."""
@@ -592,31 +625,32 @@ class LiveTrader:
             print(f"    {game.game_key} {game.inning_label} "
                   f"({score}): model={game.model_home_wp:.1%}")
         except Exception as e:
-            print(f"    {game.game_key}: sim failed: {e}")
+            log.error("%s: sim failed: %s", game.game_key, e)
 
     async def _update_market_price(self, game: LiveGame):
-        """Fetch current Polymarket price for a game."""
+        """Fetch current Polymarket price for a game (with retry)."""
         if not game.poly_market:
             return
 
         try:
-            book = await asyncio.to_thread(
-                fetch_orderbook, self._http, game.poly_market.home_token_id
+            book = await _retry_async(
+                fetch_orderbook, self._http, game.poly_market.home_token_id,
+                label=f"{game.game_key} orderbook",
             )
             game.poly_home_bid = book.get("best_bid")
             game.poly_home_ask = book.get("best_ask")
             game.poly_home_mid = book.get("midpoint")
             game.poly_spread = book.get("spread")
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("%s: market price fetch failed: %s (stale price kept)", game.game_key, e)
 
     # ── Edge Computation + Phase-Aware Sizing ─────────────────────────────
 
     def _compute_edge(self, game: LiveGame):
-        """Compute edge, phase confidence, and target position size.
+        """Compute fee-adjusted edge, phase confidence, and target position size.
 
-        Uses configurable Kelly fraction (default 25%) scaled by phase
-        confidence. Fee-aware: only trades when edge exceeds fee drag.
+        The edge is reduced by the expected Polymarket taker fee before
+        comparing against the min_edge threshold and computing Kelly size.
         """
         if game.model_home_wp is None or game.poly_home_mid is None:
             game.edge = 0.0
@@ -627,7 +661,11 @@ class LiveTrader:
             return
 
         p = game.poly_home_mid
-        game.edge = game.model_home_wp - p
+        raw_edge = game.model_home_wp - p
+
+        # Subtract fee drag from edge (fee is symmetric around p)
+        fee_drag = _polymarket_fee(p)
+        game.edge = raw_edge - fee_drag if raw_edge > 0 else raw_edge + fee_drag
 
         # Phase confidence based on inning
         inning = game.inning
@@ -636,8 +674,8 @@ class LiveTrader:
         else:
             game.phase_confidence = PHASE_CONFIDENCE.get(inning, 0.0)
 
-        # Full Kelly fraction and side
-        edge = game.model_home_wp - p
+        # Full Kelly fraction and side (using fee-adjusted edge)
+        edge = game.edge
         if abs(edge) < 1e-6 or p <= 0 or p >= 1:
             game.half_kelly = 0.0
             game.side = ""
@@ -829,7 +867,7 @@ class LiveTrader:
                   f"({game.side}) -> {order_id}")
             return result
         except Exception as e:
-            print(f"    ORDER ERROR: {label}: {e}")
+            log.error("ORDER FAILED %s: %s", label, e)
             return None
 
     async def _cancel_order(self, game: LiveGame):
@@ -844,8 +882,9 @@ class LiveTrader:
                 await asyncio.to_thread(
                     self._clob_client.cancel, game.active_order_id
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                log.error("%s: cancel order %s failed: %s",
+                          game.game_key, game.active_order_id, e)
 
         game.active_order_id = None
         game.active_order_side = ""
@@ -1008,7 +1047,7 @@ class LiveTrader:
     def _print_dashboard(self):
         """Print compact status dashboard."""
         now = datetime.now(timezone.utc)
-        now_et = now - timedelta(hours=4)
+        now_et = now.astimezone(ET)
 
         print(f"\n{'='*120}")
         print(f"  Live Trader — {self.config.target_date} — "
@@ -1208,8 +1247,8 @@ def main():
                         help="Kelly fraction (default: 0.25 = quarter-Kelly)")
     parser.add_argument("--poll", type=float, default=30.0,
                         help="Poll interval in seconds (default: 30)")
-    parser.add_argument("--n-sims", type=int, default=1000,
-                        help="MC simulations per state (default: 1000)")
+    parser.add_argument("--n-sims", type=int, default=5000,
+                        help="MC simulations per state (default: 5000)")
     parser.add_argument("--max-position", type=float, default=0.10,
                         help="Max position per game as fraction of bankroll (default: 0.10)")
     parser.add_argument("--max-total", type=float, default=0.25,
@@ -1219,6 +1258,20 @@ def main():
     parser.add_argument("--season", type=int, default=2025,
                         help="Season for xRV data (default: 2025)")
     args = parser.parse_args()
+
+    # Configure structured logging (console + file)
+    AUDIT_DIR.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)-7s [%(name)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(
+                AUDIT_DIR / f"live_{date.today().strftime('%Y%m%d')}.log",
+            ),
+        ],
+    )
 
     target_date = args.date or date.today().strftime("%Y-%m-%d")
 
