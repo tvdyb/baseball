@@ -38,7 +38,6 @@ from build_transition_matrix import (
 )
 from feature_engineering import (
     _preindex_xrv,
-    _precompute_pitcher_bases,
     _compute_pitcher_arsenal_live,
     _standardize_arsenal,
     compute_matchup_xrv,
@@ -746,78 +745,6 @@ def monte_carlo_win_prob(
 
 
 # ── Data Loading ──────────────────────────────────────────
-
-def _compute_per_hitter_matchup_xrv(
-    matchup_models: dict,
-    pitcher_df: pd.DataFrame,
-    pitcher_id: int,
-    game_date: str,
-    lineup: list[tuple[int, str]],
-    n_pitches: int = 2000,
-) -> list[float]:
-    """
-    Compute per-hitter matchup xRV for a lineup vs a pitcher using
-    the Bayesian hierarchical model.
-
-    This captures the pitcher-hitter interaction that log5 can't:
-    how well this hitter handles this pitcher's specific arsenal,
-    pitch types, and movement profile.
-
-    Returns list of floats (one per lineup slot). Zero for unknown matchups.
-    """
-    hitter_ids = [h[0] for h in lineup]
-    hitter_hands = [h[1] for h in lineup]
-    xrvs = [0.0] * len(lineup)
-
-    for hand in ["L", "R"]:
-        model = matchup_models.get(hand)
-        if model is None:
-            continue
-
-        hand_indices = [i for i, (_, h) in enumerate(lineup) if h == hand]
-        if not hand_indices:
-            continue
-
-        hand_hids = [hitter_ids[i] for i in hand_indices]
-        hand_hands = [hitter_hands[i] for i in hand_indices]
-
-        pitcher_bases = _precompute_pitcher_bases(
-            model, pitcher_df, pitcher_id, game_date, n_pitches,
-        )
-        if not pitcher_bases:
-            continue
-
-        # Compute individual hitter xRVs from model
-        map_est = model["map_estimate"]
-        hitter_map = model["hitter_map"]
-        hitter_effects = np.array(map_est["hitter_effect"])
-        hitter_ptype_effects = np.array(map_est["hitter_ptype_effect"])
-
-        # Population-average prediction (no hitter effect) for this pitcher
-        for j, (hid, hhand) in enumerate(zip(hand_hids, hand_hands)):
-            bases = pitcher_bases.get(hhand)
-            if bases is None:
-                continue
-            pitch_base, ptype_idx = bases
-
-            pop_avg = float(np.mean(pitch_base))
-
-            if hid in hitter_map:
-                h_idx = hitter_map[hid]
-                preds = (
-                    pitch_base
-                    + hitter_effects[h_idx]
-                    + hitter_ptype_effects[h_idx, ptype_idx]
-                )
-                full_pred = float(np.mean(preds))
-                # The interaction is the deviation from population average
-                # This isolates what the matchup model adds beyond individual rates
-                xrvs[hand_indices[j]] = full_pred - pop_avg
-            else:
-                xrvs[hand_indices[j]] = 0.0
-
-    return xrvs
-
 
 def ensure_batter_index(idx: dict) -> None:
     """Add a batter-level index to the pre-indexed xRV data if not already present."""
