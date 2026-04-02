@@ -138,6 +138,7 @@ class SimConfig:
     max_pa_per_half_inning: int = 25
     random_seed: int | None = None
     model_blend_weight: float = 0.6  # weight for multi-output model vs log5
+    home_advantage: float = 0.012    # calibrated: identical teams → ~53.5% home WP
 
 
 # ── Outcome Distribution ──────────────────────────────────
@@ -1168,14 +1169,40 @@ def load_simulation_context(
 
     # ── Build per-hitter outcome distributions ──
     model_weight = config.model_blend_weight
+    hfa = config.home_advantage  # home-field advantage shift
+
+    def _apply_hfa_shift(rates: dict | None, is_home_batting: bool) -> dict | None:
+        """Apply home-field advantage to batter outcome rates.
+
+        Home batters get a small boost to contact rates (1B, 2B, 3B, HR)
+        at the expense of K/out rates. Away batters get the reverse.
+        The magnitude is calibrated so two identical teams produce ~53.5%
+        home win probability. Factor ≈ 1 + hfa for home, 1 - hfa for away.
+        """
+        if rates is None or hfa == 0:
+            return rates
+        factor = 1.0 + hfa if is_home_batting else 1.0 - hfa
+        contact = {"1B", "2B", "3B", "HR", "BB", "HBP"}
+        adjusted = {}
+        for o, r in rates.items():
+            if o in contact:
+                adjusted[o] = r * factor
+            else:
+                adjusted[o] = r / factor
+        # Re-normalize
+        total = sum(adjusted.values())
+        if total > 0:
+            adjusted = {o: v / total for o, v in adjusted.items()}
+        return adjusted
 
     def _build_dists_for_lineup(lineup, opposing_sp_rates, opposing_bp_rates,
-                                model_probs_vs_sp):
+                                model_probs_vs_sp, is_home_batting: bool):
         sp_dists = []
         bp_dists = []
         for pos, (batter_id, _hand) in enumerate(lineup[:9]):
             batter_rates = _compute_batter_outcome_rates(idx, batter_id, gdate,
                                                          season=season)
+            batter_rates = _apply_hfa_shift(batter_rates, is_home_batting)
 
             sp_model_probs = model_probs_vs_sp[pos] if pos < len(model_probs_vs_sp) else None
             sp_dist = build_matchup_distribution(
@@ -1193,13 +1220,16 @@ def load_simulation_context(
 
     home_sp_dists, home_bp_dists = _build_dists_for_lineup(
         home_lineup, away_sp_rates, away_bp_rates, home_vs_away_sp_probs,
+        is_home_batting=True,
     )
     away_sp_dists, away_bp_dists = _build_dists_for_lineup(
         away_lineup, home_sp_rates, home_bp_rates, away_vs_home_sp_probs,
+        is_home_batting=False,
     )
 
     # ── Build individual reliever distributions ──
-    def _build_relievers(team, opposing_lineup, opposing_bp_rates):
+    def _build_relievers(team, opposing_lineup, opposing_bp_rates,
+                         is_opposing_home: bool):
         reliever_ids = _identify_top_relievers(idx, team, gdate)
         relievers = []
         for rp_id in reliever_ids:
@@ -1216,6 +1246,7 @@ def load_simulation_context(
             for pos, (batter_id, _hand) in enumerate(opposing_lineup[:9]):
                 batter_rates = _compute_batter_outcome_rates(idx, batter_id, gdate,
                                                              season=season)
+                batter_rates = _apply_hfa_shift(batter_rates, is_opposing_home)
 
                 # Model predictions for this reliever
                 rp_model_probs = None
@@ -1239,10 +1270,12 @@ def load_simulation_context(
             ))
         return relievers
 
-    # Home team's relievers face away lineup
-    home_relievers = _build_relievers(home_team, away_lineup, home_bp_rates)
-    # Away team's relievers face home lineup
-    away_relievers = _build_relievers(away_team, home_lineup, away_bp_rates)
+    # Home team's relievers face away lineup (away batters → not home)
+    home_relievers = _build_relievers(home_team, away_lineup, home_bp_rates,
+                                       is_opposing_home=False)
+    # Away team's relievers face home lineup (home batters → home)
+    away_relievers = _build_relievers(away_team, home_lineup, away_bp_rates,
+                                       is_opposing_home=True)
 
     home_ctx = TeamContext(
         team=home_team,

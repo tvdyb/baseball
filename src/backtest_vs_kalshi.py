@@ -993,9 +993,12 @@ def compute_kelly_rebalancing(
         for me in min_edges:
             game_pnls = []
 
+            game_dates_list = []
             for gpk, game_df in games:
                 game_df = game_df.sort_values("timestamp")
                 home_win = game_df.iloc[0]["home_win"]
+                if "game_date" in game_df.columns:
+                    game_dates_list.append(game_df.iloc[0]["game_date"])
 
                 position = 0.0      # contracts held (positive = home YES)
                 cash_spent = 0.0    # total cash invested
@@ -1056,9 +1059,16 @@ def compute_kelly_rebalancing(
             total_capital = bankroll * n_games
             roi = total_pnl / total_capital if total_capital > 0 else 0
 
-            # Per-game Sharpe (NOT annualized — report the raw ratio)
+            # Annualized Sharpe: use actual date span to compute games/year
             if n_games > 1 and pnls.std() > 0:
-                sharpe = pnls.mean() / pnls.std()
+                if game_dates_list:
+                    dates = pd.to_datetime(game_dates_list)
+                    n_days = max((dates.max() - dates.min()).days, 1)
+                    games_per_year = n_games / n_days * 365.0
+                else:
+                    # Fallback: ~162 games over ~183 days ≈ 0.89 games/day
+                    games_per_year = n_games
+                sharpe = (pnls.mean() / pnls.std()) * np.sqrt(games_per_year)
             else:
                 sharpe = 0.0
 

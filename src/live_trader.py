@@ -70,6 +70,7 @@ from simulate import (
     fetch_live_game_state,
 )
 from backtest_vs_kalshi import load_backtest_data
+from multi_output_matchup_model import load_multi_output_models
 from predict import fetch_lineup
 from polymarket_bot import (
     PolyMarket,
@@ -284,6 +285,7 @@ class LiveTrader:
         self._transition_matrix = None
         self._idx = None
         self._matchup_models = None
+        self._mo_models = None
         # No fixed seed — each sim must be independent for live trading
         self._sim_config = SimConfig(n_sims=config.n_sims, random_seed=None)
 
@@ -321,6 +323,19 @@ class LiveTrader:
             return False
         self._idx, self._matchup_models, self._lineups = shared
         print("  OK")
+
+        # Step 2b: Load multi-output matchup models
+        print("[2b/5] Loading multi-output matchup models...")
+        try:
+            mo_season = self.config.season - 1
+            self._mo_models = load_multi_output_models(mo_season)
+            if self._mo_models:
+                print(f"  Loaded multi-output models: {list(self._mo_models.keys())}")
+            else:
+                print("  No multi-output models found — using log5 only")
+        except Exception as e:
+            print(f"  Warning: Could not load MO models: {e}")
+            self._mo_models = None
 
         # Step 3: Discover today's MLB games
         print(f"[3/5] Discovering MLB games for {self.config.target_date}...")
@@ -485,7 +500,7 @@ class LiveTrader:
                 self._idx,
                 self._matchup_models or {},
                 self._base_rates,
-                None,  # mo_models — V1 only
+                self._mo_models,
                 self._sim_config,
             )
             game.home_ctx = home_ctx

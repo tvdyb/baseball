@@ -385,6 +385,42 @@ class TestSimulation:
         # Mixed team has one power hitter — should score slightly more on average
         assert r_mixed["home_runs_mean"] > r_mixed["away_runs_mean"]
 
+    def test_home_field_advantage(self, base_rates, transition_matrix):
+        """HFA-shifted identical teams should give home ~53-54% WP."""
+        lineup = [(100000 + i, "R") for i in range(9)]
+        hfa = 0.012
+        contact = {"1B", "2B", "3B", "HR", "BB", "HBP"}
+
+        def shift(rates, is_home):
+            factor = 1.0 + hfa if is_home else 1.0 - hfa
+            adj = {}
+            for o, r in rates.items():
+                adj[o] = r * factor if o in contact else r / factor
+            total = sum(adj.values())
+            return {o: v / total for o, v in adj.items()}
+
+        home_dists = [rates_to_probs(shift(base_rates, True)) for _ in range(9)]
+        away_dists = [rates_to_probs(shift(base_rates, False)) for _ in range(9)]
+
+        home = TeamContext(
+            team="HOM", lineup=lineup,
+            sp_outcome_dists=home_dists,
+            bp_outcome_dists=[d.copy() for d in home_dists],
+        )
+        away = TeamContext(
+            team="AWY", lineup=lineup,
+            sp_outcome_dists=away_dists,
+            bp_outcome_dists=[d.copy() for d in away_dists],
+        )
+
+        config = SimConfig(n_sims=10000, random_seed=42)
+        result = monte_carlo_win_prob(
+            home, away, GameState(), transition_matrix, config,
+        )
+        assert 0.51 < result["home_wp"] < 0.57, (
+            f"Expected ~53.5% home WP, got {result['home_wp']:.4f}"
+        )
+
 
 # ── Apply Transition Tests ────────────────────────────────
 
