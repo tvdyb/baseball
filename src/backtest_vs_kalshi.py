@@ -756,6 +756,71 @@ def run_ingame_backtest(
     return pd.DataFrame(rows)
 
 
+# ── Ensemble Blend ───────────────────────────────────────────────────────────
+
+
+def blend_with_ensemble(
+    ingame_df: pd.DataFrame,
+    season: int,
+) -> pd.DataFrame:
+    """Blend MC simulator probabilities with the pregame LR+XGB ensemble.
+
+    The ensemble is a better team-strength model (beats the market pregame).
+    The MC simulator is a better state-evolution model (handles score, outs,
+    bases, matchups). By blending, we get the best of both:
+      - Early innings: lean on ensemble (team strength dominates)
+      - Late innings: lean on simulator (game state dominates)
+
+    Weight schedule: ensemble weight decays linearly from 1.0 at inning 1
+    to 0.0 at inning 9+. This is derived from the observation that the
+    simulator only matches or beats the market from inning 7 onward.
+    """
+    preds_path = AUDIT_DIR / "walk_forward_predictions.csv"
+    if not preds_path.exists():
+        log(f"  WARNING: {preds_path} not found — cannot blend with ensemble")
+        log("  Run `make train` or `python src/win_model.py --walk-forward` first")
+        ingame_df["blended_wp"] = ingame_df["sim_home_wp"]
+        ingame_df["ens_prob"] = np.nan
+        ingame_df["ens_weight"] = 0.0
+        return ingame_df
+
+    preds = pd.read_csv(preds_path)
+
+    # Use ens_prob (the LR+XGB blend); fall back to lr_prob if missing
+    prob_col = "ens_prob" if "ens_prob" in preds.columns else "lr_prob"
+    ens_lookup = dict(zip(preds["game_pk"].astype(int), preds[prob_col].astype(float)))
+    log(f"  Loaded {len(ens_lookup)} pregame ensemble predictions from {prob_col}")
+
+    # Match ensemble predictions to in-game rows
+    ingame_df["ens_prob"] = ingame_df["game_pk"].map(ens_lookup)
+    matched = ingame_df["ens_prob"].notna().sum()
+    total = len(ingame_df)
+    log(f"  Matched {matched}/{total} state points ({matched/total:.0%})")
+
+    # Compute ensemble weight: decays with inning
+    # Inning 1 → 1.0, inning 9+ → 0.0
+    # NOTE: Backtesting shows this blend HURTS performance because the
+    # pregame probability doesn't incorporate in-game score changes.
+    # Included for research/comparison only.
+    ingame_df["ens_weight"] = np.clip(1.0 - (ingame_df["inning"] - 1) / 8.0, 0.0, 1.0)
+
+    # Blend: w * ensemble + (1-w) * simulator
+    ens = ingame_df["ens_prob"].fillna(ingame_df["sim_home_wp"])  # fallback if no match
+    sim = ingame_df["sim_home_wp"]
+    w = ingame_df["ens_weight"]
+    ingame_df["blended_wp"] = np.clip(w * ens + (1 - w) * sim, 0.001, 0.999)
+
+    # Summary stats
+    for inn in range(1, 10):
+        mask = ingame_df["inning"] == inn
+        if mask.sum() > 0:
+            wt = ingame_df.loc[mask, "ens_weight"].iloc[0]
+            log(f"    Inning {inn}: ens_weight={wt:.2f}, "
+                f"n={mask.sum()}")
+
+    return ingame_df
+
+
 # ── Metrics & Reporting ──────────────────────────────────────────────────────
 
 
@@ -896,6 +961,7 @@ def compute_kelly_rebalancing(
     bankroll: float = 10_000.0,
     max_position_pct: float = 0.10,
     taker_fee_rate: float = 0.03,
+    sim_col: str = "sim_home_wp",
 ) -> list[dict]:
     """Simulate Kelly rebalancing strategy on in-game backtest data.
 
@@ -935,7 +1001,7 @@ def compute_kelly_rebalancing(
                 cash_spent = 0.0    # total cash invested
 
                 for _, row in game_df.iterrows():
-                    sim_wp = row["sim_home_wp"]
+                    sim_wp = row[sim_col]
                     mkt_price = row["kalshi_home_prob"]
 
                     edge = sim_wp - mkt_price
@@ -1267,9 +1333,78 @@ def main():
                         help="Random seed for reproducibility")
     parser.add_argument("--no-mo", action="store_true",
                         help="Skip multi-output model (use log5/xRV only)")
+    parser.add_argument("--blend", action="store_true",
+                        help="Blend MC sim with pregame LR+XGB ensemble (requires walk_forward_predictions.csv)")
+    parser.add_argument("--blend-only", action="store_true",
+                        help="Load existing in-game CSV and run blend analysis only (no API calls)")
     args = parser.parse_args()
 
     AUDIT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # ── Blend-Only Mode (no API calls, no model loading) ──────────────────
+    if args.blend_only:
+        csv_path = AUDIT_DIR / f"sim_vs_kalshi_ingame_{args.season}.csv"
+        if not csv_path.exists():
+            log(f"  ERROR: {csv_path} not found. Run in-game backtest first.")
+            return
+        log(f"Loading existing in-game data from {csv_path}...")
+        ingame_df = pd.read_csv(csv_path)
+        log(f"  {len(ingame_df)} state points loaded")
+
+        print_header(f"ENSEMBLE BLEND ANALYSIS — {args.season}")
+        ingame_df = blend_with_ensemble(ingame_df, args.season)
+
+        if "blended_wp" in ingame_df.columns:
+            # Side-by-side metrics
+            log("\n  HEAD-TO-HEAD: Sim vs Blend vs Market")
+            log(f"  {'':28s} {'Sim':>10s} {'Blend':>10s} {'Market':>10s}")
+            log(f"  {'-'*60}")
+
+            sim_m = compute_metrics(ingame_df, sim_col="sim_home_wp", label="sim")
+            blend_m = compute_metrics(ingame_df, sim_col="blended_wp", label="blend")
+
+            for key, label in [
+                ("sim_log_loss", "Log Loss"),
+                ("sim_brier", "Brier Score"),
+                ("sim_auc", "AUC"),
+            ]:
+                sv = sim_m.get(key, 0)
+                bv = blend_m.get(key, 0)
+                mv = sim_m.get(key.replace("sim_", "market_"), 0)
+                log(f"  {label:28s} {sv:10.4f} {bv:10.4f} {mv:10.4f}")
+
+            # By-inning comparison
+            log(f"\n  BY-INNING LOG LOSS:")
+            log(f"  {'Inning':8s} {'Sim':>10s} {'Blend':>10s} {'Market':>10s} {'Best':>8s}")
+            log(f"  {'-'*50}")
+            for inn in sorted(ingame_df["inning"].unique()):
+                sub = ingame_df[ingame_df["inning"] == inn]
+                if len(sub) < 10:
+                    continue
+                y = sub["home_win"].values
+                sim_ll = log_loss(y, np.clip(sub["sim_home_wp"], 0.01, 0.99))
+                blend_ll = log_loss(y, np.clip(sub["blended_wp"], 0.01, 0.99))
+                mkt_ll = log_loss(y, np.clip(sub["kalshi_home_prob"], 0.01, 0.99))
+                best = "SIM" if sim_ll < blend_ll else "BLEND"
+                if mkt_ll < min(sim_ll, blend_ll):
+                    best = "MKT"
+                log(f"  {inn:8d} {sim_ll:10.4f} {blend_ll:10.4f} {mkt_ll:10.4f} {best:>8s}")
+
+            # Kelly rebalancing comparison
+            print_header("KELLY REBALANCING — MC SIMULATOR ONLY")
+            kelly_sim = compute_kelly_rebalancing(ingame_df, sim_col="sim_home_wp")
+            print_kelly_rebalancing(kelly_sim)
+
+            print_header("KELLY REBALANCING — BLENDED SIGNAL")
+            kelly_blend = compute_kelly_rebalancing(ingame_df, sim_col="blended_wp")
+            print_kelly_rebalancing(kelly_blend)
+
+            # Save updated CSV with blend column
+            out_path = AUDIT_DIR / f"sim_vs_kalshi_ingame_{args.season}.csv"
+            ingame_df.to_csv(out_path, index=False)
+            log(f"\n  Saved updated results to {out_path}")
+
+        return
 
     # Load multi-output matchup models FIRST (torch must init before large data)
     mo_models = None
@@ -1386,10 +1521,61 @@ def main():
             sim_cal = compute_calibration(ingame_df, "sim_home_wp")
             print_calibration(sim_cal, "In-Game Simulator")
 
-            # Kelly rebalancing simulation
-            print_header("KELLY REBALANCING STRATEGY")
-            kelly_results = compute_kelly_rebalancing(ingame_df)
+            # Kelly rebalancing simulation (sim-only)
+            print_header("KELLY REBALANCING — MC SIMULATOR ONLY")
+            kelly_results = compute_kelly_rebalancing(ingame_df, sim_col="sim_home_wp")
             print_kelly_rebalancing(kelly_results)
+
+            # ── Ensemble Blend ─────────────────────────────────────────
+            if args.blend:
+                print_header("ENSEMBLE BLEND — MC SIM + LR+XGB PREGAME")
+                ingame_df = blend_with_ensemble(ingame_df, args.season)
+
+                if "blended_wp" in ingame_df.columns:
+                    # Side-by-side metrics
+                    log("\n  HEAD-TO-HEAD: Sim vs Blend vs Market")
+                    log(f"  {'':28s} {'Sim':>10s} {'Blend':>10s} {'Market':>10s}")
+                    log(f"  {'-'*60}")
+
+                    sim_m = compute_metrics(ingame_df, sim_col="sim_home_wp",
+                                            label="sim")
+                    blend_m = compute_metrics(ingame_df, sim_col="blended_wp",
+                                              label="blend")
+
+                    for key, label in [
+                        ("sim_log_loss", "Log Loss"),
+                        ("sim_brier", "Brier Score"),
+                        ("sim_auc", "AUC"),
+                    ]:
+                        sv = sim_m.get(key, 0)
+                        bv = blend_m.get(key, 0)
+                        mv = sim_m.get(key.replace("sim_", "market_"), 0)
+                        best = "←" if key != "sim_auc" and bv < sv else ("←" if key == "sim_auc" and bv > sv else "")
+                        log(f"  {label:28s} {sv:10.4f} {bv:10.4f}{best} {mv:10.4f}")
+
+                    # By-inning comparison
+                    log(f"\n  BY-INNING LOG LOSS:")
+                    log(f"  {'Inning':8s} {'Sim':>10s} {'Blend':>10s} {'Market':>10s} {'Best':>8s}")
+                    log(f"  {'-'*50}")
+                    for inn in sorted(ingame_df["inning"].unique()):
+                        sub = ingame_df[ingame_df["inning"] == inn]
+                        if len(sub) < 10:
+                            continue
+                        y = sub["home_win"].values
+                        sim_ll = log_loss(y, np.clip(sub["sim_home_wp"], 0.01, 0.99))
+                        blend_ll = log_loss(y, np.clip(sub["blended_wp"], 0.01, 0.99))
+                        mkt_ll = log_loss(y, np.clip(sub["kalshi_home_prob"], 0.01, 0.99))
+                        best = "SIM" if sim_ll < blend_ll else "BLEND"
+                        if mkt_ll < min(sim_ll, blend_ll):
+                            best = "MKT"
+                        log(f"  {inn:8d} {sim_ll:10.4f} {blend_ll:10.4f} {mkt_ll:10.4f} {best:>8s}")
+
+                    # Kelly rebalancing with blended signal
+                    print_header("KELLY REBALANCING — BLENDED SIGNAL")
+                    kelly_blend = compute_kelly_rebalancing(
+                        ingame_df, sim_col="blended_wp",
+                    )
+                    print_kelly_rebalancing(kelly_blend)
 
             # Save
             out_path = AUDIT_DIR / f"sim_vs_kalshi_ingame_{args.season}.csv"
