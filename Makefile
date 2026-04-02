@@ -153,6 +153,14 @@ sim-vs-kalshi:
 sim-vs-kalshi-full:
 	$(PYTHON) src/backtest_vs_kalshi.py --season $(SEASON) --ingame --max-games $(or $(MAX_GAMES),100)
 
+# Live in-game trader (dry run)
+live-dry:
+	$(PYTHON) src/live_trader.py --bankroll $(BANKROLL) --dry-run
+
+# Live in-game trader
+live:
+	$(PYTHON) src/live_trader.py --bankroll $(BANKROLL)
+
 .PHONY: all scrape scrape-statcast scrape-games scrape-weather scrape-oaa \
         scrape-sprint-speed scrape-transactions scrape-kalshi projections \
         build-xrv matchup-models matchup-models-pooled \
@@ -160,4 +168,4 @@ sim-vs-kalshi-full:
         audit audit-quick clean-audit predict-today predict-today-lr \
         picks picks-date poly-dry poly-live poly-sizing \
         build-sim-data simulate simulate-date simulate-game simulate-backtest \
-        sim-vs-kalshi sim-vs-kalshi-full
+        sim-vs-kalshi sim-vs-kalshi-full live-dry live

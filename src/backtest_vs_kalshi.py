@@ -880,6 +880,161 @@ def compute_roi(
     return results
 
 
+def _polymarket_taker_fee(n_contracts: float, price: float, fee_rate: float = 0.03) -> float:
+    """Polymarket taker fee: C × feeRate × p × (1-p).
+
+    Sports category = 3%. Fee is symmetric around 50% and approaches
+    zero at extreme prices (0% or 100%).
+    """
+    return abs(n_contracts) * fee_rate * price * (1 - price)
+
+
+def compute_kelly_rebalancing(
+    ingame_df: pd.DataFrame,
+    kelly_fractions: list[float] = None,
+    min_edges: list[float] = None,
+    bankroll: float = 10_000.0,
+    max_position_pct: float = 0.10,
+    taker_fee_rate: float = 0.03,
+) -> list[dict]:
+    """Simulate Kelly rebalancing strategy on in-game backtest data.
+
+    Includes Polymarket taker fees: C × feeRate × p × (1-p).
+
+    For each game, at every half-inning boundary:
+      1. Compute Kelly-optimal position from model WP vs market price
+      2. Rebalance to target position (buy/sell contracts at market price)
+      3. At game end, contracts settle at $1 (home wins) or $0
+
+    This compounds small edges across ~18 half-innings per game.
+
+    Returns list of result dicts, one per (kelly_fraction, min_edge) combo.
+    """
+    if kelly_fractions is None:
+        kelly_fractions = [0.25, 0.50, 1.00]
+    if min_edges is None:
+        min_edges = [0.03, 0.05, 0.07]
+
+    if len(ingame_df) == 0:
+        return []
+
+    # Group by game
+    games = ingame_df.groupby("game_pk")
+    max_exposure = bankroll * max_position_pct
+
+    results = []
+    for kf in kelly_fractions:
+        for me in min_edges:
+            game_pnls = []
+
+            for gpk, game_df in games:
+                game_df = game_df.sort_values("timestamp")
+                home_win = game_df.iloc[0]["home_win"]
+
+                position = 0.0      # contracts held (positive = home YES)
+                cash_spent = 0.0    # total cash invested
+
+                for _, row in game_df.iterrows():
+                    sim_wp = row["sim_home_wp"]
+                    mkt_price = row["kalshi_home_prob"]
+
+                    edge = sim_wp - mkt_price
+                    abs_edge = abs(edge)
+
+                    if abs_edge < me:
+                        target = 0.0
+                    elif edge > 0:
+                        # Buy home YES: Kelly = edge / (1 - price)
+                        full_kelly = edge / (1 - mkt_price) if mkt_price < 1 else 0
+                        dollar_size = min(bankroll * full_kelly * kf, max_exposure)
+                        target = dollar_size / mkt_price  # contracts
+                    else:
+                        # Short home YES: Kelly = |edge| / price
+                        full_kelly = abs_edge / mkt_price if mkt_price > 0 else 0
+                        dollar_size = min(bankroll * full_kelly * kf, max_exposure)
+                        target = -dollar_size / (1 - mkt_price)
+
+                    # Rebalance: buy/sell to reach target
+                    delta = target - position
+                    if abs(delta) < 0.01:
+                        continue
+
+                    # Taker fee on the rebalance trade
+                    fee = _polymarket_taker_fee(delta, mkt_price, taker_fee_rate)
+
+                    if delta > 0:
+                        cost = delta * mkt_price + fee
+                        cash_spent += cost
+                        position += delta
+                    else:
+                        proceeds = abs(delta) * mkt_price - fee
+                        cash_spent -= proceeds
+                        position += delta
+
+                # Settlement: home YES contracts pay $1 if home wins, $0 if not
+                settle_value = position * (1.0 if home_win else 0.0)
+                game_pnl = settle_value - cash_spent
+                game_pnls.append(game_pnl)
+
+            if not game_pnls:
+                continue
+
+            pnls = np.array(game_pnls)
+            total_pnl = pnls.sum()
+            n_games = len(pnls)
+            # ROI relative to total capital deployed
+            total_capital = bankroll * n_games
+            roi = total_pnl / total_capital if total_capital > 0 else 0
+
+            # Sharpe (annualized assuming ~6 months of games)
+            if n_games > 1 and pnls.std() > 0:
+                sharpe = (pnls.mean() / pnls.std()) * np.sqrt(n_games)
+            else:
+                sharpe = 0.0
+
+            # Bootstrap 95% CI for ROI
+            rng = np.random.RandomState(42)
+            boot_rois = []
+            for _ in range(1000):
+                sample = rng.choice(pnls, size=n_games, replace=True)
+                boot_roi = sample.sum() / total_capital
+                boot_rois.append(boot_roi)
+            boot_rois = sorted(boot_rois)
+            ci_lo = boot_rois[25]
+            ci_hi = boot_rois[975]
+            p_positive = sum(1 for r in boot_rois if r > 0) / len(boot_rois)
+
+            results.append({
+                "kelly_pct": kf,
+                "min_edge": me,
+                "n_games": n_games,
+                "total_pnl": total_pnl,
+                "roi": roi,
+                "sharpe": sharpe,
+                "ci_lo": ci_lo,
+                "ci_hi": ci_hi,
+                "p_positive": p_positive,
+            })
+
+    return results
+
+
+def print_kelly_rebalancing(results: list[dict]):
+    """Print Kelly rebalancing results table."""
+    if not results:
+        return
+    log(f"\n  Kelly Rebalancing Strategy (position rebalanced at each half-inning)")
+    log(f"  {'Kelly%':>7s} {'MinEdge':>8s} {'Games':>6s} {'TotalPnL':>10s} "
+        f"{'ROI':>7s} {'Sharpe':>7s} {'95% CI':>20s} {'P(ROI>0)':>9s}")
+    log(f"  {'-'*80}")
+    for r in results:
+        ci_str = f"[{r['ci_lo']:+.1%}, {r['ci_hi']:+.1%}]"
+        log(f"  {r['kelly_pct']:>6.0%} {r['min_edge']:>7.0%} "
+            f"{r['n_games']:>6d} ${r['total_pnl']:>+9.0f} "
+            f"{r['roi']:>+6.1%} {r['sharpe']:>7.2f} "
+            f"{ci_str:>20s} {r['p_positive']:>8.0%}")
+
+
 def compute_calibration(
     df: pd.DataFrame,
     prob_col: str,
@@ -1106,20 +1261,26 @@ def main():
                         help="Sims per in-game state (default: 500)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for reproducibility")
+    parser.add_argument("--no-mo", action="store_true",
+                        help="Skip multi-output model (use log5/xRV only)")
     args = parser.parse_args()
 
     AUDIT_DIR.mkdir(parents=True, exist_ok=True)
 
     # Load multi-output matchup models FIRST (torch must init before large data)
-    mo_season = args.season - 1
-    log(f"Loading multi-output matchup models (trained on {mo_season})...")
-    try:
-        mo_models = load_multi_output_models(mo_season)
-        log(f"  Loaded multi-output models: {list(mo_models.keys())}")
-    except Exception as e:
-        log(f"  Warning: Could not load multi-output models: {e}")
-        log("  Falling back to log5-only predictions")
-        mo_models = None
+    mo_models = None
+    if not args.no_mo:
+        mo_season = args.season - 1
+        log(f"Loading multi-output matchup models (trained on {mo_season})...")
+        try:
+            mo_models = load_multi_output_models(mo_season)
+            log(f"  Loaded multi-output models: {list(mo_models.keys())}")
+        except Exception as e:
+            log(f"  Warning: Could not load multi-output models: {e}")
+            log("  Falling back to log5-only predictions")
+            mo_models = None
+    else:
+        log("Skipping multi-output model (--no-mo flag)")
 
     # Load simulation artifacts
     log("Loading simulation artifacts...")
@@ -1220,6 +1381,11 @@ def main():
             # Calibration
             sim_cal = compute_calibration(ingame_df, "sim_home_wp")
             print_calibration(sim_cal, "In-Game Simulator")
+
+            # Kelly rebalancing simulation
+            print_header("KELLY REBALANCING STRATEGY")
+            kelly_results = compute_kelly_rebalancing(ingame_df)
+            print_kelly_rebalancing(kelly_results)
 
             # Save
             out_path = AUDIT_DIR / f"sim_vs_kalshi_ingame_{args.season}.csv"
