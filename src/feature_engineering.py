@@ -31,8 +31,6 @@ from utils import (
     ROSTER_DIR, HARD_TYPES, BREAK_TYPES, OFFSPEED_TYPES, filter_competitive,
 )
 
-# Backward-compat alias for internal callers
-_filter_competitive = filter_competitive
 
 # Differential columns: (feature_suffix, sign) where sign controls direction
 # positive sign = higher home value is better for home team
@@ -216,7 +214,7 @@ def _precompute_pitcher_bases(
         recent = hand_pitches.iloc[-n_pitches:] if len(hand_pitches) > n_pitches else hand_pitches
 
         # Apply competitive count filter
-        recent = _filter_competitive(recent)
+        recent = filter_competitive(recent)
 
         if len(recent) < 50:
             result[hand] = None
@@ -438,7 +436,7 @@ def _compute_pitcher_arsenal_live(pitcher_df: pd.DataFrame, game_date: str,
     recent = before.iloc[-n_pitches:] if len(before) > n_pitches else before
 
     # Apply competitive count filter
-    recent = _filter_competitive(recent)
+    recent = filter_competitive(recent)
 
     if len(recent) < 100:
         return None

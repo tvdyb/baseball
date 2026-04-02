@@ -97,11 +97,18 @@ class TeamContext:
 
 @dataclass
 class SimConfig:
-    """Simulation parameters."""
+    """Simulation parameters.
+
+    Defaults are based on 2017-2024 MLB averages:
+    - SP pitch limit: 92 ± 10 (MLB avg ~91 pitches/start, Gaussian for variance)
+    - Pitches per PA: 3.9 (MLB avg 3.87-3.93 over 2017-2024)
+    - Max PA per half-inning: 25 (safety limit; MLB record is 23 batters)
+    """
     n_sims: int = 10_000
     sp_pitch_limit_mean: int = 92
     sp_pitch_limit_std: int = 10
-    pitches_per_pa: float = 3.9    # league avg pitches per PA
+    pitches_per_pa: float = 3.9
+    max_pa_per_half_inning: int = 25
     random_seed: int | None = None
 
 
@@ -112,7 +119,9 @@ class SimConfig:
 #   3. Log5 odds-ratio combination (standard baseball method)
 #   4. Bayesian matchup model interaction adjustment
 
-# Minimum PA thresholds before trusting individual rates
+# Minimum PA thresholds before trusting individual rates over league avg.
+# Below these thresholds, we use league averages to avoid small-sample noise.
+# 50 PAs ≈ 2 weeks of games for a regular starter.
 _MIN_BATTER_PA = 50
 _MIN_PITCHER_PA = 100
 
@@ -250,6 +259,7 @@ def apply_matchup_adjustment(
 
 def rates_to_probs(rates: dict[str, float]) -> np.ndarray:
     """Convert outcome rate dict to numpy prob array, applying clamps."""
+    rates = dict(rates)  # avoid mutating caller's dict
     for o, cap in _OUTCOME_CLAMPS.items():
         if rates.get(o, 0) > cap:
             rates[o] = cap
@@ -427,9 +437,8 @@ def simulate_half_inning(
     Returns runs scored in this half-inning.
     """
     runs_total = 0
-    max_pa = 25  # safety limit per half-inning
 
-    for _ in range(max_pa):
+    for _ in range(config.max_pa_per_half_inning):
         if state.outs >= 3:
             break
 
@@ -530,12 +539,12 @@ def simulate_game(
         if state.home_pitcher == "sp" and state.home_sp_pitches >= home_sp_limit:
             state.home_pitcher = "bp"
 
-        # Extra innings: Manfred runner on 2B from 10th inning on
-        if state.inning >= 10:
-            state.bases = (False, True, False)
-
         # Top of inning: away team bats
         if state.top_bottom == "Top":
+            # Extra innings: Manfred runner on 2B
+            if state.inning >= 10:
+                state.bases = (False, True, False)
+
             simulate_half_inning(
                 state, "away", "home", dists, transition_matrix, config, rng,
             )
@@ -543,18 +552,16 @@ def simulate_game(
             state.bases = (False, False, False)
             state.top_bottom = "Bot"
 
-            # If home team already leads after top of 9th+, game over
-            # (This is wrong — the bottom still needs to happen unless home leads GOING INTO bottom)
-            # Actually: bottom of 9th is skipped only if home leads after top 9
+            # Bottom of 9th+ is skipped if home already leads
             if state.inning >= 9 and state.home_score > state.away_score:
                 return state.home_score, state.away_score
 
-            # Extra innings: Manfred runner
+        # Bottom of inning: home team bats
+        if state.top_bottom == "Bot":
+            # Extra innings: Manfred runner on 2B
             if state.inning >= 10:
                 state.bases = (False, True, False)
 
-        # Bottom of inning: home team bats
-        if state.top_bottom == "Bot":
             simulate_half_inning(
                 state, "home", "away", dists, transition_matrix, config, rng,
             )
@@ -616,10 +623,6 @@ def monte_carlo_win_prob(
             away_wins += 1
         else:
             ties += 1
-
-        if hr + ar > 0:  # approximate extras detection
-            # Check if game went to extras by looking at run totals
-            pass  # Could track this in simulate_game if needed
 
     n = config.n_sims
     home_wp = home_wins / n
@@ -1079,6 +1082,7 @@ def run_backtest(
             actuals.append(int(game["home_win"]))
         except Exception as e:
             n_skip += 1
+            print(f"  SKIP game {gpk}: {type(e).__name__}: {e}")
             continue
 
     if not preds:
@@ -1188,7 +1192,8 @@ def predict_date(
         if is_live:
             try:
                 initial_state = fetch_live_game_state(client, game["game_pk"])
-            except Exception:
+            except Exception as e:
+                print(f"  Could not fetch live state for {game['game_pk']}: {e}")
                 initial_state = GameState()
         else:
             initial_state = GameState()

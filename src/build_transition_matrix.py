@@ -58,6 +58,27 @@ BBTYPE_MAP = {
 OUTCOME_ORDER = ["K", "BB", "HBP", "1B", "2B", "3B", "HR",
                  "dp", "out_ground", "out_fly", "out_line"]
 
+STATCAST_DIR = DATA_DIR / "statcast"
+
+
+def _classify_events_vectorized(df: pd.DataFrame) -> pd.Series:
+    """Vectorized classification of Statcast events to sim outcome categories."""
+    outcome = df["events"].map(EVENT_MAP)
+
+    field_out_mask = df["events"] == "field_out"
+    if field_out_mask.any():
+        bb_mapped = df.loc[field_out_mask, "bb_type"].map(BBTYPE_MAP).fillna("out_ground")
+        outcome.loc[field_out_mask] = bb_mapped
+
+    still_null = outcome.isna() & df["events"].notna()
+    if still_null.any():
+        has_dp = df.loc[still_null, "events"].str.contains("double_play", na=False)
+        outcome.loc[still_null & has_dp] = "dp"
+        has_out = df.loc[still_null & ~has_dp, "events"].str.contains("out", na=False)
+        outcome.loc[still_null & ~has_dp & has_out] = "out_ground"
+
+    return outcome
+
 
 def _classify_event(row) -> str | None:
     """Map a Statcast row to a simulation outcome category."""
@@ -82,12 +103,17 @@ def _classify_event(row) -> str | None:
 
 
 def _base_state(row) -> tuple[bool, bool, bool]:
-    """Extract (1B, 2B, 3B) occupancy from a Statcast row."""
-    return (
-        not pd.isna(row.get("on_1b", np.nan)),
-        not pd.isna(row.get("on_2b", np.nan)),
-        not pd.isna(row.get("on_3b", np.nan)),
-    )
+    """Extract (1B, 2B, 3B) occupancy from a Statcast row.
+
+    A base is occupied if the column exists and has a non-null player ID.
+    """
+    def _occupied(col: str) -> bool:
+        val = row.get(col) if hasattr(row, "get") else row[col] if col in row.index else None
+        if val is None:
+            return False
+        return not pd.isna(val)
+
+    return (_occupied("on_1b"), _occupied("on_2b"), _occupied("on_3b"))
 
 
 # ── Step 1: League-average base rates ─────────────────────
@@ -95,7 +121,7 @@ def _base_state(row) -> tuple[bool, bool, bool]:
 def compute_base_rates(df: pd.DataFrame) -> dict[str, float]:
     """Compute league-average PA outcome frequencies."""
     pa = df[df["events"].notna()].copy()
-    pa["outcome"] = pa.apply(_classify_event, axis=1)
+    pa["outcome"] = _classify_events_vectorized(pa)
     pa = pa[pa["outcome"].notna()]
 
     counts = pa["outcome"].value_counts()
@@ -119,7 +145,7 @@ def compute_xrv_calibration(df: pd.DataFrame, base_rates: dict) -> dict:
     """
     # Get PA-level mean xRV (average across all pitches in the at-bat)
     pa = df[df["events"].notna()].copy()
-    pa["outcome"] = pa.apply(_classify_event, axis=1)
+    pa["outcome"] = _classify_events_vectorized(pa)
     pa = pa[pa["outcome"].notna()]
 
     pa_xrv = pa.groupby(["game_pk", "at_bat_number"])["xrv"].mean().reset_index()
@@ -145,7 +171,9 @@ def compute_xrv_calibration(df: pd.DataFrame, base_rates: dict) -> dict:
     bins = sorted(bin_rates.keys())
     xrv_vals = np.array([bin_xrv_means[b] for b in bins])
 
-    # Heuristic scale: xRV is per-pitch (~0.00X), amplify for PA-level effect
+    # Scale factor: xRV is per-pitch (~±0.005 range) but outcomes happen per-PA.
+    # With ~3.9 pitches/PA and wanting ~±20% shifts at ±1σ, scale=8.0 gives
+    # exp(8 * 0.005 * 3.9) ≈ 1.17, a reasonable ~17% multiplicative shift.
     scale = 8.0
 
     alphas = {}
@@ -291,18 +319,13 @@ def compute_transition_matrix(df: pd.DataFrame, min_count: int = 20) -> dict:
     """
     # Get PA-level rows
     pa = df[df["events"].notna()].copy()
-    pa["outcome"] = pa.apply(_classify_event, axis=1)
+    pa["outcome"] = _classify_events_vectorized(pa)
     pa = pa[pa["outcome"].notna()]
     pa["bases"] = pa.apply(_base_state, axis=1)
 
     # For post-PA state, we need to look at the next PA in the same half-inning.
     # Group by game + half-inning, sort by at_bat_number.
     pa = pa.sort_values(["game_pk", "inning", "inning_topbot", "at_bat_number"])
-    pa["half_inning_key"] = (
-        pa["game_pk"].astype(str) + "_" +
-        pa["inning"].astype(str) + "_" +
-        pa["inning_topbot"]
-    )
 
     # Determine best way to compute runs scored per PA.
     # Preferred: post_home_score / post_away_score vs home_score / away_score
@@ -321,7 +344,7 @@ def compute_transition_matrix(df: pd.DataFrame, min_count: int = 20) -> dict:
 
     transitions = {}  # (outcome, bases, outs) -> list of (new_bases, runs, count)
 
-    for hi_key, grp in pa.groupby("half_inning_key"):
+    for hi_key, grp in pa.groupby(["game_pk", "inning", "inning_topbot"]):
         grp = grp.sort_values("at_bat_number").reset_index(drop=True)
 
         for i in range(len(grp)):
@@ -414,8 +437,6 @@ def main():
     parser = argparse.ArgumentParser(description="Build simulation lookup tables")
     parser.add_argument("--seasons", type=int, nargs="+", default=list(range(2021, 2026)))
     args = parser.parse_args()
-
-    STATCAST_DIR = DATA_DIR / "statcast"
 
     # Load xRV data and merge score columns from raw Statcast
     frames = []

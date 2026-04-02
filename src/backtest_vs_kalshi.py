@@ -75,19 +75,30 @@ class StateSnapshot:
     inning_half: str           # e.g., "Top 5", "Bot 7"
 
 
-def fetch_play_by_play(client: httpx.Client, game_pk: int) -> dict | None:
+def fetch_play_by_play(client: httpx.Client, game_pk: int, retries: int = 3) -> dict | None:
     """Fetch complete play-by-play data for a historical game from the MLB API."""
-    try:
-        resp = client.get(
-            f"https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live",
-            timeout=30.0,
-        )
-        if resp.status_code == 404:
+    import time as _time
+    for attempt in range(retries):
+        try:
+            resp = client.get(
+                f"https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live",
+                timeout=30.0,
+            )
+            if resp.status_code == 404:
+                return None
+            if resp.status_code == 429 or resp.status_code >= 500:
+                _time.sleep(2 ** attempt)
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        except (httpx.TimeoutException, httpx.ConnectError):
+            if attempt < retries - 1:
+                _time.sleep(2 ** attempt)
+                continue
             return None
-        resp.raise_for_status()
-        return resp.json()
-    except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.ConnectError) as e:
-        return None
+        except httpx.HTTPStatusError:
+            return None
+    return None
 
 
 def extract_half_inning_states(
@@ -319,6 +330,57 @@ def match_candle_to_timestamp(
     return best_price
 
 
+# ── Shared Data Loading ─────────────────────────────────────────────────────
+
+
+def load_backtest_data(season: int) -> tuple[dict, dict, dict] | None:
+    """Load xRV index, matchup models, and lineups for a season.
+
+    Returns (xrv_index, matchup_models, lineups) or None if data is missing.
+    Shared by pregame and in-game backtests to avoid duplicate I/O.
+    """
+    # Load xRV data
+    xrv_frames = []
+    for yr in range(season - 1, season + 1):
+        path = XRV_DIR / f"statcast_xrv_{yr}.parquet"
+        if path.exists():
+            df = pd.read_parquet(path)
+            if "game_type" in df.columns:
+                df = df[df["game_type"] == "R"]
+            xrv_frames.append(df)
+            log(f"  Loaded xRV {yr}: {len(df):,} pitches")
+    if not xrv_frames:
+        log("  No xRV data found")
+        return None
+    xrv = pd.concat(xrv_frames, ignore_index=True)
+    idx = _preindex_xrv(xrv)
+
+    # Load matchup models
+    model_year = season - 1
+    matchup_models = _load_hand_models("matchup_model", model_year)
+    if not matchup_models:
+        matchup_models = _load_hand_models("matchup_model", season)
+    if not matchup_models:
+        log("  WARNING: No matchup models found — using league-average xRV")
+
+    # Load lineups from JSON cache
+    lineups_path = GAMES_DIR / f"lineups_{season}.json"
+    lineups = {}
+    if lineups_path.exists():
+        with open(lineups_path) as f:
+            raw = json.load(f)
+        for gpk, lu in raw.items():
+            home_raw = lu.get("home", lu.get("home_lineup", []))
+            away_raw = lu.get("away", lu.get("away_lineup", []))
+            home_lu = [(p["player_id"], p.get("bat_side") or "R") for p in home_raw]
+            away_lu = [(p["player_id"], p.get("bat_side") or "R") for p in away_raw]
+            if home_lu and away_lu:
+                lineups[int(gpk)] = {"home": home_lu, "away": away_lu}
+        log(f"  Loaded lineups for {len(lineups)} games from cache")
+
+    return idx, matchup_models or {}, lineups
+
+
 # ── Pregame Backtest ─────────────────────────────────────────────────────────
 
 
@@ -328,6 +390,9 @@ def run_pregame_backtest(
     calibration: dict,
     transition_matrix: dict,
     config: SimConfig,
+    idx: dict | None = None,
+    matchup_models: dict | None = None,
+    lineups: dict | None = None,
 ) -> pd.DataFrame:
     """Run MC simulator pregame on all games with Kalshi data.
 
@@ -354,7 +419,6 @@ def run_pregame_backtest(
 
     games_df = pd.read_parquet(games_path)
     games_df["game_date"] = games_df["game_date"].astype(str)
-    # Normalize column names (games parquet uses _abbr suffix)
     if "home_team_abbr" in games_df.columns and "home_team" not in games_df.columns:
         games_df["home_team"] = games_df["home_team_abbr"]
         games_df["away_team"] = games_df["away_team_abbr"]
@@ -364,7 +428,6 @@ def run_pregame_backtest(
         & games_df["away_sp_id"].notna()
     ].copy()
 
-    # Merge with Kalshi
     merged = games_df.merge(
         kalshi[["game_date", "home_team", "away_team", "kalshi_home_prob", "volume"]],
         on=["game_date", "home_team", "away_team"],
@@ -375,46 +438,12 @@ def run_pregame_backtest(
     if len(merged) == 0:
         return pd.DataFrame()
 
-    # Load xRV data
-    xrv_frames = []
-    for yr in range(season - 1, season + 1):
-        path = XRV_DIR / f"statcast_xrv_{yr}.parquet"
-        if path.exists():
-            df = pd.read_parquet(path)
-            if "game_type" in df.columns:
-                df = df[df["game_type"] == "R"]
-            xrv_frames.append(df)
-            log(f"  Loaded xRV {yr}: {len(df):,} pitches")
-    if not xrv_frames:
-        log("  No xRV data found")
-        return pd.DataFrame()
-    xrv = pd.concat(xrv_frames, ignore_index=True)
-    idx = _preindex_xrv(xrv)
-
-    # Load matchup models
-    model_year = season - 1
-    matchup_models = _load_hand_models("matchup_model", model_year)
-    if not matchup_models:
-        matchup_models = _load_hand_models("matchup_model", season)
-    if not matchup_models:
-        log("  WARNING: No matchup models found — using league-average xRV")
-
-    # Load lineups from JSON cache, or fetch from API
-    lineups_path = GAMES_DIR / f"lineups_{season}.json"
-    lineups = {}
-    if lineups_path.exists():
-        with open(lineups_path) as f:
-            raw = json.load(f)
-        for gpk, lu in raw.items():
-            # Handle both key formats: scraper uses home_lineup/away_lineup,
-            # simulate.py backtest uses home/away
-            home_raw = lu.get("home", lu.get("home_lineup", []))
-            away_raw = lu.get("away", lu.get("away_lineup", []))
-            home_lu = [(p["player_id"], p.get("bat_side") or "R") for p in home_raw]
-            away_lu = [(p["player_id"], p.get("bat_side") or "R") for p in away_raw]
-            if home_lu and away_lu:
-                lineups[int(gpk)] = {"home": home_lu, "away": away_lu}
-        log(f"  Loaded lineups for {len(lineups)} games from cache")
+    # Fall back to loading data if not provided
+    if idx is None or matchup_models is None or lineups is None:
+        loaded = load_backtest_data(season)
+        if loaded is None:
+            return pd.DataFrame()
+        idx, matchup_models, lineups = loaded
 
     # For games without cached lineups, fetch from MLB API
     from predict import fetch_lineup
@@ -525,6 +554,9 @@ def run_ingame_backtest(
     config: SimConfig,
     max_games: int = 100,
     pregame_df: pd.DataFrame | None = None,
+    idx: dict | None = None,
+    matchup_models: dict | None = None,
+    lineups: dict | None = None,
 ) -> pd.DataFrame:
     """Run in-game backtest: reconstruct states, match to Kalshi candles, simulate.
 
@@ -578,39 +610,14 @@ def run_ingame_backtest(
         merged = merged.sample(n=max_games, random_state=42).sort_values("game_date")
         log(f"  Subsampled to {max_games} games for in-game backtest")
 
-    # Load xRV + models (same as pregame)
-    xrv_frames = []
-    for yr in range(season - 1, season + 1):
-        path = XRV_DIR / f"statcast_xrv_{yr}.parquet"
-        if path.exists():
-            df = pd.read_parquet(path)
-            if "game_type" in df.columns:
-                df = df[df["game_type"] == "R"]
-            xrv_frames.append(df)
-    if not xrv_frames:
-        log("  No xRV data for in-game backtest")
-        return pd.DataFrame()
-    xrv = pd.concat(xrv_frames, ignore_index=True)
-    idx = _preindex_xrv(xrv)
+    # Fall back to loading data if not provided
+    if idx is None or matchup_models is None or lineups is None:
+        loaded = load_backtest_data(season)
+        if loaded is None:
+            return pd.DataFrame()
+        idx, matchup_models, lineups = loaded
 
-    model_year = season - 1
-    matchup_models = _load_hand_models("matchup_model", model_year)
-    if not matchup_models:
-        matchup_models = _load_hand_models("matchup_model", season)
-
-    lineups_path = GAMES_DIR / f"lineups_{season}.json"
-    lineups = {}
-    if lineups_path.exists():
-        with open(lineups_path) as f:
-            raw = json.load(f)
-        for gpk, lu in raw.items():
-            # Handle both key formats: scraper uses home_lineup/away_lineup,
-            # simulate.py backtest uses home/away
-            home_raw = lu.get("home", lu.get("home_lineup", []))
-            away_raw = lu.get("away", lu.get("away_lineup", []))
-            home_lu = [(p["player_id"], p.get("bat_side") or "R") for p in home_raw]
-            away_lu = [(p["player_id"], p.get("bat_side") or "R") for p in away_raw]
-            lineups[int(gpk)] = {"home": home_lu, "away": away_lu}
+    lineups = dict(lineups)  # local copy so we can add fetched lineups
 
     rows = []
     n_games_processed = 0
@@ -635,7 +642,8 @@ def run_ingame_backtest(
                     game, str(game["game_date"]), lu, idx,
                     matchup_models or {}, base_rates, calibration,
                 )
-            except Exception:
+            except Exception as e:
+                log(f"    SKIP game {gpk} (context): {type(e).__name__}: {e}")
                 continue
 
             # Fetch play-by-play
@@ -697,7 +705,8 @@ def run_ingame_backtest(
                         home_ctx, away_ctx, snap.game_state,
                         transition_matrix, config,
                     )
-                except Exception:
+                except Exception as e:
+                    log(f"    SKIP {gpk} {snap.inning_half}: {type(e).__name__}: {e}")
                     continue
 
                 # Compute game progress (0.0 = pregame, 1.0 = game over)
@@ -1104,6 +1113,14 @@ def main():
         log("Run `python src/build_transition_matrix.py` first.")
         return
 
+    # Load shared data once for both backtests
+    log("Loading xRV, matchup models, and lineups...")
+    shared = load_backtest_data(args.season)
+    if shared is None:
+        log("Cannot proceed without xRV data")
+        return
+    idx, matchup_models, lineups = shared
+
     # ── Pregame Backtest ──────────────────────────────────────────────────
     pregame_df = pd.DataFrame()
     if not args.ingame_only:
@@ -1112,6 +1129,7 @@ def main():
         pregame_config = SimConfig(n_sims=args.n_sims, random_seed=args.seed)
         pregame_df = run_pregame_backtest(
             args.season, base_rates, calibration, transition_matrix, pregame_config,
+            idx=idx, matchup_models=matchup_models, lineups=lineups,
         )
 
     if len(pregame_df) > 0:
@@ -1162,6 +1180,7 @@ def main():
         ingame_df = run_ingame_backtest(
             args.season, base_rates, calibration, transition_matrix,
             ingame_config, max_games=args.max_games, pregame_df=pregame_df,
+            idx=idx, matchup_models=matchup_models, lineups=lineups,
         )
 
         if len(ingame_df) > 0:
