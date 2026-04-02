@@ -123,9 +123,41 @@ poly-live:
 poly-sizing:
 	$(PYTHON) src/polymarket_bot.py --date $(DATE) --bankroll $(BANKROLL) --sizing-only
 
+# ── Monte Carlo Simulation ────────────────────────────────
+
+# Build simulation lookup tables (base-running transitions, xRV calibration)
+build-sim-data:
+	$(PYTHON) src/build_transition_matrix.py --seasons $(SEASONS)
+
+# Run MC simulation for today's games
+simulate:
+	$(PYTHON) src/simulate.py
+
+# Simulate a specific date
+simulate-date:
+	$(PYTHON) src/simulate.py --date $(DATE)
+
+# Simulate a specific game (mid-game if live)
+simulate-game:
+	$(PYTHON) src/simulate.py --game-pk $(GAME_PK)
+
+# Backtest simulator against historical results
+simulate-backtest:
+	$(PYTHON) src/simulate.py --backtest $(SEASON)
+
+# Backtest MC simulator vs Kalshi (pregame only)
+sim-vs-kalshi:
+	$(PYTHON) src/backtest_vs_kalshi.py --season $(SEASON)
+
+# Backtest MC simulator vs Kalshi (pregame + in-game)
+sim-vs-kalshi-full:
+	$(PYTHON) src/backtest_vs_kalshi.py --season $(SEASON) --ingame --max-games $(or $(MAX_GAMES),100)
+
 .PHONY: all scrape scrape-statcast scrape-games scrape-weather scrape-oaa \
         scrape-sprint-speed scrape-transactions scrape-kalshi projections \
         build-xrv matchup-models matchup-models-pooled \
         features train predict compare ablation \
         audit audit-quick clean-audit predict-today predict-today-lr \
-        picks picks-date poly-dry poly-live poly-sizing
+        picks picks-date poly-dry poly-live poly-sizing \
+        build-sim-data simulate simulate-date simulate-game simulate-backtest \
+        sim-vs-kalshi sim-vs-kalshi-full

@@ -892,10 +892,12 @@ def _preindex_xrv(xrv: pd.DataFrame) -> dict:
     return idx
 
 
-def _get_before(df: pd.DataFrame, game_date: str) -> pd.DataFrame:
+def _get_before(df: pd.DataFrame, game_date) -> pd.DataFrame:
     """Get rows before game_date using the sorted game_date column."""
-    # Binary search for cutoff
+    # Binary search for cutoff — ensure type matches the column
     dates = df["game_date"].values
+    if dates.dtype.kind == "M" and not isinstance(game_date, np.datetime64):
+        game_date = np.datetime64(game_date)
     idx = np.searchsorted(dates, game_date, side="left")
     return df.iloc[:idx]
 
