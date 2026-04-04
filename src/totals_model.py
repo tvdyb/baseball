@@ -166,26 +166,12 @@ def train_totals_model(train_df: pd.DataFrame) -> tuple:
         verbose=False,
     )
 
-    # OOF-estimated blend weight
-    ridge_preds = ridge.predict(X_scaled)
-    xgb_preds = xgb_model.predict(X)
-
-    best_w = 0.5
-    best_rmse = float("inf")
-    for w in np.arange(0.0, 1.01, 0.05):
-        blend = w * ridge_preds + (1 - w) * xgb_preds
-        rmse = np.sqrt(np.mean((blend - y) ** 2))
-        if rmse < best_rmse:
-            best_rmse = rmse
-            best_w = w
-
-    w_ridge = best_w
-
-    # Cross-validated residuals for empirical P(over).
-    # Using in-sample residuals would understate uncertainty; k-fold OOF
-    # residuals capture the true conditional error distribution.
+    # Cross-validated OOF predictions for (a) blend weight and (b) residual CDF.
+    # Both must use OOF to avoid in-sample bias — XGB overfits relative to its
+    # OOF performance, so in-sample blend weight would be biased toward XGB.
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
-    oof_preds = np.full(len(y), np.nan)
+    oof_ridge = np.full(len(y), np.nan)
+    oof_xgb = np.full(len(y), np.nan)
 
     for train_idx, val_idx in kf.split(X):
         X_tr, X_va = X.iloc[train_idx], X.iloc[val_idx]
@@ -205,7 +191,6 @@ def train_totals_model(train_df: pd.DataFrame) -> tuple:
             objective="reg:squarederror", eval_metric="rmse",
             early_stopping_rounds=20, random_state=42,
         )
-        # Use last 20% of this fold's training data for early stopping
         n_es = max(50, len(X_tr) // 5)
         xg.fit(
             X_tr.iloc[:-n_es], y_tr[:-n_es],
@@ -213,16 +198,36 @@ def train_totals_model(train_df: pd.DataFrame) -> tuple:
             verbose=False,
         )
 
-        r_pred = r.predict(X_va_s)
-        x_pred = xg.predict(X_va)
-        oof_preds[val_idx] = w_ridge * r_pred + (1 - w_ridge) * x_pred
+        oof_ridge[val_idx] = r.predict(X_va_s)
+        oof_xgb[val_idx] = xg.predict(X_va)
 
-    oof_residuals = y - oof_preds
-    sorted_residuals = np.sort(oof_residuals[~np.isnan(oof_residuals)])
-    oof_rmse = np.sqrt(np.nanmean(oof_residuals ** 2))
+    # Optimize blend weight on OOF predictions (not in-sample)
+    valid = ~(np.isnan(oof_ridge) | np.isnan(oof_xgb))
+    best_w = 0.5
+    best_rmse = float("inf")
+    for w in np.arange(0.0, 1.01, 0.05):
+        blend = w * oof_ridge[valid] + (1 - w) * oof_xgb[valid]
+        rmse = np.sqrt(np.mean((blend - y[valid]) ** 2))
+        if rmse < best_rmse:
+            best_rmse = rmse
+            best_w = w
+
+    w_ridge = best_w
+
+    # Build OOF residuals using the OOF-optimized blend weight
+    oof_preds = w_ridge * oof_ridge + (1 - w_ridge) * oof_xgb
+    oof_residuals = y[valid] - oof_preds[valid]
+    sorted_residuals = np.sort(oof_residuals)
+    oof_rmse = np.sqrt(np.mean(oof_residuals ** 2))
+
+    # In-sample RMSE for comparison (to gauge overfitting)
+    ridge_preds = ridge.predict(X_scaled)
+    xgb_preds_is = xgb_model.predict(X)
+    is_blend = w_ridge * ridge_preds + (1 - w_ridge) * xgb_preds_is
+    is_rmse = np.sqrt(np.mean((is_blend - y) ** 2))
 
     print(f"  Totals model: Ridge weight={w_ridge:.2f}, "
-          f"in-sample RMSE={best_rmse:.3f}, CV RMSE={oof_rmse:.3f}, "
+          f"in-sample RMSE={is_rmse:.3f}, CV RMSE={oof_rmse:.3f}, "
           f"n_residuals={len(sorted_residuals)}")
 
     return ridge, scaler, xgb_model, features, w_ridge, train_medians, sorted_residuals

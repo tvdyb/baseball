@@ -955,6 +955,18 @@ class LiveTrader:
             if game.totals_market and game.totals_model_over is not None:
                 await self._update_totals_market_price(game)
                 self._compute_totals_edge(game)
+
+                # Dampen pregame→in-game transition: the pregame regression
+                # model and in-game MC sim produce P(over) from different
+                # distributions.  On the first in-game update, skip
+                # rebalancing unless the MC estimate diverges significantly
+                # from the pregame estimate (avoids unnecessary churn).
+                if (game.totals_pregame_traded
+                        and game.totals_net_position != 0
+                        and game.inning <= 1
+                        and game.totals_phase_confidence <= TOTALS_PHASE_CONFIDENCE.get(1, 0)):
+                    continue
+
                 await self._maybe_trade_totals(game)
 
         # Check fills on active orders
@@ -1143,11 +1155,18 @@ class LiveTrader:
             return
 
         if edge > 0:
+            # Buying over at price p: Kelly = edge / (1 - p)
             full_kelly = edge / (1 - p)
             game.totals_side = "BUY_OVER"
         else:
+            # Buying under at price (1-p): Kelly = |edge| / p
             full_kelly = abs(edge) / p
             game.totals_side = "BUY_UNDER"
+
+        # Gate: zero out size when below threshold (avoids confusing dashboard)
+        if abs(edge) < self.config.totals_min_edge or game.totals_phase_confidence <= 0:
+            game.totals_target_size_usd = 0.0
+            return
 
         scaled_kelly = full_kelly * self.config.totals_kelly_fraction * game.totals_phase_confidence
         max_per_game = self.config.bankroll * self.config.totals_max_position_pct

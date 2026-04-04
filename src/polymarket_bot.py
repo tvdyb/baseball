@@ -108,7 +108,14 @@ class PolyMarket:
 
 @dataclass
 class PolyTotalsMarket:
-    """A Polymarket MLB totals (over/under) market."""
+    """A Polymarket MLB totals (over/under) market.
+
+    NOTE: home_team / away_team are parsed from the Polymarket event title
+    via regex and may be swapped (title order is not guaranteed).  The
+    matching logic in live_trader._discover_markets tries both orderings,
+    so game matching works regardless.  Do not rely on these for team-
+    specific features — use the LiveGame fields instead.
+    """
     home_team: str
     away_team: str
     line: float              # e.g. 8.5
