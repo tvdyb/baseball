@@ -697,6 +697,7 @@ def monte_carlo_win_prob(
     ties = 0
     home_runs_dist = Counter()
     away_runs_dist = Counter()
+    total_runs_dist = Counter()
     n_extras = 0
 
     for _ in range(config.n_sims):
@@ -706,6 +707,7 @@ def monte_carlo_win_prob(
         )
         home_runs_dist[hr] += 1
         away_runs_dist[ar] += 1
+        total_runs_dist[hr + ar] += 1
 
         if hr > ar:
             home_wins += 1
@@ -737,11 +739,24 @@ def monte_carlo_win_prob(
         "total_runs_mean": np.mean(all_home) + np.mean(all_away) if all_home else 0,
         "home_runs_dist": dict(home_runs_dist),
         "away_runs_dist": dict(away_runs_dist),
+        "total_runs_dist": dict(total_runs_dist),
         "n_sims": n,
         "home_wins": home_wins,
         "away_wins": away_wins,
         "ties": ties,
     }
+
+
+def compute_total_prob(mc_result: dict, line: float) -> float:
+    """Compute P(over line) from MC simulation total runs distribution.
+
+    Uses the joint total_runs_dist (not marginals) to preserve
+    intra-game correlation between home and away runs.
+    """
+    total_dist = mc_result.get("total_runs_dist", {})
+    n_sims = mc_result.get("n_sims", 1)
+    over = sum(count for runs, count in total_dist.items() if runs > line)
+    return over / n_sims
 
 
 # ── Data Loading ──────────────────────────────────────────

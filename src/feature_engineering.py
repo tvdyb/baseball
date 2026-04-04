@@ -832,22 +832,44 @@ def compute_defense_features(
 # 6. Park Factor (static per home_team / season)
 # ──────────────────────────────────────────────────────────────
 
-def compute_park_factors(xrv_df: pd.DataFrame, season: int,
-                         shrinkage_n: int = 20000) -> dict[str, float]:
+def compute_park_factors(games_df: pd.DataFrame, season: int,
+                         shrinkage_games: int = 40) -> dict[str, float]:
     """
-    Compute park factor as ratio of xRV at this park vs league average.
-    Uses Bayesian shrinkage: parks with fewer pitches are pulled toward 1.0.
-    shrinkage_n = number of pitches needed for full weight on park estimate.
+    Compute park factor as ratio of runs/game at venue vs league average.
+
+    Uses actual game scoring data (home_score + away_score per game at each
+    venue).  Bayesian shrinkage pulls small-sample parks toward 1.0.
+
+    Parameters
+    ----------
+    games_df : DataFrame with home_team, home_score, away_score columns.
+    season : For logging only.
+    shrinkage_games : Number of home games needed for full weight on the
+        venue-specific estimate (default 40 ≈ half season).
+
+    Returns dict mapping team abbreviation → park factor (1.0 = league avg).
     """
-    park_stats = xrv_df.groupby("home_team")["xrv"].agg(["mean", "count"])
-    league_avg = xrv_df["xrv"].mean()
+    if "home_score" not in games_df.columns or "away_score" not in games_df.columns:
+        return {}
+
+    gdf = games_df.dropna(subset=["home_score", "away_score"]).copy()
+    gdf["total_runs"] = gdf["home_score"] + gdf["away_score"]
+    league_rpg = gdf["total_runs"].mean()
+
+    if league_rpg <= 0:
+        return {}
+
+    # Support both column naming conventions
+    team_col = "home_team" if "home_team" in gdf.columns else "home_team_abbr"
+    park_stats = gdf.groupby(team_col)["total_runs"].agg(["mean", "count"])
 
     factors = {}
     for team, row in park_stats.iterrows():
         n = row["count"]
-        weight = n / (n + shrinkage_n)
-        shrunk_mean = weight * row["mean"] + (1 - weight) * league_avg
-        factors[team] = shrunk_mean / league_avg if league_avg != 0 else 1.0
+        venue_rpg = row["mean"]
+        weight = n / (n + shrinkage_games)
+        shrunk_rpg = weight * venue_rpg + (1 - weight) * league_rpg
+        factors[team] = shrunk_rpg / league_rpg
 
     return factors
 
@@ -2190,12 +2212,15 @@ def build_game_features(
     else:
         print(f"  WARNING: No arsenal model for {target_year - 1}, skipping arsenal matchup features")
 
-    # Compute park factors from prior season
-    prior_xrv_path = XRV_DIR / f"statcast_xrv_{target_year - 1}.parquet"
-    if prior_xrv_path.exists():
-        prior_xrv = pd.read_parquet(prior_xrv_path)
-        park_factors = compute_park_factors(prior_xrv, target_year - 1)
-        print(f"  Park factors from {target_year - 1}: {len(park_factors)} parks")
+    # Compute park factors from prior season game scores
+    prior_games_path = GAMES_DIR / f"games_{target_year - 1}.parquet"
+    if prior_games_path.exists():
+        prior_games = pd.read_parquet(prior_games_path)
+        prior_games = prior_games[prior_games["game_type"] == "R"]
+        park_factors = compute_park_factors(prior_games, target_year - 1)
+        pf_vals = sorted(park_factors.values())
+        print(f"  Park factors from {target_year - 1}: {len(park_factors)} parks "
+              f"(range {pf_vals[0]:.3f}–{pf_vals[-1]:.3f})")
     else:
         park_factors = {}
 
