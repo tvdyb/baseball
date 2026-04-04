@@ -108,6 +108,11 @@ PHASE_CONFIDENCE = {
 }
 EXTRAS_CONFIDENCE = 1.00
 
+# Pregame ensemble: demonstrated edge vs market in backtest (LL 0.6771 vs 0.6813).
+# Lower confidence than late-inning MC sim since it trades pregame (wider spreads,
+# no game-state information yet).
+PREGAME_CONFIDENCE = 0.50
+
 # Polymarket sports taker fee: C × 0.03 × p × (1-p)
 # Symmetric around 50%, near-zero at extremes (where our late-game trades are)
 TAKER_FEE_RATE = 0.03
@@ -152,6 +157,8 @@ class TraderConfig:
     max_position_pct: float = 0.10   # 10% of bankroll per game
     max_total_exposure_pct: float = 0.25  # 25% total across all games
     max_loss: float = 500.0          # kill switch
+    pregame_min_edge: float = 0.04   # separate threshold for pregame (wider spreads)
+    pregame_window_min: float = 5.0  # minutes before first pitch to attempt pregame trade
     season: int = 2025
     target_date: str = ""
 
@@ -165,6 +172,13 @@ class LiveGame:
     home_team: str
     away_team: str
     game_time_utc: str = ""
+    home_sp_id: int = 0
+    away_sp_id: int = 0
+
+    # Pregame ensemble model
+    pregame_traded: bool = False          # gate: only trade once pregame
+    pregame_model_prob: float | None = None
+    pregame_edge: float = 0.0
 
     # Simulation context (built once at game discovery)
     home_ctx: TeamContext | None = None
@@ -289,6 +303,9 @@ class LiveTrader:
         # No fixed seed — each sim must be independent for live trading
         self._sim_config = SimConfig(n_sims=config.n_sims, random_seed=None)
 
+        # Pregame LR+XGB ensemble (loaded lazily on first pregame attempt)
+        self._pregame_ensemble = None
+
         # Per-thread HTTP clients to avoid sharing a single client across threads
         self._http = httpx.Client(timeout=30.0)
 
@@ -307,6 +324,9 @@ class LiveTrader:
         print(f"  Max per game: ${self.config.bankroll * self.config.max_position_pct:,.0f}")
         print(f"  Max total: ${self.config.bankroll * self.config.max_total_exposure_pct:,.0f}")
         print(f"  Kill switch: -${self.config.max_loss:,.0f}")
+        print(f"  Pregame: edge>{self.config.pregame_min_edge:.0%}, "
+              f"window={self.config.pregame_window_min:.0f}min, "
+              f"conf={PREGAME_CONFIDENCE:.0%}")
         print(f"  Sims per state: {self.config.n_sims}")
         print(f"{'='*70}")
 
@@ -415,12 +435,17 @@ class LiveTrader:
                 if not ht or not at or not game_pk:
                     continue
 
+                home_sp = home.get("probablePitcher", {})
+                away_sp = away.get("probablePitcher", {})
+
                 game = LiveGame(
                     game_pk=game_pk,
                     home_team=ht,
                     away_team=at,
                     game_time_utc=g.get("gameDate", ""),
                     game_status=status,
+                    home_sp_id=home_sp.get("id", 0) or 0,
+                    away_sp_id=away_sp.get("id", 0) or 0,
                 )
                 self.games[game.game_key] = game
                 print(f"    {game.game_key} (pk={game_pk}) — {status}")
@@ -509,6 +534,139 @@ class LiveTrader:
         except Exception as e:
             log.error("%s: context build failed: %s", game.game_key, e)
 
+    # ── Pregame Ensemble ─────────────────────────────────────────────────
+
+    async def _load_pregame_model(self):
+        """Lazily load the LR+XGB ensemble for pregame prediction."""
+        if self._pregame_ensemble is not None:
+            return
+
+        from predict import load_training_data, train_ensemble
+
+        log.info("Loading pregame LR+XGB ensemble...")
+        train_df = await asyncio.to_thread(load_training_data)
+        train_df["game_date"] = train_df["game_date"].astype(str)
+        train_df = train_df[train_df["game_date"] < self.config.target_date]
+
+        result = await asyncio.to_thread(train_ensemble, train_df)
+        self._pregame_ensemble = result
+        log.info("Pregame ensemble loaded (%d training games)", len(train_df))
+
+    def _is_pregame_window(self, game: LiveGame) -> bool:
+        """True if game is in the pregame trading window."""
+        if game.pregame_traded or game.game_status != "Preview":
+            return False
+        if not game.home_sp_id or not game.away_sp_id:
+            return False
+        if not game.poly_market:
+            return False
+
+        try:
+            gtime = game.game_time_utc
+            if gtime.endswith("Z"):
+                gtime = gtime[:-1] + "+00:00"
+            game_time = datetime.fromisoformat(gtime)
+            now = datetime.now(timezone.utc)
+            minutes_until = (game_time - now).total_seconds() / 60
+            return -2 <= minutes_until <= self.config.pregame_window_min
+        except (ValueError, TypeError):
+            return False
+
+    async def _run_pregame(self, game: LiveGame):
+        """Run pregame LR+XGB ensemble and trade if edge exists."""
+        from predict import build_live_features, predict_games, LineupStatus
+
+        # Fetch lineup — both sides must be posted
+        lu = await asyncio.to_thread(fetch_lineup, self._http, game.game_pk)
+        if not lu or not lu.get("home") or not lu.get("away"):
+            return
+        home_st = lu.get("home_status", LineupStatus.NOT_POSTED)
+        away_st = lu.get("away_status", LineupStatus.NOT_POSTED)
+        if home_st != LineupStatus.AVAILABLE or away_st != LineupStatus.AVAILABLE:
+            return
+
+        # Load ensemble (lazy, first time only)
+        await self._load_pregame_model()
+
+        # Build features for this single game
+        game_dict = {
+            "game_pk": game.game_pk,
+            "game_date": self.config.target_date,
+            "home_team": game.home_team,
+            "away_team": game.away_team,
+            "home_sp_id": game.home_sp_id,
+            "away_sp_id": game.away_sp_id,
+            "home_sp_name": "",
+            "away_sp_name": "",
+            "venue_name": "",
+            "game_time": game.game_time_utc,
+            "status": game.game_status,
+            "weather": {},
+        }
+
+        try:
+            features_df = await asyncio.to_thread(
+                build_live_features, [game_dict], self.config.target_date,
+                self._http, True,  # skip_freshness_check
+            )
+        except Exception as e:
+            log.error("%s: pregame feature build failed: %s", game.game_key, e)
+            return
+
+        if features_df.empty:
+            return
+
+        lr, scaler, xgb_model, lr_features, xgb_features, w_lr, train_medians = self._pregame_ensemble
+        results = await asyncio.to_thread(
+            predict_games, lr, scaler, xgb_model, lr_features, xgb_features,
+            features_df, w_lr, train_medians,
+        )
+
+        home_wp = float(results["home_win_prob"].iloc[0])
+        game.pregame_model_prob = home_wp
+        game.model_home_wp = home_wp
+
+        # Get market price
+        await self._update_market_price(game)
+        if game.poly_home_mid is None:
+            return
+
+        # Compute edge
+        p = game.poly_home_mid
+        raw_edge = home_wp - p
+        fee_drag = _polymarket_fee(p)
+        game.edge = raw_edge - fee_drag if raw_edge > 0 else raw_edge + fee_drag
+        game.pregame_edge = game.edge
+        game.phase_confidence = PREGAME_CONFIDENCE
+
+        abs_edge = abs(game.edge)
+        if abs_edge < self.config.pregame_min_edge:
+            log.info("%s: pregame edge %.1f%% < threshold %.1f%% — skip",
+                     game.game_key, abs_edge * 100, self.config.pregame_min_edge * 100)
+            game.pregame_traded = True
+            return
+
+        # Kelly sizing
+        if game.edge > 0:
+            full_kelly = game.edge / (1 - p)
+            game.side = "BUY_HOME"
+        else:
+            full_kelly = abs(game.edge) / p
+            game.side = "BUY_AWAY"
+
+        scaled_kelly = full_kelly * self.config.kelly_fraction * PREGAME_CONFIDENCE
+        game.half_kelly = full_kelly * self.config.kelly_fraction
+        max_per_game = self.config.bankroll * self.config.max_position_pct
+        game.target_size_usd = min(self.config.bankroll * scaled_kelly, max_per_game)
+
+        # Place trade (reuses existing rebalancing logic + exposure caps)
+        await self._maybe_trade(game)
+
+        game.pregame_traded = True
+        log.info("%s: PREGAME %s edge=%.1f%% size=$%.0f model=%.1f%% mkt=%.1f%%",
+                 game.game_key, game.side, abs_edge * 100, game.target_size_usd,
+                 home_wp * 100, p * 100)
+
     # ── Core Loop ─────────────────────────────────────────────────────────
 
     async def run(self):
@@ -546,6 +704,14 @@ class LiveTrader:
 
         # Update game states from MLB API
         await self._update_game_states()
+
+        # Pregame phase: trade ~5min before first pitch (LR+XGB ensemble)
+        for key, game in list(self.games.items()):
+            if self._is_pregame_window(game):
+                try:
+                    await self._run_pregame(game)
+                except Exception as e:
+                    log.error("%s: pregame failed: %s", key, e)
 
         # For each live game: run sim, check edge, trade
         for key, game in self.games.items():
@@ -1181,6 +1347,9 @@ class LiveTrader:
                 "fill_history": g.fill_history,
                 "halted": g.halted,
                 "halt_reason": g.halt_reason,
+                "pregame_traded": g.pregame_traded,
+                "pregame_model_prob": g.pregame_model_prob,
+                "pregame_edge": g.pregame_edge,
             }
 
         with open(state_path, "w") as f:
@@ -1212,6 +1381,10 @@ class LiveTrader:
             game.active_order_side = saved.get("active_order_side", "")
             game.active_order_price = saved.get("active_order_price", 0.0)
             game.active_order_size = saved.get("active_order_size", 0.0)
+
+            game.pregame_traded = saved.get("pregame_traded", False)
+            game.pregame_model_prob = saved.get("pregame_model_prob")
+            game.pregame_edge = saved.get("pregame_edge", 0.0)
 
             if saved.get("halted"):
                 game.halted = True
@@ -1278,6 +1451,10 @@ def main():
                         help="Max total exposure as fraction of bankroll (default: 0.25)")
     parser.add_argument("--max-loss", type=float, default=500.0,
                         help="Kill switch: halt if total P&L drops below this (default: 500)")
+    parser.add_argument("--pregame-min-edge", type=float, default=0.04,
+                        help="Min edge for pregame trades (default: 0.04)")
+    parser.add_argument("--pregame-window", type=float, default=5.0,
+                        help="Minutes before first pitch for pregame trade (default: 5)")
     parser.add_argument("--season", type=int, default=2025,
                         help="Season for xRV data (default: 2025)")
     args = parser.parse_args()
@@ -1308,6 +1485,8 @@ def main():
         max_position_pct=args.max_position,
         max_total_exposure_pct=args.max_total,
         max_loss=args.max_loss,
+        pregame_min_edge=args.pregame_min_edge,
+        pregame_window_min=args.pregame_window,
         season=args.season,
         target_date=target_date,
     )
