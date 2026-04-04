@@ -584,6 +584,10 @@ def build_live_features(
             "away_sp_name": game.get("away_sp_name", "TBD"),
             "game_time": game.get("game_time", ""),
             "status": game.get("status", ""),
+            "home_sp_missing": not game.get("home_sp_id"),
+            "away_sp_missing": not game.get("away_sp_id"),
+            "home_lineup_missing": home_st == LineupStatus.NOT_POSTED,
+            "away_lineup_missing": away_st == LineupStatus.NOT_POSTED,
         })
 
     # Report lineup fetch outcomes
@@ -655,7 +659,9 @@ def predict_date(target_date: str, lr_only: bool = False):
     results = predict_games(lr, scaler, xgb_model, lr_features, xgb_features, features_df, w_lr, train_medians)
 
     # Merge display columns back
-    for col in ["home_sp_name", "away_sp_name", "game_time", "status"]:
+    for col in ["home_sp_name", "away_sp_name", "game_time", "status",
+                 "home_sp_missing", "away_sp_missing",
+                 "home_lineup_missing", "away_lineup_missing"]:
         if col in features_df.columns:
             results[col] = features_df[col].values
 
@@ -678,11 +684,26 @@ def predict_date(target_date: str, lr_only: bool = False):
     print(f"  {'Matchup':<35s} {'Home%':>6s} {'Away%':>6s} {'Pick':>6s} {'Conf':>5s}")
     print(f"  {'-'*60}")
 
+    skipped = []
     for _, r in results.iterrows():
         away_sp = r.get("away_sp_name", "TBD")
         home_sp = r.get("home_sp_name", "TBD")
         matchup = f"{r['away_team']} @ {r['home_team']}"
         pitchers = f"  {away_sp} vs {home_sp}"
+
+        # Skip games missing SP or lineup
+        missing = []
+        if r.get("home_sp_missing"):
+            missing.append(f"{r['home_team']} SP")
+        if r.get("away_sp_missing"):
+            missing.append(f"{r['away_team']} SP")
+        if r.get("home_lineup_missing"):
+            missing.append(f"{r['home_team']} lineup")
+        if r.get("away_lineup_missing"):
+            missing.append(f"{r['away_team']} lineup")
+        if missing:
+            skipped.append((matchup, pitchers, missing))
+            continue
 
         pick_team = r["home_team"] if r["home_win_prob"] >= 0.5 else r["away_team"]
 
@@ -700,6 +721,13 @@ def predict_date(target_date: str, lr_only: bool = False):
               f" {pick_team:>5s} {conf_str:>5s}{low_conf}{result_str}")
         print(f"  {pitchers}")
         print()
+
+    if skipped:
+        print(f"  {'--- SKIPPED (missing data) ---':^60}")
+        for matchup, pitchers, missing in skipped:
+            print(f"  {matchup:<35s}  missing: {', '.join(missing)}")
+            print(f"  {pitchers}")
+            print()
 
     if "home_win" in results.columns and results["home_win"].notna().all():
         picks_correct = results.apply(

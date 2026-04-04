@@ -1002,8 +1002,8 @@ def _sp_features_fast(pitcher_df: pd.DataFrame, game_date: str, n_pitches: int) 
             len(short_fb) > 0 and "release_spin_rate" in recent_short.columns
         ) else np.nan
 
-        sp_velo_trend = short_velo - avg_velo if not (np.isnan(short_velo) or np.isnan(avg_velo)) else np.nan
-        sp_spin_trend = short_spin - long_spin if not (np.isnan(short_spin) or np.isnan(long_spin)) else np.nan
+        sp_velo_trend = short_velo - avg_velo if not (pd.isna(short_velo) or pd.isna(avg_velo)) else np.nan
+        sp_spin_trend = short_spin - long_spin if not (pd.isna(short_spin) or pd.isna(long_spin)) else np.nan
         sp_xrv_trend = short_xrv - xrv_mean  # positive = getting worse recently
     else:
         sp_velo_trend = np.nan
