@@ -449,6 +449,24 @@ def run_pregame_backtest(
             return pd.DataFrame()
         idx, matchup_models, lineups = loaded
 
+    # Load park factors and weather for sim adjustments
+    from feature_engineering import compute_park_factors
+    park_factors = compute_park_factors(merged, season)
+    weather_map = {}
+    weather_path = GAMES_DIR.parent / "weather" / f"weather_{season}.parquet"
+    if weather_path.exists():
+        import pandas as _pd
+        wdf = _pd.read_parquet(weather_path)
+        for _, wr in wdf.iterrows():
+            wind_dir = str(wr.get("wind_dir", "")).lower()
+            weather_map[int(wr["game_pk"])] = {
+                "temperature": wr.get("temperature"),
+                "wind_speed": wr.get("wind_speed"),
+                "wind_out": int("out" in wind_dir),
+                "wind_in": int("in" in wind_dir),
+                "is_dome": wr.get("is_dome", 0),
+            }
+
     # For games without cached lineups, fetch from MLB API
     from predict import fetch_lineup
     lineup_client = httpx.Client(timeout=30.0)
@@ -483,9 +501,15 @@ def run_pregame_backtest(
                 matchup_models or {}, base_rates,
                 mo_models=mo_models, config=config,
             )
+            pf = park_factors.get(game.get("home_team", ""), 1.0)
+            wx = weather_map.get(gpk)
+            if wx and wx.get("is_dome"):
+                wx = None
+
             result = monte_carlo_win_prob(
                 home_ctx, away_ctx, GameState(),
                 transition_matrix, config,
+                park_factor=pf, weather=wx,
             )
 
             rows.append({

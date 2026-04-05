@@ -107,6 +107,31 @@ class PolyMarket:
 
 
 @dataclass
+class PolyTotalsMarket:
+    """A Polymarket MLB totals (over/under) market.
+
+    NOTE: home_team / away_team are parsed from the Polymarket event title
+    via regex and may be swapped (title order is not guaranteed).  The
+    matching logic in live_trader._discover_markets tries both orderings,
+    so game matching works regardless.  Do not rely on these for team-
+    specific features — use the LiveGame fields instead.
+    """
+    home_team: str
+    away_team: str
+    line: float              # e.g. 8.5
+    over_token_id: str
+    under_token_id: str
+    game_start_time: str
+    condition_id: str
+    question: str
+    volume: float = 0.0
+    gamma_best_bid: float | None = None  # bid for over
+    gamma_best_ask: float | None = None  # ask for over
+    neg_risk: bool = False
+    accepting_orders: bool = True
+
+
+@dataclass
 class GameState:
     """Tracked state for a single game."""
     home_team: str
@@ -413,6 +438,139 @@ def fetch_poly_mlb_markets(target_date: str) -> list[PolyMarket]:
 
     print(f"  Discovery: scanned {total_events} events, {total_markets_scanned} markets → "
           f"found {len(markets)} moneyline games for {target_date}")
+    return markets
+
+
+def fetch_poly_mlb_totals_markets(target_date: str) -> list[PolyTotalsMarket]:
+    """Fetch active Polymarket MLB totals (over/under) markets for the target date.
+
+    Totals markets have sportsMarketType="totals" with outcomes like
+    "Over 8.5" / "Under 8.5". Parses the line from outcome text.
+    """
+    import re
+
+    series_id = discover_mlb_series_id()
+    if not series_id:
+        series_id = "3"
+
+    markets = []
+    offset = 0
+
+    with httpx.Client(timeout=30.0) as client:
+        while True:
+            params = {
+                "series_id": series_id,
+                "active": "true",
+                "closed": "false",
+                "limit": 100,
+                "offset": offset,
+                "order": "startTime",
+                "ascending": "true",
+            }
+            resp = client.get(f"{GAMMA_API}/events", params=params)
+            resp.raise_for_status()
+            events = resp.json()
+
+            if not events:
+                break
+
+            for event in events:
+                title = event.get("title", "")
+                skip_words = [
+                    "Series Winner", "Champion", "MVP", "Cy Young",
+                    "Division", "Home Run", "sweep", "record", "props",
+                    "CBA", "sale", "Jersey",
+                ]
+                if any(w.lower() in title.lower() for w in skip_words):
+                    continue
+
+                # Resolve teams from event title
+                event_teams = []
+                for word in re.split(r"\s+vs\.?\s+|\s*:\s*", title):
+                    t = resolve_team_abbr(word.strip())
+                    if t:
+                        event_teams.append(t)
+
+                for mkt in event.get("markets", []):
+                    smt = mkt.get("sportsMarketType", "")
+                    if smt != "totals":
+                        continue
+                    if mkt.get("closed", False):
+                        continue
+                    if not mkt.get("acceptingOrders", True):
+                        continue
+
+                    # Parse outcomes: ["Over 8.5", "Under 8.5"]
+                    outcomes = _json_parse(mkt.get("outcomes", []))
+                    if len(outcomes) != 2:
+                        continue
+
+                    # Find over/under and parse line
+                    over_idx = under_idx = -1
+                    line = None
+                    for i, o in enumerate(outcomes):
+                        m = re.match(r"(Over|Under)\s+(\d+\.?\d*)", o, re.IGNORECASE)
+                        if m:
+                            if m.group(1).lower() == "over":
+                                over_idx = i
+                            else:
+                                under_idx = i
+                            line = float(m.group(2))
+
+                    if over_idx < 0 or under_idx < 0 or line is None:
+                        continue
+
+                    game_date = _parse_game_date(event, mkt)
+                    if game_date != target_date:
+                        continue
+
+                    clob_ids = _json_parse(mkt.get("clobTokenIds", []))
+                    if len(clob_ids) != 2:
+                        continue
+
+                    neg_risk = bool(mkt.get("negRisk", False))
+                    gamma_bid = mkt.get("bestBid")
+                    gamma_ask = mkt.get("bestAsk")
+                    try:
+                        gamma_bid = float(gamma_bid) if gamma_bid else None
+                        gamma_ask = float(gamma_ask) if gamma_ask else None
+                    except (ValueError, TypeError):
+                        gamma_bid = gamma_ask = None
+
+                    # Use event-level teams or try question text
+                    teams = event_teams[:]
+                    if len(teams) < 2:
+                        for word in re.split(r"\s+vs\.?\s+|\s*:\s*", mkt.get("question", "")):
+                            t = resolve_team_abbr(word.strip())
+                            if t and t not in teams:
+                                teams.append(t)
+
+                    t0 = teams[0] if len(teams) > 0 else ""
+                    t1 = teams[1] if len(teams) > 1 else ""
+
+                    pm = PolyTotalsMarket(
+                        home_team=t0,
+                        away_team=t1,
+                        line=line,
+                        over_token_id=clob_ids[over_idx],
+                        under_token_id=clob_ids[under_idx],
+                        game_start_time=mkt.get("gameStartTime", ""),
+                        condition_id=mkt.get("conditionId", mkt.get("condition_id", "")),
+                        question=mkt.get("question", title),
+                        volume=float(mkt.get("volumeNum") or mkt.get("volume") or 0),
+                        gamma_best_bid=gamma_bid,
+                        gamma_best_ask=gamma_ask,
+                        neg_risk=neg_risk,
+                    )
+                    markets.append(pm)
+                    _debug(f"TOTALS: {t0} vs {t1} O/U {line} | "
+                           f"date={game_date} | vol=${pm.volume:,.0f}")
+
+            if len(events) < 100:
+                break
+            offset += 100
+
+    print(f"  Discovery: found {len(markets)} totals markets for {target_date}")
     return markets
 
 

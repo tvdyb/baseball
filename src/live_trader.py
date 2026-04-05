@@ -74,7 +74,9 @@ from multi_output_matchup_model import load_multi_output_models
 from predict import fetch_lineup
 from polymarket_bot import (
     PolyMarket,
+    PolyTotalsMarket,
     fetch_poly_mlb_markets,
+    fetch_poly_mlb_totals_markets,
     fetch_orderbook,
     fetch_clob_midpoint,
     compute_half_kelly,
@@ -112,6 +114,16 @@ EXTRAS_CONFIDENCE = 1.00
 # Lower confidence than late-inning MC sim since it trades pregame (wider spreads,
 # no game-state information yet).
 PREGAME_CONFIDENCE = 0.50
+
+PREGAME_TOTALS_CONFIDENCE = 0.40  # totals model less validated than moneyline
+
+# In-game totals phase confidence: ramps faster since known runs reduce uncertainty.
+TOTALS_PHASE_CONFIDENCE = {
+    1: 0.00, 2: 0.00, 3: 0.00,
+    4: 0.10, 5: 0.20, 6: 0.35,
+    7: 0.60, 8: 0.80, 9: 1.00,
+}
+TOTALS_EXTRAS_CONFIDENCE = 1.00
 
 # Polymarket sports taker fee: C × 0.03 × p × (1-p)
 # Symmetric around 50%, near-zero at extremes (where our late-game trades are)
@@ -159,6 +171,10 @@ class TraderConfig:
     max_loss: float = 500.0          # kill switch
     pregame_min_edge: float = 0.04   # separate threshold for pregame (wider spreads)
     pregame_window_min: float = 5.0  # minutes before first pitch to attempt pregame trade
+    totals_min_edge: float = 0.05    # in-game totals min edge
+    totals_kelly_fraction: float = 0.20  # slightly less aggressive than moneyline
+    totals_max_position_pct: float = 0.08
+    pregame_totals_min_edge: float = 0.05
     season: int = 2025
     target_date: str = ""
 
@@ -217,6 +233,25 @@ class LiveGame:
     active_order_price: float = 0.0
     active_order_size: float = 0.0
     fill_history: list = field(default_factory=list)
+
+    # Totals market
+    totals_market: PolyTotalsMarket | None = None
+    totals_line: float = 0.0
+    totals_model_over: float | None = None  # P(over)
+    totals_poly_over_mid: float | None = None
+    totals_edge: float = 0.0
+    totals_side: str = ""                    # "BUY_OVER" or "BUY_UNDER"
+    totals_target_size_usd: float = 0.0
+    totals_phase_confidence: float = 0.0
+    totals_net_position: float = 0.0         # +ve = long over, -ve = long under
+    totals_cost_basis: float = 0.0
+    totals_realized_pnl: float = 0.0
+    totals_active_order_id: str | None = None
+    totals_active_order_side: str = ""
+    totals_active_order_price: float = 0.0
+    totals_active_order_size: float = 0.0
+    totals_fill_history: list = field(default_factory=list)
+    totals_pregame_traded: bool = False
 
     # Risk flags
     halted: bool = False
@@ -306,6 +341,9 @@ class LiveTrader:
         # Pregame LR+XGB ensemble (loaded lazily on first pregame attempt)
         self._pregame_ensemble = None
 
+        # Totals model (loaded lazily)
+        self._totals_model = None
+
         # Per-thread HTTP clients to avoid sharing a single client across threads
         self._http = httpx.Client(timeout=30.0)
 
@@ -327,6 +365,9 @@ class LiveTrader:
         print(f"  Pregame: edge>{self.config.pregame_min_edge:.0%}, "
               f"window={self.config.pregame_window_min:.0f}min, "
               f"conf={PREGAME_CONFIDENCE:.0%}")
+        print(f"  Totals: edge>{self.config.totals_min_edge:.0%}, "
+              f"Kelly={self.config.totals_kelly_fraction:.0%}, "
+              f"max=${self.config.bankroll * self.config.totals_max_position_pct:,.0f}")
         print(f"  Sims per state: {self.config.n_sims}")
         print(f"{'='*70}")
 
@@ -473,6 +514,28 @@ class LiveTrader:
 
         print(f"  Matched {matched}/{len(self.games)} games")
 
+        # Discover totals markets
+        totals_markets = await asyncio.to_thread(
+            fetch_poly_mlb_totals_markets, self.config.target_date
+        )
+        print(f"  Found {len(totals_markets)} Polymarket totals markets")
+
+        totals_matched = 0
+        for tm in totals_markets:
+            for ht, at in [
+                (tm.home_team, tm.away_team),
+                (tm.away_team, tm.home_team),
+            ]:
+                key = f"{at}@{ht}"
+                if key in self.games:
+                    self.games[key].totals_market = tm
+                    self.games[key].totals_line = tm.line
+                    totals_matched += 1
+                    print(f"    Totals: {key} → O/U {tm.line}")
+                    break
+
+        print(f"  Matched {totals_matched}/{len(self.games)} totals markets")
+
     # ── Build Simulation Context ──────────────────────────────────────────
 
     async def _build_context(self, game: LiveGame):
@@ -572,6 +635,42 @@ class LiveTrader:
         except (ValueError, TypeError):
             return False
 
+    def _is_pregame_totals_window(self, game: LiveGame) -> bool:
+        """True if game is in the pregame totals trading window."""
+        if game.totals_pregame_traded or game.game_status != "Preview":
+            return False
+        if not game.home_sp_id or not game.away_sp_id:
+            return False
+        if not game.totals_market:
+            return False
+
+        try:
+            gtime = game.game_time_utc
+            if gtime.endswith("Z"):
+                gtime = gtime[:-1] + "+00:00"
+            game_time = datetime.fromisoformat(gtime)
+            now = datetime.now(timezone.utc)
+            minutes_until = (game_time - now).total_seconds() / 60
+            return -2 <= minutes_until <= self.config.pregame_window_min
+        except (ValueError, TypeError):
+            return False
+
+    async def _load_totals_model(self):
+        """Lazily load the Ridge+XGB totals ensemble."""
+        if self._totals_model is not None:
+            return
+
+        from totals_model import load_totals_training_data, train_totals_model
+
+        log.info("Loading totals model...")
+        train_df = await asyncio.to_thread(load_totals_training_data)
+        train_df["game_date"] = train_df["game_date"].astype(str)
+        train_df = train_df[train_df["game_date"] < self.config.target_date]
+
+        model_tuple = await asyncio.to_thread(train_totals_model, train_df)
+        self._totals_model = model_tuple
+        log.info("Totals model loaded (%d training games)", len(train_df))
+
     async def _run_pregame(self, game: LiveGame):
         """Run pregame LR+XGB ensemble and trade if edge exists."""
         from predict import build_live_features, predict_games, LineupStatus
@@ -667,6 +766,105 @@ class LiveTrader:
                  game.game_key, game.side, abs_edge * 100, game.target_size_usd,
                  home_wp * 100, p * 100)
 
+    async def _run_pregame_totals(self, game: LiveGame):
+        """Run pregame totals model and trade if edge exists."""
+        from predict import build_live_features, LineupStatus
+
+        # Fetch lineup
+        lu = await asyncio.to_thread(fetch_lineup, self._http, game.game_pk)
+        if not lu or not lu.get("home") or not lu.get("away"):
+            return
+        home_st = lu.get("home_status", LineupStatus.NOT_POSTED)
+        away_st = lu.get("away_status", LineupStatus.NOT_POSTED)
+        if home_st != LineupStatus.AVAILABLE or away_st != LineupStatus.AVAILABLE:
+            return
+
+        # Load totals model (lazy)
+        await self._load_totals_model()
+
+        # Build features
+        game_dict = {
+            "game_pk": game.game_pk,
+            "game_date": self.config.target_date,
+            "home_team": game.home_team,
+            "away_team": game.away_team,
+            "home_sp_id": game.home_sp_id,
+            "away_sp_id": game.away_sp_id,
+            "home_sp_name": "",
+            "away_sp_name": "",
+            "venue_name": "",
+            "game_time": game.game_time_utc,
+            "status": game.game_status,
+            "weather": {},
+        }
+
+        try:
+            features_df = await asyncio.to_thread(
+                build_live_features, [game_dict], self.config.target_date,
+                self._http, True,
+            )
+        except Exception as e:
+            log.error("%s: pregame totals feature build failed: %s", game.game_key, e)
+            return
+
+        if features_df.empty:
+            return
+
+        from totals_model import predict_total_runs, prob_over
+
+        result = await asyncio.to_thread(
+            predict_total_runs, self._totals_model, features_df,
+        )
+        total_pred = float(result["total_runs_pred"].iloc[0])
+        line = game.totals_line
+
+        sorted_residuals = (self._totals_model["sorted_residuals"]
+                             if isinstance(self._totals_model, dict)
+                             else self._totals_model[-1])
+        model_over = prob_over(total_pred, line, sorted_residuals)
+        game.totals_model_over = model_over
+
+        # Get market price
+        await self._update_totals_market_price(game)
+        if game.totals_poly_over_mid is None:
+            return
+
+        # Compute edge
+        p = game.totals_poly_over_mid
+        raw_edge_over = model_over - p
+        fee_drag = _polymarket_fee(p)
+        edge = raw_edge_over - fee_drag if raw_edge_over > 0 else raw_edge_over + fee_drag
+
+        game.totals_edge = edge
+        abs_edge = abs(edge)
+
+        if abs_edge < self.config.pregame_totals_min_edge:
+            log.info("%s: pregame totals edge %.1f%% < threshold — skip",
+                     game.game_key, abs_edge * 100)
+            game.totals_pregame_traded = True
+            return
+
+        # Kelly sizing
+        if edge > 0:
+            full_kelly = edge / (1 - p)
+            game.totals_side = "BUY_OVER"
+        else:
+            full_kelly = abs(edge) / p
+            game.totals_side = "BUY_UNDER"
+
+        scaled_kelly = full_kelly * self.config.totals_kelly_fraction * PREGAME_TOTALS_CONFIDENCE
+        game.totals_phase_confidence = PREGAME_TOTALS_CONFIDENCE
+        max_per_game = self.config.bankroll * self.config.totals_max_position_pct
+        game.totals_target_size_usd = min(self.config.bankroll * scaled_kelly, max_per_game)
+
+        # Place trade
+        await self._maybe_trade_totals(game)
+
+        game.totals_pregame_traded = True
+        log.info("%s: PREGAME TOTALS %s edge=%.1f%% size=$%.0f model_over=%.1f%% mkt=%.1f%% line=%.1f",
+                 game.game_key, game.totals_side, abs_edge * 100,
+                 game.totals_target_size_usd, model_over * 100, p * 100, line)
+
     # ── Core Loop ─────────────────────────────────────────────────────────
 
     async def run(self):
@@ -712,6 +910,11 @@ class LiveTrader:
                     await self._run_pregame(game)
                 except Exception as e:
                     log.error("%s: pregame failed: %s", key, e)
+            if self._is_pregame_totals_window(game):
+                try:
+                    await self._run_pregame_totals(game)
+                except Exception as e:
+                    log.error("%s: pregame totals failed: %s", key, e)
 
         # For each live game: run sim, check edge, trade
         for key, game in self.games.items():
@@ -744,11 +947,29 @@ class LiveTrader:
             # Run MC simulation
             await self._run_simulation(game)
 
-            # Compute edge and sizing
+            # Compute edge and sizing (moneyline)
             self._compute_edge(game)
 
-            # Rebalance position to Kelly-optimal target
+            # Rebalance moneyline position to Kelly-optimal target
             await self._maybe_trade(game)
+
+            # Totals: compute edge and trade
+            if game.totals_market and game.totals_model_over is not None:
+                await self._update_totals_market_price(game)
+                self._compute_totals_edge(game)
+
+                # Dampen pregame→in-game transition: the pregame regression
+                # model and in-game MC sim produce P(over) from different
+                # distributions.  On the first in-game update, skip
+                # rebalancing unless the MC estimate diverges significantly
+                # from the pregame estimate (avoids unnecessary churn).
+                if (game.totals_pregame_traded
+                        and game.totals_net_position != 0
+                        and game.inning <= 1
+                        and game.totals_phase_confidence <= TOTALS_PHASE_CONFIDENCE.get(1, 0)):
+                    continue
+
+                await self._maybe_trade_totals(game)
 
         # Check fills on active orders
         await self._check_fills()
@@ -810,9 +1031,15 @@ class LiveTrader:
             game.model_home_wp = result["home_wp"]
             game.model_updated_at = time.time()
 
+            # Compute P(over) from MC total_runs_dist if totals market exists
+            if game.totals_market and game.totals_line > 0:
+                from simulate import compute_total_prob
+                game.totals_model_over = compute_total_prob(result, game.totals_line)
+
             score = game.score_str
+            over_str = f" O{game.totals_line}={game.totals_model_over:.1%}" if game.totals_model_over is not None else ""
             print(f"    {game.game_key} {game.inning_label} "
-                  f"({score}): model={game.model_home_wp:.1%}")
+                  f"({score}): model={game.model_home_wp:.1%}{over_str}")
         except Exception as e:
             log.error("%s: sim failed: %s", game.game_key, e)
 
@@ -887,7 +1114,174 @@ class LiveTrader:
         kelly_size = self.config.bankroll * scaled_kelly
         game.target_size_usd = min(kelly_size, max_per_game)
 
+    async def _update_totals_market_price(self, game: LiveGame):
+        """Fetch current Polymarket price for a totals market."""
+        if not game.totals_market:
+            return
+
+        try:
+            book = await _retry_async(
+                fetch_orderbook, self._http, game.totals_market.over_token_id,
+                label=f"{game.game_key} totals orderbook",
+            )
+            game.totals_poly_over_mid = book.get("midpoint")
+        except Exception as e:
+            log.warning("%s: totals price fetch failed: %s", game.game_key, e)
+
+    def _compute_totals_edge(self, game: LiveGame):
+        """Compute fee-adjusted edge and sizing for totals."""
+        if game.totals_model_over is None or game.totals_poly_over_mid is None:
+            game.totals_edge = 0.0
+            game.totals_phase_confidence = 0.0
+            game.totals_side = ""
+            game.totals_target_size_usd = 0.0
+            return
+
+        p = game.totals_poly_over_mid
+        raw_edge = game.totals_model_over - p
+
+        fee_drag = _polymarket_fee(p)
+        game.totals_edge = raw_edge - fee_drag if raw_edge > 0 else raw_edge + fee_drag
+
+        # Phase confidence
+        inning = game.inning
+        if inning >= 10:
+            game.totals_phase_confidence = TOTALS_EXTRAS_CONFIDENCE
+        else:
+            game.totals_phase_confidence = TOTALS_PHASE_CONFIDENCE.get(inning, 0.0)
+
+        edge = game.totals_edge
+        if abs(edge) < 1e-6 or p <= 0 or p >= 1:
+            game.totals_side = ""
+            game.totals_target_size_usd = 0.0
+            return
+
+        if edge > 0:
+            # Buying over at price p: Kelly = edge / (1 - p)
+            full_kelly = edge / (1 - p)
+            game.totals_side = "BUY_OVER"
+        else:
+            # Buying under at price (1-p): Kelly = |edge| / p
+            full_kelly = abs(edge) / p
+            game.totals_side = "BUY_UNDER"
+
+        # Gate: zero out size when below threshold (avoids confusing dashboard)
+        if abs(edge) < self.config.totals_min_edge or game.totals_phase_confidence <= 0:
+            game.totals_target_size_usd = 0.0
+            return
+
+        scaled_kelly = full_kelly * self.config.totals_kelly_fraction * game.totals_phase_confidence
+        max_per_game = self.config.bankroll * self.config.totals_max_position_pct
+        game.totals_target_size_usd = min(self.config.bankroll * scaled_kelly, max_per_game)
+
     # ── Trading ───────────────────────────────────────────────────────────
+
+    async def _maybe_trade_totals(self, game: LiveGame):
+        """Rebalance totals position to Kelly-optimal target."""
+        if not game.totals_market:
+            return
+
+        abs_edge = abs(game.totals_edge)
+        has_edge = (abs_edge >= self.config.totals_min_edge and game.totals_phase_confidence > 0)
+
+        # Compute target position (signed: +ve=over, -ve=under)
+        if has_edge and game.totals_target_size_usd > 0:
+            if game.totals_side == "BUY_OVER":
+                p = game.totals_poly_over_mid or 0.5
+                target = game.totals_target_size_usd / max(p, 0.01)
+            elif game.totals_side == "BUY_UNDER":
+                p = game.totals_poly_over_mid or 0.5
+                target = -(game.totals_target_size_usd / max(1 - p, 0.01))
+            else:
+                target = 0.0
+        else:
+            target = 0.0
+
+        current = game.totals_net_position
+        delta = target - current
+
+        if abs(delta) < 1:
+            return
+
+        # Exposure check (totals exposure counts toward total)
+        total_exposure = sum(
+            abs(g.cost_basis) + abs(g.totals_cost_basis) for g in self.games.values()
+        )
+        max_total = self.config.bankroll * self.config.max_total_exposure_pct
+        increasing = abs(target) > abs(current)
+
+        if increasing and total_exposure >= max_total:
+            if delta > 0 and current >= 0:
+                return
+            if delta < 0 and current <= 0:
+                return
+            delta = -current
+            if abs(delta) < 1:
+                return
+
+        # Cancel existing totals order
+        await self._cancel_totals_order(game)
+
+        # Determine order parameters
+        mid = game.totals_poly_over_mid or 0.5
+
+        if delta > 0:
+            # Buy over tokens
+            order_price = round_to_tick(mid)
+            token_id = game.totals_market.over_token_id
+            clob_side = "BUY"
+            n_contracts = int(abs(delta))
+            trade_side = "BUY_OVER"
+        else:
+            # Buy under tokens
+            under_price = 1 - mid
+            order_price = round_to_tick(under_price)
+            token_id = game.totals_market.under_token_id
+            clob_side = "BUY"
+            n_contracts = int(abs(delta))
+            trade_side = "BUY_UNDER"
+
+        if n_contracts < 1:
+            return
+
+        result = await self._place_order(
+            token_id=token_id,
+            side=clob_side,
+            price=order_price,
+            size=float(n_contracts),
+            game=game,
+            neg_risk=game.totals_market.neg_risk,
+        )
+
+        if result:
+            order_id = result.get("orderID") or result.get("id", "")
+            game.totals_active_order_id = order_id
+            game.totals_active_order_side = trade_side
+            game.totals_active_order_price = order_price
+            game.totals_active_order_size = float(n_contracts)
+
+            self._log_trade_totals(game, "ORDER", n_contracts, order_price)
+
+    async def _cancel_totals_order(self, game: LiveGame):
+        """Cancel active totals order."""
+        if not game.totals_active_order_id:
+            return
+
+        if (not game.totals_active_order_id.startswith("dry_")
+                and not self.config.dry_run
+                and self._clob_client):
+            try:
+                await asyncio.to_thread(
+                    self._clob_client.cancel, game.totals_active_order_id
+                )
+            except Exception as e:
+                log.error("%s: cancel totals order %s failed: %s",
+                          game.game_key, game.totals_active_order_id, e)
+
+        game.totals_active_order_id = None
+        game.totals_active_order_side = ""
+        game.totals_active_order_price = 0.0
+        game.totals_active_order_size = 0.0
 
     async def _maybe_trade(self, game: LiveGame):
         """Rebalance position to Kelly-optimal target at each half-inning.
@@ -1134,14 +1528,40 @@ class LiveTrader:
               f"(pos={game.net_position:+.0f}, cost=${game.cost_basis:.2f}, "
               f"realized=${game.realized_pnl:+.2f})")
 
+    def _apply_totals_fill(self, game: LiveGame, side: str, fill_size: float,
+                           fill_price: float):
+        """Apply a fill to totals position tracking."""
+        fee = abs(fill_size) * TAKER_FEE_RATE * fill_price * (1 - fill_price)
+
+        if side == "BUY_OVER":
+            game.totals_net_position += fill_size
+            game.totals_cost_basis += fill_size * fill_price + fee
+        elif side == "BUY_UNDER":
+            game.totals_net_position -= fill_size
+            game.totals_cost_basis += fill_size * fill_price + fee
+
+        game.totals_fill_history.append({
+            "order_id": game.totals_active_order_id,
+            "side": side,
+            "size": fill_size,
+            "price": fill_price,
+            "fee": fee,
+            "ts": time.time(),
+            "inning": game.inning_label,
+        })
+
+        print(f"    TOTALS FILL: {game.game_key} {side} "
+              f"{fill_size:.0f} @ {fill_price:.2f} fee=${fee:.2f} "
+              f"(pos={game.totals_net_position:+.0f}, "
+              f"cost=${game.totals_cost_basis:.2f})")
+
     async def _check_fills(self):
         """Check for fills on active orders. In dry-run, simulate instant fills."""
         for key, game in self.games.items():
+            # Moneyline fills
             if not game.active_order_id:
-                continue
-
-            # Dry-run: simulate instant full fill
-            if game.active_order_id.startswith("dry_"):
+                pass
+            elif game.active_order_id.startswith("dry_"):
                 fill_size = game.active_order_size
                 if fill_size > 0:
                     self._apply_fill(
@@ -1152,61 +1572,127 @@ class LiveTrader:
                 game.active_order_side = ""
                 game.active_order_price = 0.0
                 game.active_order_size = 0.0
-                continue
+            else:
+                await self._check_live_fill(game)
+
+            # Totals fills
+            if not game.totals_active_order_id:
+                pass
+            elif game.totals_active_order_id.startswith("dry_"):
+                fill_size = game.totals_active_order_size
+                if fill_size > 0:
+                    self._apply_totals_fill(
+                        game, game.totals_active_order_side,
+                        fill_size, game.totals_active_order_price,
+                    )
+                game.totals_active_order_id = None
+                game.totals_active_order_side = ""
+                game.totals_active_order_price = 0.0
+                game.totals_active_order_size = 0.0
+            else:
+                await self._check_live_totals_fill(game)
+
+    async def _check_live_fill(self, game: LiveGame):
+        """Check live moneyline order fill status."""
+        if not game.active_order_id or not self._clob_client:
+            return
+
+        try:
+            order = await asyncio.to_thread(
+                self._clob_client.get_order, game.active_order_id
+            )
+        except Exception:
+            return
+
+        size_matched = float(order.get("size_matched", 0))
+        prev_filled = sum(
+            f["size"] for f in game.fill_history
+            if f.get("order_id") == game.active_order_id
+        )
+        new_fill = size_matched - prev_filled
+
+        if new_fill > 0:
+            self._apply_fill(
+                game, game.active_order_side,
+                new_fill, game.active_order_price,
+            )
+
+        status = order.get("status", "")
+        if status in ("matched", "canceled"):
+            game.active_order_id = None
+            game.active_order_side = ""
+            game.active_order_price = 0.0
+            game.active_order_size = 0.0
+
+    async def _check_live_totals_fill(self, game: LiveGame):
+        """Check live totals order fill status."""
+        if not game.totals_active_order_id or not self._clob_client:
+            return
+
+        try:
+            order = await asyncio.to_thread(
+                self._clob_client.get_order, game.totals_active_order_id
+            )
+        except Exception:
+            return
+
+        size_matched = float(order.get("size_matched", 0))
+        prev_filled = sum(
+            f["size"] for f in game.totals_fill_history
+            if f.get("order_id") == game.totals_active_order_id
+        )
+        new_fill = size_matched - prev_filled
+
+        if new_fill > 0:
+            self._apply_totals_fill(
+                game, game.totals_active_order_side,
+                new_fill, game.totals_active_order_price,
+            )
+
+        status = order.get("status", "")
+        if status in ("matched", "canceled"):
+            game.totals_active_order_id = None
+            game.totals_active_order_side = ""
+            game.totals_active_order_price = 0.0
+            game.totals_active_order_size = 0.0
 
             # Live: check with CLOB API
-            if not self._clob_client:
-                continue
-
-            try:
-                order = await asyncio.to_thread(
-                    self._clob_client.get_order, game.active_order_id
-                )
-            except Exception:
-                continue
-
-            size_matched = float(order.get("size_matched", 0))
-            prev_filled = sum(
-                f["size"] for f in game.fill_history
-                if f.get("order_id") == game.active_order_id
-            )
-            new_fill = size_matched - prev_filled
-
-            if new_fill > 0:
-                self._apply_fill(
-                    game, game.active_order_side,
-                    new_fill, game.active_order_price,
-                )
-
-            # Clear fully filled or canceled orders
-            status = order.get("status", "")
-            if status in ("matched", "canceled"):
-                game.active_order_id = None
-                game.active_order_side = ""
-                game.active_order_price = 0.0
-                game.active_order_size = 0.0
-
     async def _handle_game_final(self, game: LiveGame):
         """Handle game completion — cancel orders, settle position."""
         if game.halted and game.halt_reason == "FINAL":
             return  # already handled
 
         await self._cancel_order(game)
+        await self._cancel_totals_order(game)
 
-        # Settle position
+        # Settle moneyline position
         if game.net_position != 0 and game.sim_state:
             home_won = game.sim_state.home_score > game.sim_state.away_score
             if game.net_position > 0:
-                # Long home
                 settle_value = abs(game.net_position) * (1.0 if home_won else 0.0)
             else:
-                # Long away
                 settle_value = abs(game.net_position) * (0.0 if home_won else 1.0)
 
             game.realized_pnl = settle_value - game.cost_basis
             result_str = "HOME WIN" if home_won else "AWAY WIN"
-            print(f"\n  SETTLE: {game.game_key} — {result_str} — "
+            print(f"\n  SETTLE ML: {game.game_key} — {result_str} — "
                   f"P&L: ${game.realized_pnl:+.2f}")
+
+        # Settle totals position
+        if game.totals_net_position != 0 and game.sim_state and game.totals_line > 0:
+            total_runs = game.sim_state.home_score + game.sim_state.away_score
+            went_over = total_runs > game.totals_line
+            if game.totals_net_position > 0:
+                # Long over
+                settle_value = abs(game.totals_net_position) * (1.0 if went_over else 0.0)
+            else:
+                # Long under
+                settle_value = abs(game.totals_net_position) * (0.0 if went_over else 1.0)
+
+            game.totals_realized_pnl = settle_value - game.totals_cost_basis
+            result_str = f"TOTAL={total_runs} {'OVER' if went_over else 'UNDER'} {game.totals_line}"
+            print(f"  SETTLE OU: {game.game_key} — {result_str} — "
+                  f"P&L: ${game.totals_realized_pnl:+.2f}")
 
         game.halted = True
         game.halt_reason = "FINAL"
@@ -1218,7 +1704,7 @@ class LiveTrader:
         if self._killed:
             return True
 
-        total_pnl = sum(g.total_pnl for g in self.games.values())
+        total_pnl = sum(g.total_pnl + g.totals_realized_pnl for g in self.games.values())
         if total_pnl < -self.config.max_loss:
             print(f"\n  *** KILL SWITCH: Total P&L ${total_pnl:+.2f} < "
                   f"-${self.config.max_loss:.0f} → HALTING ALL TRADING")
@@ -1284,6 +1770,28 @@ class LiveTrader:
                   f"{edge_str:>6s} {phase_str:>5s} {kelly_str:>6s} "
                   f"{size_str:>7s} {pos_str:>6s} {pnl_str:>8s} {order_str:>12s}")
 
+            # Totals row (if market exists)
+            if g.totals_market:
+                t_model = f"{g.totals_model_over:.1%}" if g.totals_model_over is not None else "  ---"
+                t_mkt = f"{g.totals_poly_over_mid:.1%}" if g.totals_poly_over_mid is not None else "  ---"
+                t_edge = f"{g.totals_edge:+.1%}" if g.totals_poly_over_mid is not None else "  ---"
+                t_phase = f"{g.totals_phase_confidence:.0%}" if g.totals_phase_confidence > 0 else "  ---"
+                t_size = f"${g.totals_target_size_usd:,.0f}" if g.totals_target_size_usd > 0 else "  ---"
+                t_pos = f"{g.totals_net_position:+.0f}" if g.totals_net_position != 0 else "  ---"
+                t_pnl = f"${g.totals_realized_pnl:+.2f}" if g.totals_cost_basis > 0 or g.totals_realized_pnl != 0 else "  ---"
+
+                t_order = "---"
+                if g.totals_active_order_id:
+                    t_order = f"{g.totals_active_order_side.replace('BUY_', '')}@{g.totals_active_order_price:.2f}"
+                    active_orders += 1
+                    total_exposure += abs(g.totals_cost_basis)
+
+                total_pnl += g.totals_realized_pnl
+                line_str = f"  O/U {g.totals_line}"
+                print(f"  {line_str:<14s} {'':8s} {'':8s} {'':7s} "
+                      f"{t_model:>6s} {t_mkt:>6s} {t_edge:>6s} {t_phase:>5s} "
+                      f"{'':>6s} {t_size:>7s} {t_pos:>6s} {t_pnl:>8s} {t_order:>12s}")
+
         print(f"\n  Active orders: {active_orders} | "
               f"Exposure: ${total_exposure:,.0f} / "
               f"${self.config.bankroll * self.config.max_total_exposure_pct:,.0f} | "
@@ -1314,6 +1822,35 @@ class LiveTrader:
             "target_size": game.target_size_usd,
             "net_position": game.net_position,
             "cost_basis": game.cost_basis,
+        }
+
+        with open(log_path, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+
+    def _log_trade_totals(self, game: LiveGame, action: str, size: float, price: float):
+        """Append totals trade to audit log."""
+        AUDIT_DIR.mkdir(parents=True, exist_ok=True)
+        log_path = AUDIT_DIR / f"trades_{self.config.target_date}.jsonl"
+
+        entry = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "game_key": game.game_key,
+            "game_pk": game.game_pk,
+            "action": action,
+            "type": "totals",
+            "side": game.totals_side,
+            "line": game.totals_line,
+            "size": size,
+            "price": price,
+            "model_over": game.totals_model_over,
+            "market_over_mid": game.totals_poly_over_mid,
+            "edge": game.totals_edge,
+            "phase_confidence": game.totals_phase_confidence,
+            "inning": game.inning_label,
+            "score": game.score_str,
+            "target_size": game.totals_target_size_usd,
+            "net_position": game.totals_net_position,
+            "cost_basis": game.totals_cost_basis,
         }
 
         with open(log_path, "a") as f:
@@ -1350,6 +1887,17 @@ class LiveTrader:
                 "pregame_traded": g.pregame_traded,
                 "pregame_model_prob": g.pregame_model_prob,
                 "pregame_edge": g.pregame_edge,
+                # Totals
+                "totals_line": g.totals_line,
+                "totals_net_position": g.totals_net_position,
+                "totals_cost_basis": g.totals_cost_basis,
+                "totals_realized_pnl": g.totals_realized_pnl,
+                "totals_active_order_id": g.totals_active_order_id,
+                "totals_active_order_side": g.totals_active_order_side,
+                "totals_active_order_price": g.totals_active_order_price,
+                "totals_active_order_size": g.totals_active_order_size,
+                "totals_fill_history": g.totals_fill_history,
+                "totals_pregame_traded": g.totals_pregame_traded,
             }
 
         with open(state_path, "w") as f:
@@ -1386,6 +1934,18 @@ class LiveTrader:
             game.pregame_model_prob = saved.get("pregame_model_prob")
             game.pregame_edge = saved.get("pregame_edge", 0.0)
 
+            # Totals
+            game.totals_line = saved.get("totals_line", 0.0)
+            game.totals_net_position = saved.get("totals_net_position", 0.0)
+            game.totals_cost_basis = saved.get("totals_cost_basis", 0.0)
+            game.totals_realized_pnl = saved.get("totals_realized_pnl", 0.0)
+            game.totals_fill_history = saved.get("totals_fill_history", [])
+            game.totals_active_order_id = saved.get("totals_active_order_id")
+            game.totals_active_order_side = saved.get("totals_active_order_side", "")
+            game.totals_active_order_price = saved.get("totals_active_order_price", 0.0)
+            game.totals_active_order_size = saved.get("totals_active_order_size", 0.0)
+            game.totals_pregame_traded = saved.get("totals_pregame_traded", False)
+
             if saved.get("halted"):
                 game.halted = True
                 game.halt_reason = saved.get("halt_reason", "restored")
@@ -1408,13 +1968,14 @@ class LiveTrader:
         print("  Cancelling all active orders...")
         for game in self.games.values():
             await self._cancel_order(game)
+            await self._cancel_totals_order(game)
 
         self._save_state()
 
         # Print final P&L
-        total_pnl = sum(g.total_pnl for g in self.games.values())
-        total_realized = sum(g.realized_pnl for g in self.games.values())
-        total_fills = sum(len(g.fill_history) for g in self.games.values())
+        total_pnl = sum(g.total_pnl + g.totals_realized_pnl for g in self.games.values())
+        total_realized = sum(g.realized_pnl + g.totals_realized_pnl for g in self.games.values())
+        total_fills = sum(len(g.fill_history) + len(g.totals_fill_history) for g in self.games.values())
 
         print(f"\n{'='*70}")
         print(f"  SESSION SUMMARY")
@@ -1455,6 +2016,14 @@ def main():
                         help="Min edge for pregame trades (default: 0.04)")
     parser.add_argument("--pregame-window", type=float, default=5.0,
                         help="Minutes before first pitch for pregame trade (default: 5)")
+    parser.add_argument("--totals-min-edge", type=float, default=0.05,
+                        help="Min edge for in-game totals trades (default: 0.05)")
+    parser.add_argument("--totals-kelly", type=float, default=0.20,
+                        help="Kelly fraction for totals (default: 0.20)")
+    parser.add_argument("--totals-max-position", type=float, default=0.08,
+                        help="Max totals position per game as frac of bankroll (default: 0.08)")
+    parser.add_argument("--pregame-totals-min-edge", type=float, default=0.05,
+                        help="Min edge for pregame totals trades (default: 0.05)")
     parser.add_argument("--season", type=int, default=2025,
                         help="Season for xRV data (default: 2025)")
     args = parser.parse_args()
@@ -1487,6 +2056,10 @@ def main():
         max_loss=args.max_loss,
         pregame_min_edge=args.pregame_min_edge,
         pregame_window_min=args.pregame_window,
+        totals_min_edge=args.totals_min_edge,
+        totals_kelly_fraction=args.totals_kelly,
+        totals_max_position_pct=args.totals_max_position,
+        pregame_totals_min_edge=args.pregame_totals_min_edge,
         season=args.season,
         target_date=target_date,
     )
