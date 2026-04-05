@@ -23,7 +23,8 @@ Six independent strategies targeting three MLB betting markets (moneyline, over/
 
 **Market:** Over/Under total runs
 **Side:** Almost exclusively unders
-**Backtest:** 332 bets · 59.3% win rate · +12.4% ROI · Bootstrap 95% CI [+9.8%, +26.0%]
+**Backtest:** 332 bets · 59.3% win rate · +12.4% ROI (unified backtest with actual DK odds)
+**Standalone model (actual DK odds):** 482 bets · 61.8% win rate · +15.9% ROI · Bootstrap 95% CI [+7.8%, +23.8%]
 **Statistical significance:** Permutation test p = 0.0000 (5,000 iterations)
 
 ### What This Strategy Does
@@ -103,14 +104,18 @@ After calibration, if the model's P(under) = 1 - P(over) exceeds 0.55, we have a
 
 **Walk-forward test set (last 60% of 2025 season, ~1,400 games):**
 
-| Threshold | Bets | Win Rate | ROI at DK Odds |
-|-----------|------|----------|----------------|
-| P(under) > 0.52 | 580 | 56.4% | +7.5% |
-| P(under) > 0.55 | 482 | 58.3% | +12.4% |
-| P(under) > 0.57 | 415 | 59.3% | +14.2% |
-| P(under) > 0.60 | 320 | 61.6% | +18.0% |
+| Threshold | Bets | Win Rate | ROI (actual DK odds) | ROI (flat -110) |
+|-----------|------|----------|----------------------|-----------------|
+| P(under) > 0.52 | 484 | 61.8% | +15.8% | +17.9% |
+| P(under) > 0.55 | 482 | 61.8% | +15.9% | +18.0% |
+| P(under) > 0.57 | 467 | 62.1% | +16.5% | +18.6% |
+| P(under) > 0.60 | 415 | 61.0% | +14.4% | +16.4% |
 
-**Bootstrap 95% CI at 0.55 threshold:** ROI between +9.8% and +26.0%.
+**Bootstrap 95% CI at 0.55 threshold (actual DK odds):** ROI between +7.8% and +23.8%.
+
+Note: Flat -110 overstates ROI by ~2 percentage points because actual DK under
+closing odds are slightly worse than -110 on average (median -112). Always use
+actual per-game odds for realistic P&L estimation.
 
 **Permutation test:** We shuffled the over/under labels 5,000 times and re-ran the model each time. Zero shuffled runs produced ROI as high as the real model's. p < 0.0002.
 

@@ -177,34 +177,68 @@ def engineer_features(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
 # ──────────────────────────────────────────────────────────────────────
 # 4. Evaluation helpers
 # ──────────────────────────────────────────────────────────────────────
-def compute_roi(preds: np.ndarray, actuals: np.ndarray, threshold: float,
-                juice: float = -110) -> dict:
-    """Compute ROI at a given confidence threshold for over AND under bets."""
-    cost = abs(juice) / 100 if juice < 0 else 1.0  # bet $110 to win $100
-    payout = 100 / abs(juice) if juice < 0 else juice / 100
+def _american_to_decimal(odds):
+    """Convert American odds to decimal odds."""
+    if odds < 0:
+        return 1.0 + 100.0 / abs(odds)
+    elif odds > 0:
+        return 1.0 + odds / 100.0
+    return np.nan
 
+
+def compute_roi(preds: np.ndarray, actuals: np.ndarray, threshold: float,
+                juice: float = -110,
+                over_odds: np.ndarray | None = None,
+                under_odds: np.ndarray | None = None) -> dict:
+    """Compute ROI at a given confidence threshold for over AND under bets.
+
+    If per-game ``over_odds`` / ``under_odds`` arrays (American format) are
+    provided, payouts are computed from the actual DK closing odds for each
+    bet.  Otherwise falls back to the flat ``juice`` assumption.
+    """
     # Over bets: predict > threshold
     over_mask = preds > threshold
     # Under bets: predict < (1 - threshold)
     under_mask = preds < (1 - threshold)
 
-    n_over = over_mask.sum()
-    n_under = under_mask.sum()
+    n_over = int(over_mask.sum())
+    n_under = int(under_mask.sum())
     n_total = n_over + n_under
 
     if n_total == 0:
         return {"threshold": threshold, "n_bets": 0, "roi": np.nan, "win_pct": np.nan}
 
-    # Over wins
-    over_wins = (actuals[over_mask] == 1).sum() if n_over > 0 else 0
-    # Under wins
-    under_wins = (actuals[under_mask] == 0).sum() if n_under > 0 else 0
+    # Compute PnL per bet using actual odds when available
+    total_pnl = 0.0
+    total_wins = 0
 
-    total_wins = over_wins + under_wins
+    if n_over > 0:
+        over_won = actuals[over_mask] == 1
+        total_wins += int(over_won.sum())
+        if over_odds is not None:
+            over_dec = np.array([_american_to_decimal(o) for o in over_odds[over_mask]])
+            # NaN odds → fallback to flat juice
+            fallback_dec = 1.0 + 100.0 / abs(juice) if juice < 0 else 1.0 + juice / 100.0
+            over_dec = np.where(np.isnan(over_dec), fallback_dec, over_dec)
+            total_pnl += np.sum(np.where(over_won, over_dec - 1.0, -1.0))
+        else:
+            payout = 100.0 / abs(juice) if juice < 0 else juice / 100.0
+            total_pnl += int(over_won.sum()) * payout - int((~over_won).sum()) * 1.0
+
+    if n_under > 0:
+        under_won = actuals[under_mask] == 0
+        total_wins += int(under_won.sum())
+        if under_odds is not None:
+            under_dec = np.array([_american_to_decimal(o) for o in under_odds[under_mask]])
+            fallback_dec = 1.0 + 100.0 / abs(juice) if juice < 0 else 1.0 + juice / 100.0
+            under_dec = np.where(np.isnan(under_dec), fallback_dec, under_dec)
+            total_pnl += np.sum(np.where(under_won, under_dec - 1.0, -1.0))
+        else:
+            payout = 100.0 / abs(juice) if juice < 0 else juice / 100.0
+            total_pnl += int(under_won.sum()) * payout - int((~under_won).sum()) * 1.0
+
     win_pct = total_wins / n_total
-    # Each bet costs 1 unit; winning returns payout units profit
-    profit = total_wins * payout - (n_total - total_wins) * 1.0
-    roi = profit / n_total
+    roi = total_pnl / n_total
 
     return {
         "threshold": threshold,
@@ -213,19 +247,23 @@ def compute_roi(preds: np.ndarray, actuals: np.ndarray, threshold: float,
         "n_under": n_under,
         "wins": total_wins,
         "win_pct": win_pct,
-        "profit_units": profit,
+        "profit_units": total_pnl,
         "roi": roi,
     }
 
 
-def bootstrap_roi(preds, actuals, threshold, n_boot=2000, juice=-110):
+def bootstrap_roi(preds, actuals, threshold, n_boot=2000, juice=-110,
+                   over_odds=None, under_odds=None):
     """Bootstrap CI for ROI at a threshold."""
     rng = np.random.default_rng(42)
     rois = []
     n = len(preds)
     for _ in range(n_boot):
         idx = rng.choice(n, size=n, replace=True)
-        result = compute_roi(preds[idx], actuals[idx], threshold, juice)
+        oo = over_odds[idx] if over_odds is not None else None
+        uo = under_odds[idx] if under_odds is not None else None
+        result = compute_roi(preds[idx], actuals[idx], threshold, juice,
+                             over_odds=oo, under_odds=uo)
         if not np.isnan(result["roi"]):
             rois.append(result["roi"])
     if not rois:
@@ -447,6 +485,8 @@ def main():
     expanding_preds = []
     expanding_actuals = []
     expanding_dates = []
+    expanding_over_odds = []
+    expanding_under_odds = []
 
     for i, test_month in enumerate(months):
         if i < 2:  # need at least 2 months of 2025 data for calibration
@@ -479,6 +519,13 @@ def main():
         expanding_preds.extend(test_cal)
         expanding_actuals.extend(y_t)
         expanding_dates.extend(test_chunk["game_date"].values)
+        # Collect actual DK closing odds for this chunk
+        if "over_close_odds" in test_chunk.columns:
+            expanding_over_odds.extend(test_chunk["over_close_odds"].values)
+            expanding_under_odds.extend(test_chunk["under_close_odds"].values)
+        else:
+            expanding_over_odds.extend([np.nan] * len(y_t))
+            expanding_under_odds.extend([np.nan] * len(y_t))
 
         month_brier = brier_score_loss(y_t, test_cal)
         month_naive = brier_score_loss(y_t, np.full(len(y_t), y_t.mean()))
@@ -499,7 +546,7 @@ def main():
 
     # ── ROI Analysis ───────────────────────────────────────────────
     print("\n" + "=" * 70)
-    print("[8] ROI ANALYSIS (on walk-forward test set, -110 juice)")
+    print("[8] ROI ANALYSIS (on walk-forward test set)")
     print("=" * 70)
 
     # Use the expanding window predictions (most realistic)
@@ -507,26 +554,46 @@ def main():
         print("  No expanding window predictions available, using full test set")
         roi_preds = lgb_preds_raw
         roi_actuals = y_test
+        roi_over_odds = None
+        roi_under_odds = None
     else:
         roi_preds = expanding_preds
         roi_actuals = expanding_actuals
+        roi_over_odds = np.array(expanding_over_odds, dtype=float)
+        roi_under_odds = np.array(expanding_under_odds, dtype=float)
+
+    has_real_odds = roi_over_odds is not None and np.isfinite(roi_over_odds).sum() > 0
+    if has_real_odds:
+        n_real = np.isfinite(roi_under_odds).sum()
+        print(f"  Using actual DK closing odds for {n_real}/{len(roi_preds)} games (fallback -110 for rest)")
+    else:
+        print("  No actual DK odds available — using flat -110 assumption")
 
     breakeven = 110 / 210  # ~0.5238 at -110
     print(f"  Break-even win rate at -110: {breakeven:.4f}")
 
     thresholds = [0.50, 0.52, 0.53, 0.54, 0.55, 0.56, 0.57, 0.58, 0.60, 0.62, 0.65]
-    print(f"\n  {'Thresh':>7s} {'N_bets':>7s} {'N_over':>7s} {'N_under':>7s} "
-          f"{'Win%':>7s} {'ROI':>8s} {'Units':>8s} {'Boot_Med':>9s} {'95% CI':>20s}")
-    print("  " + "-" * 95)
 
-    for t in thresholds:
-        result = compute_roi(roi_preds, roi_actuals, t)
-        if result["n_bets"] == 0:
+    # Show both actual-odds and flat-110 for comparison
+    for label, oo, uo in [("Actual DK odds", roi_over_odds, roi_under_odds),
+                          ("Flat -110", None, None)]:
+        if label == "Actual DK odds" and not has_real_odds:
             continue
-        med_roi, ci_lo, ci_hi = bootstrap_roi(roi_preds, roi_actuals, t)
-        print(f"  {t:7.2f} {result['n_bets']:7d} {result['n_over']:7d} {result['n_under']:7d} "
-              f"{result['win_pct']:7.3f} {result['roi']:+8.3f} {result['profit_units']:+8.1f} "
-              f"{med_roi:+9.3f} [{ci_lo:+.3f}, {ci_hi:+.3f}]")
+        print(f"\n  --- {label} ---")
+        print(f"  {'Thresh':>7s} {'N_bets':>7s} {'N_over':>7s} {'N_under':>7s} "
+              f"{'Win%':>7s} {'ROI':>8s} {'Units':>8s} {'Boot_Med':>9s} {'95% CI':>20s}")
+        print("  " + "-" * 95)
+
+        for t in thresholds:
+            result = compute_roi(roi_preds, roi_actuals, t,
+                                 over_odds=oo, under_odds=uo)
+            if result["n_bets"] == 0:
+                continue
+            med_roi, ci_lo, ci_hi = bootstrap_roi(roi_preds, roi_actuals, t,
+                                                   over_odds=oo, under_odds=uo)
+            print(f"  {t:7.2f} {result['n_bets']:7d} {result['n_over']:7d} {result['n_under']:7d} "
+                  f"{result['win_pct']:7.3f} {result['roi']:+8.3f} {result['profit_units']:+8.1f} "
+                  f"{med_roi:+9.3f} [{ci_lo:+.3f}, {ci_hi:+.3f}]")
 
     # ── Calibration check ──────────────────────────────────────────
     print("\n" + "=" * 70)
