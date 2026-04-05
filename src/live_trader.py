@@ -818,7 +818,9 @@ class LiveTrader:
         total_pred = float(result["total_runs_pred"].iloc[0])
         line = game.totals_line
 
-        sorted_residuals = self._totals_model[-1]
+        sorted_residuals = (self._totals_model["sorted_residuals"]
+                             if isinstance(self._totals_model, dict)
+                             else self._totals_model[-1])
         model_over = prob_over(total_pred, line, sorted_residuals)
         game.totals_model_over = model_over
 

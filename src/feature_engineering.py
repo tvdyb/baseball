@@ -74,6 +74,17 @@ DIFF_COLS = [
     ("sp_projected_war", 1),    # higher WAR = better pitcher
     # Roster-adjusted team prior (Step 6)
     ("adjusted_team_prior", 1),
+    # Pitcher stuff model scores (lower = better stuff for pitcher)
+    ("sp_stuff_score", -1),
+    ("sp_location_score", -1),
+    ("sp_sequencing_score", -1),
+    ("sp_composite_score", -1),
+    # Hitter eval scores (higher = better for hitters)
+    ("hit_swing_z", 1),
+    ("hit_iz_contact", 1),
+    ("hit_chase_contact", 1),
+    ("hit_foul_fight", 1),
+    ("hit_bip_iz", 1),
 ]
 
 
@@ -1123,7 +1134,26 @@ def _hit_features_fast(team_batting: pd.DataFrame, game_date: str,
     pa = recent["events"].notna().sum()
     k_rate = (recent["events"] == "strikeout").sum() / pa if pa > 0 else np.nan
 
-    return {"hit_xrv_mean": hit_xrv, "hit_xrv_contact": hit_xrv_contact, "hit_k_rate": k_rate}
+    # Batted ball quality features (from launch_speed / launch_angle)
+    batted = contact.dropna(subset=["launch_speed"]) if "launch_speed" in recent.columns else pd.DataFrame()
+    if len(batted) >= 20:
+        hard_hit_rate = (batted["launch_speed"] >= 95).mean()
+        # Barrel: EV >= 98 mph and launch angle in sweet spot (26-30 base, widens with EV)
+        if "launch_angle" in batted.columns:
+            ev = batted["launch_speed"]
+            la = batted["launch_angle"]
+            barrel_mask = (ev >= 98) & (la >= 26 - (ev - 98) * 0.5) & (la <= 30 + (ev - 98) * 1.0)
+            barrel_rate = barrel_mask.mean()
+        else:
+            barrel_rate = np.nan
+    else:
+        hard_hit_rate = np.nan
+        barrel_rate = np.nan
+
+    return {
+        "hit_xrv_mean": hit_xrv, "hit_xrv_contact": hit_xrv_contact, "hit_k_rate": k_rate,
+        "hit_hard_hit_rate": hard_hit_rate, "hit_barrel_rate": barrel_rate,
+    }
 
 
 def _def_features_fast(team_pitches: pd.DataFrame, game_date: str,
@@ -1144,9 +1174,26 @@ def _def_features_fast(team_pitches: pd.DataFrame, game_date: str,
             recent = contact
 
     if len(recent) < 50:
-        return {"def_xrv_delta": np.nan}
+        return {"def_xrv_delta": np.nan, "pitch_hard_hit_rate": np.nan, "pitch_barrel_rate": np.nan}
 
-    return {"def_xrv_delta": (recent["delta_run_exp"] - recent["xrv"]).mean()}
+    result = {"def_xrv_delta": (recent["delta_run_exp"] - recent["xrv"]).mean()}
+
+    # Pitcher-allowed batted ball quality (from same contact data)
+    batted = recent.dropna(subset=["launch_speed"]) if "launch_speed" in recent.columns else pd.DataFrame()
+    if len(batted) >= 20:
+        result["pitch_hard_hit_rate"] = (batted["launch_speed"] >= 95).mean()
+        if "launch_angle" in batted.columns:
+            ev = batted["launch_speed"]
+            la = batted["launch_angle"]
+            barrel_mask = (ev >= 98) & (la >= 26 - (ev - 98) * 0.5) & (la <= 30 + (ev - 98) * 1.0)
+            result["pitch_barrel_rate"] = barrel_mask.mean()
+        else:
+            result["pitch_barrel_rate"] = np.nan
+    else:
+        result["pitch_hard_hit_rate"] = np.nan
+        result["pitch_barrel_rate"] = np.nan
+
+    return result
 
 
 def _extract_lineups(xrv_season: pd.DataFrame) -> dict:
@@ -1903,7 +1950,8 @@ def compute_single_game_features(
             for k, v in hit.items():
                 row[f"{side}_{k}"] = v
         else:
-            for k in ["hit_xrv_mean", "hit_xrv_contact", "hit_k_rate"]:
+            for k in ["hit_xrv_mean", "hit_xrv_contact", "hit_k_rate",
+                       "hit_hard_hit_rate", "hit_barrel_rate"]:
                 row[f"{side}_{k}"] = np.nan
 
     # --- Defense ---
@@ -1914,7 +1962,8 @@ def compute_single_game_features(
             for k, v in d.items():
                 row[f"{side}_{k}"] = v
         else:
-            row[f"{side}_def_xrv_delta"] = np.nan
+            for k in ["def_xrv_delta", "pitch_hard_hit_rate", "pitch_barrel_rate"]:
+                row[f"{side}_{k}"] = np.nan
 
     # --- OAA defense ---
     row["home_oaa_rate"] = team_oaa.get(home_team, 0.0)
@@ -2145,7 +2194,203 @@ def compute_single_game_features(
 
     row["is_home"] = 1
 
+    # Day/night indicator
+    day_night = game.get("day_night", "")
+    row["is_night"] = 1 if str(day_night).lower() == "night" else 0
+
     return row, meta
+
+
+def _add_model_scores(features_df: pd.DataFrame, games: pd.DataFrame, target_year: int):
+    """Add pitcher stuff/location/sequencing and hitter eval scores to features.
+
+    Uses pre-trained model artifacts from the prior season (no lookahead).
+    Scores are static per pitcher/batter for the season.
+    """
+    # Load pitcher stuff scores (trained on prior season data)
+    stuff_scores = {}
+    loc_scores_data = {}
+    seq_scores = {}
+    hitter_scores = {}
+
+    for yr in [target_year - 1, target_year]:
+        try:
+            path = MODEL_DIR / f"stuff_noloc_{yr}.pkl"
+            if path.exists():
+                with open(path, "rb") as f:
+                    d = pickle.load(f)
+                for hand in ["L", "R"]:
+                    key = f"pitcher_overall_vs{hand}"
+                    if key in d:
+                        for pid, score in d[key].items():
+                            stuff_scores[(int(pid), hand)] = score
+        except Exception:
+            pass
+
+        try:
+            path = MODEL_DIR / f"location_scores_{yr}.pkl"
+            if path.exists():
+                with open(path, "rb") as f:
+                    d = pickle.load(f)
+                for hand in ["L", "R"]:
+                    key = f"vs{hand}"
+                    if key in d:
+                        for pid, entry in d[key].items():
+                            loc_scores_data[(int(pid), hand)] = entry.get("overall", 0.0)
+        except Exception:
+            pass
+
+        try:
+            path = MODEL_DIR / f"sequencing_{yr}.pkl"
+            if path.exists():
+                with open(path, "rb") as f:
+                    d = pickle.load(f)
+                for hand in ["L", "R"]:
+                    key = f"sequencing_vs{hand}"
+                    if key in d:
+                        for pid, entry in d[key].items():
+                            seq_scores[(int(pid), hand)] = entry.get("sequencing_score", 0.0)
+        except Exception:
+            pass
+
+        try:
+            path = MODEL_DIR / f"hitter_eval_{yr}.pkl"
+            if path.exists():
+                with open(path, "rb") as f:
+                    d = pickle.load(f)
+                sd = d.get("swing_decision", {})
+                cr = d.get("contact_rates", {})
+                ff = d.get("foul_fighting", {})
+                bq = d.get("bip_quality", {})
+                for bid in set(list(sd.keys()) + list(cr.keys()) + list(bq.keys())):
+                    bid = int(bid)
+                    hitter_scores[bid] = {
+                        "swing_z": sd.get(bid, {}).get("z_score", 0.0),
+                        "iz_contact": cr.get(bid, {}).get("iz_contact_skill", 0.0),
+                        "chase_contact": cr.get(bid, {}).get("chase_contact_skill", 0.0),
+                        "foul_fight": ff.get(bid, {}).get("foul_fight_score", 0.0),
+                        "bip_iz": bq.get(bid, {}).get("bip_quality_iz", 0.0),
+                    }
+        except Exception:
+            pass
+
+    n_stuff = len(stuff_scores)
+    n_hit = len(hitter_scores)
+    print(f"  Model scores: {n_stuff} pitcher-hand stuff scores, {n_hit} hitter eval scores")
+
+    # Add pitcher stuff/location/sequencing scores for each game's SPs
+    # Use average across hands as the overall score (weighted by typical lineup composition)
+    for side in ["home", "away"]:
+        sp_col = f"{side}_sp_id" if f"{side}_sp_id" in games.columns else None
+        if sp_col is None:
+            continue
+
+        stuff_vals = []
+        loc_vals = []
+        seq_vals = []
+        composite_vals = []
+
+        for _, g in games.iterrows():
+            sp_id = g.get(sp_col)
+            if pd.isna(sp_id):
+                stuff_vals.append(np.nan)
+                loc_vals.append(np.nan)
+                seq_vals.append(np.nan)
+                composite_vals.append(np.nan)
+                continue
+
+            sp_id = int(sp_id)
+            # Average across vs-L and vs-R
+            s_l = stuff_scores.get((sp_id, "L"))
+            s_r = stuff_scores.get((sp_id, "R"))
+            l_l = loc_scores_data.get((sp_id, "L"))
+            l_r = loc_scores_data.get((sp_id, "R"))
+            q_l = seq_scores.get((sp_id, "L"))
+            q_r = seq_scores.get((sp_id, "R"))
+
+            # Weighted average (roughly 40% vs LHH, 60% vs RHH)
+            def _wavg(vl, vr, wl=0.4, wr=0.6):
+                if vl is not None and vr is not None:
+                    return wl * vl + wr * vr
+                return vl if vl is not None else (vr if vr is not None else np.nan)
+
+            stuff_vals.append(_wavg(s_l, s_r))
+            loc_vals.append(_wavg(l_l, l_r))
+            seq_vals.append(_wavg(q_l, q_r))
+
+            s = _wavg(s_l, s_r)
+            l = _wavg(l_l, l_r)
+            q = _wavg(q_l, q_r)
+            if not np.isnan(s):
+                comp = s + (l if not np.isnan(l) else 0) + (q if not np.isnan(q) else 0)
+                composite_vals.append(comp)
+            else:
+                composite_vals.append(np.nan)
+
+        features_df[f"{side}_sp_stuff_score"] = stuff_vals
+        features_df[f"{side}_sp_location_score"] = loc_vals
+        features_df[f"{side}_sp_sequencing_score"] = seq_vals
+        features_df[f"{side}_sp_composite_score"] = composite_vals
+
+    # Add hitter eval scores — average across lineup
+    # We need lineups per game which are in the xRV data
+    # For simplicity, use the lineup extracted during feature building
+    # (stored in the lineups dict passed to compute_single_game_features)
+    # Since we don't have easy access here, compute team-level hitter averages
+    # from the hitter_scores dict using batting team from xRV
+    for side in ["home", "away"]:
+        for metric in ["swing_z", "iz_contact", "chase_contact", "foul_fight", "bip_iz"]:
+            features_df[f"{side}_hit_{metric}"] = np.nan
+
+    # We'll use a simpler approach: per-team average from hitter_scores
+    # Load current season xRV to map batters to teams
+    try:
+        xrv_path = XRV_DIR / f"statcast_xrv_{target_year}.parquet"
+        if xrv_path.exists():
+            xrv = pd.read_parquet(xrv_path)
+            if "game_type" in xrv.columns:
+                xrv = xrv[xrv["game_type"] == "R"]
+            # Map batter to most common batting team
+            xrv["batting_team"] = np.where(
+                xrv["inning_topbot"] == "Bot", xrv["home_team"], xrv["away_team"]
+            )
+            batter_team = xrv.groupby("batter")["batting_team"].agg(
+                lambda x: x.value_counts().index[0]
+            ).to_dict()
+
+            # Build team-level hitter averages
+            team_hitter_avgs = {}
+            for bid, scores in hitter_scores.items():
+                team = batter_team.get(bid)
+                if team:
+                    team_hitter_avgs.setdefault(team, []).append(scores)
+
+            team_hitter_final = {}
+            for team, score_list in team_hitter_avgs.items():
+                avg = {}
+                for metric in ["swing_z", "iz_contact", "chase_contact", "foul_fight", "bip_iz"]:
+                    vals = []
+                    for s in score_list:
+                        v = s.get(metric)
+                        try:
+                            if v is not None and not np.isnan(float(v)):
+                                vals.append(float(v))
+                        except (TypeError, ValueError):
+                            pass
+                    avg[metric] = np.mean(vals) if vals else 0.0
+                team_hitter_final[team] = avg
+            team_hitter_avgs = team_hitter_final
+
+            for side in ["home", "away"]:
+                team_col = f"{side}_team"
+                for metric in ["swing_z", "iz_contact", "chase_contact", "foul_fight", "bip_iz"]:
+                    col_name = f"{side}_hit_{metric}"
+                    m = metric  # capture for lambda
+                    features_df[col_name] = features_df[team_col].map(
+                        lambda t, m=m: team_hitter_avgs.get(t, {}).get(m, np.nan)
+                    )
+    except Exception as e:
+        print(f"  WARNING: Could not add hitter eval scores: {e}")
 
 
 def build_game_features(
@@ -2296,6 +2541,7 @@ def build_game_features(
             "home_win": game["home_win"],
             "home_score": game["home_score"],
             "away_score": game["away_score"],
+            "day_night": game.get("day_night", ""),
         }
         row, meta = compute_single_game_features(
             game_dict, idx, lineups, matchup_models, arsenal_models,
@@ -2318,6 +2564,9 @@ def build_game_features(
     print(f"  Matchup features computed for {matchup_computed}/{total} games")
     if sp_prior_fallback_count:
         print(f"  SP prior-season fallback used for {sp_prior_fallback_count} pitcher-games")
+
+    # --- Pitcher stuff/location/sequencing scores + Hitter eval scores ---
+    _add_model_scores(features_df, games, target_year)
 
     # --- Team recent form + games played (computed vectorized over the games df) ---
     # Win% in last 10 games for each team, computed without lookahead

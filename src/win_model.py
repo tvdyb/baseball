@@ -92,6 +92,17 @@ DIFF_FEATURES = [
     "diff_sp_projected_war",
     # Roster-adjusted team prior
     "diff_adjusted_team_prior",
+    # Pitcher stuff model scores
+    "diff_sp_stuff_score",
+    "diff_sp_location_score",
+    "diff_sp_sequencing_score",
+    "diff_sp_composite_score",
+    # Hitter eval scores
+    "diff_hit_swing_z",
+    "diff_hit_iz_contact",
+    "diff_hit_chase_contact",
+    "diff_hit_foul_fight",
+    "diff_hit_bip_iz",
 ]
 
 RAW_FEATURES = [
