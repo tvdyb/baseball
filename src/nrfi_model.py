@@ -31,6 +31,7 @@ import numpy as np
 import pandas as pd
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
+from sklearn.model_selection import TimeSeriesSplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -856,6 +857,69 @@ def build_model(params: dict = None) -> "CalibratedClassifierCV":
     return CalibratedClassifierCV(base, cv=5, method="isotonic")
 
 
+def optimize_nrfi_lgb(X_train, y_train, n_trials=120, n_splits=5):
+    """Optuna hyperparameter optimization with TimeSeriesSplit CV."""
+    try:
+        import optuna
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+    except ImportError:
+        print("  Optuna not available, using default params")
+        return LGB_PARAMS
+
+    def objective(trial):
+        params = {
+            "objective": "binary",
+            "n_estimators": trial.suggest_int("n_estimators", 15, 200),
+            "max_depth": trial.suggest_int("max_depth", 2, 5),
+            "num_leaves": trial.suggest_int("num_leaves", 3, 31),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.15, log=True),
+            "min_child_samples": trial.suggest_int("min_child_samples", 30, 150),
+            "reg_alpha": trial.suggest_float("reg_alpha", 0.5, 30.0, log=True),
+            "reg_lambda": trial.suggest_float("reg_lambda", 0.5, 50.0, log=True),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.3, 1.0),
+            "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+            "subsample_freq": trial.suggest_int("subsample_freq", 0, 5),
+            "verbose": -1,
+            "random_state": 42,
+            "n_jobs": -1,
+        }
+        tscv = TimeSeriesSplit(n_splits=n_splits)
+        scores = []
+        for train_idx, val_idx in tscv.split(X_train):
+            X_tr = X_train.iloc[train_idx] if hasattr(X_train, 'iloc') else X_train[train_idx]
+            y_tr = y_train[train_idx]
+            X_val = X_train.iloc[val_idx] if hasattr(X_train, 'iloc') else X_train[val_idx]
+            y_val = y_train[val_idx]
+            model = lgb.LGBMClassifier(**params)
+            model.fit(X_tr, y_tr)
+            preds = model.predict_proba(X_val)[:, 1]
+            scores.append(log_loss(y_val, preds))
+        return np.mean(scores)
+
+    from tqdm import tqdm
+    pbar = tqdm(total=n_trials)
+    study = optuna.create_study(direction="minimize")
+
+    def callback(study, trial):
+        pbar.update(1)
+        pbar.set_description(f"Best trial: {study.best_trial.number}. Best value: {study.best_value:.6f}")
+
+    study.optimize(objective, n_trials=n_trials, callbacks=[callback])
+    pbar.close()
+
+    best = study.best_params
+    best["objective"] = "binary"
+    best["verbose"] = -1
+    best["random_state"] = 42
+    best["n_jobs"] = -1
+    print(f"\n  Best CV log-loss: {study.best_value:.5f}")
+    print(f"  Best params:")
+    for k, v in sorted(best.items()):
+        if k not in ("objective", "verbose", "random_state", "n_jobs"):
+            print(f"    {k:<30} = {v}")
+    return best
+
+
 def get_feature_importance(model, feature_cols: list[str], top_n: int = 30) -> dict:
     """Extract and print feature importances from a CalibratedClassifierCV."""
     # Average importances across CV folds
@@ -922,19 +986,22 @@ def walk_forward_nrfi(
 
     print(f"\nTrain: {len(train_df)} games, Test: {len(test_df)} games")
 
-    # ── Variant A: Full features with FI stats ──
+    # ── Variant A: Full features with Optuna-optimized hyperparameters ──
     print(f"\n{'='*60}")
-    print("Variant A: Full features (with FI + interaction)")
+    print("Variant A: Full features (Optuna-optimized)")
     print(f"{'='*60}")
     X_train_a, y_train, feature_cols_a = prepare_xy(train_df)
     X_test_a, y_test, _ = prepare_xy(test_df, feature_cols_a)
     print(f"Features: {len(feature_cols_a)}")
 
-    model_a = build_model(lgb_params)
+    print("\n  Optimizing hyperparameters with Optuna...")
+    opt_params = optimize_nrfi_lgb(X_train_a, y_train, n_trials=120, n_splits=5)
+
+    model_a = build_model(opt_params)
     model_a.fit(X_train_a, y_train)
     probs_a = model_a.predict_proba(X_test_a)[:, 1]
     get_feature_importance(model_a, feature_cols_a)
-    metrics_a = evaluate_nrfi(y_test, probs_a, "Full features", bootstrap=False)
+    metrics_a = evaluate_nrfi(y_test, probs_a, "Full features (Optuna)", bootstrap=False)
 
     # ── Variant B: Core features only (no FI, no sim, minimal interactions) ──
     print(f"\n{'='*60}")
@@ -1035,7 +1102,7 @@ def walk_forward_nrfi(
     print("VARIANT COMPARISON")
     print(f"{'='*60}")
     variants = [
-        ("A: Full features", metrics_a, probs_a),
+        ("A: Full (Optuna)", metrics_a, probs_a),
         ("B: Core features", metrics_b, probs_b),
         ("C: Ultra-minimal", metrics_c, probs_c),
         ("D: Logistic regr", metrics_d, probs_d),

@@ -1,14 +1,14 @@
 # Betting Strategy Playbook
 
-Six independent strategies targeting three MLB betting markets (moneyline, over/under totals, first-inning scoring). Each strategy was backtested on the 2025 MLB season using walk-forward methodology — meaning the model never sees future data when making predictions.
+Five active strategies targeting two MLB betting markets (moneyline, first-inning scoring). Each strategy was backtested on the 2025 MLB season using walk-forward methodology — meaning the model never sees future data when making predictions. One former strategy (O/U Under Classifier) was retired after edge-based testing showed no profitable signal.
 
-**Combined backtest (June–October 2025): 1,011 bets, 57.1% win rate, +12.1% flat-bet ROI, Sharpe 3.68.**
+**Combined backtest (June–October 2025): 679 bets, 56.0% win rate, +12.0% flat-bet ROI, Sharpe 3.30.**
 
 ---
 
 ## Table of Contents
 
-1. [Strategy 1: O/U Under Classifier](#strategy-1-ou-under-classifier)
+1. [Strategy 1: O/U Under Classifier — RETIRED](#strategy-1-ou-under-classifier--retired)
 2. [Strategy 2: YRFI (Yes Run First Inning)](#strategy-2-yrfi-yes-run-first-inning)
 3. [Strategy 3: DK-vs-Kalshi Moneyline Arbitrage](#strategy-3-dk-vs-kalshi-moneyline-arbitrage)
 4. [Strategy 4: Away Underdog Anomaly](#strategy-4-away-underdog-anomaly)
@@ -19,135 +19,37 @@ Six independent strategies targeting three MLB betting markets (moneyline, over/
 
 ---
 
-## Strategy 1: O/U Under Classifier
+## Strategy 1: O/U Under Classifier — RETIRED
 
-**Market:** Over/Under total runs
-**Side:** Almost exclusively unders
-**Backtest:** 332 bets · 59.3% win rate · +12.4% ROI (unified backtest with actual DK odds)
-**Standalone model (actual DK odds):** 482 bets · 61.8% win rate · +15.9% ROI · Bootstrap 95% CI [+7.8%, +23.8%]
-**Statistical significance:** Permutation test p = 0.0000 (5,000 iterations)
+**Status: REMOVED from active portfolio**
+**Reason:** When tested correctly using edge-based betting (comparing model probability vs market's devigged probability with actual per-game DK odds), the model shows no profitable signal.
 
-### What This Strategy Does
+### Why It Was Retired
 
-Sportsbooks post a "total runs" line for each game — for example, 8.5. You can bet "over" (9+ runs will be scored) or "under" (8 or fewer). The book charges juice (vigorish) on both sides, typically around -110, meaning you risk $110 to win $100. To break even at -110, you need to win 52.4% of your bets.
+The original backtest used a flawed methodology:
+1. **Fixed probability threshold** (P(under) > 0.55) instead of comparing against the market's implied probability. A model saying P(under) = 0.55 on a -200 under (market implied 66.7%) is actually a *negative* edge of -11.7%.
+2. **Assumed flat -110 odds** for all games, when actual DK closing odds vary significantly (only 6.8% of games are exactly -110).
 
-This strategy uses a machine learning model to predict whether the total runs in a game will go over or under the DraftKings closing line. When the model is confident the game will go under, we bet the under.
+When corrected to edge-based betting — only bet when model probability exceeds the market's devigged probability by a minimum threshold — the results collapsed:
 
-### How the Probability Is Formed
+| Metric | Value |
+|--------|-------|
+| Brier Skill Score | -0.006 (worse than base rate) |
+| AUC | 0.511 (essentially random) |
+| Walk-forward ROI at 2% edge | -4.1% (1,106 bets) |
+| Walk-forward ROI at 5% edge | +1.9% (530 bets, CI [-7%, +11%]) |
+| Permutation test p-value | 0.989 (NOT significant) |
+| Blind under ROI | -0.8% |
+| Model-selected under ROI | -4.1% |
 
-#### Step 1: Collect Pregame Features
+**The model is value-destructive** — blind under betting outperforms model-selected unders. DK closing O/U lines are too efficient for a LightGBM model trained on ~195 Statcast features to beat.
 
-Before each game, we assemble ~194 numerical features describing the matchup. These come from the pregame feature matrix (`data/features/pregame_{season}.parquet`) plus the DraftKings line itself. The features fall into categories:
-
-**Starting pitcher quality (most important):**
-- Expected run value (xRV): a statistic measuring how many runs a pitcher prevents per pitch relative to league average. Computed from Statcast pitch-level data (velocity, spin, movement, location, outcome) using a model trained on prior-season data.
-- Strikeout rate, walk rate, average fastball velocity, velocity trend, pitch mix entropy (how varied their pitches are).
-- "Stuff" score: a model-derived rating of pitch quality independent of location.
-- "Location" score: how well the pitcher hits their spots.
-- "Sequencing" score: how well the pitcher sequences pitch types.
-- "Composite" score: weighted combination of the above.
-- Days of rest, number of recent pitches thrown (workload).
-
-**Lineup quality:**
-- Team batting stats: barrel rate (how often they crush the ball), hard-hit rate, strikeout rate, walk rate, expected batting average on balls in play.
-- Swing quality metrics: in-zone contact rate, chase contact rate (swinging at bad pitches and still making contact), foul-fight rate.
-
-**Context:**
-- Park factor: Coors Field (1.14) inflates runs by 14% vs average; Oracle Park (0.87) suppresses them by 13%. Computed from 3-year rolling venue-specific run scoring.
-- Weather: temperature (warmer = more runs), wind speed and direction (wind blowing out to center boosts home runs), whether the stadium has a retractable roof.
-- Day/night game, days into the season.
-
-**The DraftKings line itself:**
-- `dk_ou_line`: the closing over/under number (e.g., 8.5).
-- `line_movement`: how much the line moved from open to close (e.g., opened at 9.0, closed at 8.5 → movement of -0.5). This captures where "sharp" money moved the line.
-- `devigged_over_prob`: the market's implied probability of the over, after removing the book's built-in profit margin (see Appendix A).
-
-**Engineered interactions:**
-- `sp_quality_sum/diff`: combined and differential pitcher quality.
-- `lineup_power_sum`: combined barrel rates of both lineups.
-- `line_vs_sp_era`: how the DK line compares to what you'd naively expect from the pitchers' ERAs. A high value means the market is setting the line above what the pitchers' track records suggest.
-
-#### Step 2: Train the Model
-
-We use LightGBM, a gradient-boosted decision tree algorithm. Think of it as building a series of simple decision rules (e.g., "if the home SP's strikeout rate is above 28% AND the park factor is below 0.95, lean toward under") and combining hundreds of them into a single prediction.
-
-**Training data:** All games from the 2024 MLB season where we have both DraftKings lines and pregame features (~1,885 games). For each game, the model learns: given these 194 features, did the actual total go over or under the DK line?
-
-**Key model settings (hyperparameters):**
-- 80 decision trees, each with a maximum depth of 3 levels and at most 8 leaf nodes — this keeps each individual tree simple to prevent overfitting.
-- Learning rate of 0.05 — each new tree makes only small corrections to the ensemble.
-- Regularization: L1 penalty of 2.0 and L2 penalty of 2.0, which penalize overly complex patterns. Plus 50% feature subsampling per tree (each tree only sees a random half of the features).
-- Minimum 50 data points per leaf node — prevents the model from making predictions based on too few examples.
-
-These are deliberately conservative settings. With only ~1,900 training games, aggressive settings would memorize noise in the training data rather than learning real patterns.
-
-**Why LightGBM?** Unlike linear regression, it can capture non-linear relationships (e.g., "high park factor matters more when both pitchers are mediocre") and interactions between features without manually specifying them.
-
-#### Step 3: Calibrate the Raw Predictions
-
-The raw model output is a number between 0 and 1 representing P(over). But raw model outputs are often poorly calibrated — a prediction of 0.60 might correspond to an actual over rate of only 0.52.
-
-We fix this with isotonic regression calibration:
-1. Sort the first 40% of 2025 games chronologically. This is our calibration set (~970 games).
-2. Fit an isotonic regression: a step function that maps raw model P(over) → actual observed over rate, preserving the ordering (if raw prediction A > raw prediction B, calibrated A >= calibrated B).
-3. Apply this mapping to all subsequent games.
-
-The calibration is done in an expanding-window fashion within 2025: for each month starting from May, we calibrate using all prior months and predict the current month.
-
-#### Step 4: Generate the Bet Signal
-
-After calibration, if the model's P(under) = 1 - P(over) exceeds 0.55, we have a bet. In practice, almost all qualifying bets are unders — the model has essentially no reliable over signal.
-
-**Why unders specifically?** The model's top features (SP composite score, sequencing score, xRV vs lineup) are all pitcher quality metrics. The model is best at identifying games where strong pitching will suppress scoring — it's finding games where the book's total is set too high relative to the pitching matchup.
-
-### Backtest Results
-
-**Walk-forward test set (last 60% of 2025 season, ~1,400 games):**
-
-| Threshold | Bets | Win Rate | ROI (actual DK odds) | ROI (flat -110) |
-|-----------|------|----------|----------------------|-----------------|
-| P(under) > 0.52 | 484 | 61.8% | +15.8% | +17.9% |
-| P(under) > 0.55 | 482 | 61.8% | +15.9% | +18.0% |
-| P(under) > 0.57 | 467 | 62.1% | +16.5% | +18.6% |
-| P(under) > 0.60 | 415 | 61.0% | +14.4% | +16.4% |
-
-**Bootstrap 95% CI at 0.55 threshold (actual DK odds):** ROI between +7.8% and +23.8%.
-
-Note: Flat -110 overstates ROI by ~2 percentage points because actual DK under
-closing odds are slightly worse than -110 on average (median -112). Always use
-actual per-game odds for realistic P&L estimation.
-
-**Permutation test:** We shuffled the over/under labels 5,000 times and re-ran the model each time. Zero shuffled runs produced ROI as high as the real model's. p < 0.0002.
-
-**Top features by importance:**
-1. SP sequencing score (how well pitchers vary their pitch sequences)
-2. SP overperformance differential (one team's SP outperforming their underlying stats)
-3. Hit quality metrics (barrel rate, hard-hit rate)
-4. SP composite quality scores
-
-Notably, the DK line itself is NOT a top feature — the model finds signal in pregame matchup features that the market doesn't fully price.
-
-**Monthly stability:**
-
-| Month | Bets | Win Rate | ROI |
-|-------|------|----------|-----|
-| June | ~80 | 57% | +9% |
-| July | ~95 | 60% | +15% |
-| August | ~100 | 58% | +11% |
-| September | ~85 | 61% | +16% |
-
-All months profitable. The signal is consistent across the season.
-
-### Important Caveats
-
-1. **Single out-of-sample season.** 2025's actual over rate was 47.3% vs the market's implied ~50%. The blind-under baseline returned only +0.6% ROI, so the model is doing real selection work (+12.4% vs +0.6%), but the favorable under environment helps.
-2. **Closing line assumption.** We assume bets are placed at DK closing odds. In practice, you'd bet before the close; if lines move against you, realized ROI would be lower.
+Hyperparameters were optimized via Optuna (150 trials, 5-fold TimeSeriesSplit CV). Best CV log-loss was 0.69325 — barely better than the 0.6931 theoretical minimum for a coin flip. The market already incorporates the same pitching/hitting signals.
 
 ### How to Use
 
 ```
-make ou-vs-line    # Train the model
-make unified-picks # Generate today's picks (includes this strategy)
+make ou-vs-line    # Run the analysis (for research only, not for betting)
 ```
 
 ---
@@ -235,13 +137,13 @@ The model is better at identifying games where scoring IS likely than games wher
 
 Additionally, YRFI odds (+100) require only 50% accuracy to break even, while NRFI odds (-120) require 54.5%. The lower bar makes YRFI the more forgiving side.
 
-### Backtest Results
+### Backtest Results (Optuna-optimized ensemble)
 
-| Threshold | Bets | Win Rate | ROI |
-|-----------|------|----------|-----|
-| P(NRFI) ≤ 0.50 | 569 | 54.3% | +8.7% |
+| Threshold | Bets | Win Rate | ROI (+100 odds) |
+|-----------|------|----------|-----------------|
+| P(NRFI) ≤ 0.50 | 475 | 55.8% | +11.6% |
 | P(NRFI) ≤ 0.48 | 314 | 57.6% | +15.3% |
-| P(NRFI) ≤ 0.45 | 189 | 58.7% | +17.5% |
+| P(NRFI) ≤ 0.45 | 194 | 58.2% | +16.5% |
 | P(NRFI) ≤ 0.43 | 128 | 59.4% | +18.8% |
 
 The signal gets stronger at tighter thresholds but with fewer bets. The 0.48 threshold balances volume and edge.
@@ -507,16 +409,16 @@ The model must be right about BOTH pitchers to win an NRFI bet. If either pitche
 
 Additionally, at -120 odds, the book is already charging you a premium — they know NRFI is a popular recreational bet. You need 54.5% accuracy just to break even, leaving less room for profit.
 
-### Backtest Results
+### Backtest Results (Optuna-optimized ensemble)
 
-| Threshold | Bets | Win Rate | ROI |
-|-----------|------|----------|-----|
-| P(NRFI) ≥ 0.55 | 584 | 57.9% | +6.1% |
-| P(NRFI) ≥ 0.57 | 432 | 58.5% | +7.3% |
-| P(NRFI) ≥ 0.60 | 268 | 60.4% | +10.4% |
-| P(NRFI) ≥ 0.63 | 163 | 61.3% | +12.0% |
+| Threshold | Bets | Win Rate | ROI (-120 odds) |
+|-----------|------|----------|-----------------|
+| P(NRFI) ≥ 0.55 | 990 | 55.9% | +2.4% |
+| P(NRFI) ≥ 0.57 | 584 | 57.9% | +6.1% |
+| P(NRFI) ≥ 0.60 | 203 | 55.7% | +2.1% |
+| P(NRFI) ≥ 0.63 | 64 | 59.4% | +8.9% |
 
-Higher thresholds = higher win rate but fewer bets.
+The model (BSS: +0.006, AUC: 0.570) has modest but real skill. The 0.57 threshold offers the best balance of volume and ROI.
 
 ### Important Caveats
 
