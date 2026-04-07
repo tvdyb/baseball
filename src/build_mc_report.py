@@ -116,11 +116,27 @@ def simulate_kelly_rebalancing(df):
             bankroll += pnl
             bankroll_history.append(bankroll)
             won = (position > 0 and home_win == 1) or (position < 0 and home_win == 0)
+            side = "HOME" if position > 0 else "AWAY"
+            # Get last state with edge for summary
+            late_states = game[game["inning"] >= 7].sort_values("game_progress")
+            if len(late_states) > 0:
+                last = late_states.iloc[-1]
+                final_edge = last["edge"] if position > 0 else -last["edge"]
+                mkt = last["kalshi_home_prob"] if position > 0 else 1 - last["kalshi_home_prob"]
+                sim = last["sim_home_wp"] if position > 0 else 1 - last["sim_home_wp"]
+            else:
+                final_edge = 0
+                mkt = 0.5
+                sim = 0.5
             game_results.append({
                 "game_pk": gpk,
                 "game_date": game.iloc[0]["game_date"],
                 "home_team": game.iloc[0]["home_team"],
                 "away_team": game.iloc[0]["away_team"],
+                "side": side,
+                "mkt_price": mkt,
+                "sim_prob": sim,
+                "edge": abs(final_edge),
                 "pnl": pnl,
                 "won": int(won),
                 "bankroll": bankroll,
@@ -344,6 +360,66 @@ def slide_strategy_overview(pdf):
 
     pdf.savefig(fig)
     plt.close(fig)
+
+
+def slide_trade_table(pdf, results):
+    """Table of every game traded with P&L and cumulative P&L."""
+    if len(results) == 0:
+        return
+
+    bets = results.sort_values("game_date").reset_index(drop=True)
+    bets["cum_pnl"] = bets["pnl"].cumsum()
+    bets["game_date"] = pd.to_datetime(bets["game_date"])
+
+    headers = ["Date", "Matchup", "Side", "Market", "Sim", "Edge", "W/L", "P&L", "Cum P&L", "Bankroll"]
+    max_rows = 16
+    pages = [bets.iloc[i:i + max_rows] for i in range(0, len(bets), max_rows)]
+
+    for page_idx, page_bets in enumerate(pages):
+        suffix = "" if page_idx == 0 else " (cont.)"
+        fig, ax = setup_fig(f"Every Trade{suffix}")
+
+        n = len(page_bets)
+        row_h = 0.68 / (n + 1)
+        y_start = 0.83
+        col_x = [0.02, 0.10, 0.30, 0.40, 0.50, 0.59, 0.68, 0.76, 0.85, 0.93]
+
+        for j, h in enumerate(headers):
+            ax.text(col_x[j], y_start, h, fontsize=11, fontweight="bold",
+                    color=ACCENT, va="center", family="sans-serif")
+
+        for i, (_, r) in enumerate(page_bets.iterrows()):
+            y = y_start - (i + 1) * row_h
+            bg_color = GREEN if r["won"] else RED
+            rect = FancyBboxPatch((0.01, y - row_h * 0.4), 0.98, row_h * 0.8,
+                                   boxstyle="round,pad=0.003",
+                                   facecolor=bg_color, alpha=0.12, edgecolor="none")
+            ax.add_patch(rect)
+
+            team_str = f"{r['away_team']}@{r['home_team']}"
+            vals = [
+                r["game_date"].strftime("%m/%d"),
+                team_str,
+                r["side"],
+                f"{r['mkt_price']:.2f}",
+                f"{r['sim_prob']:.2f}",
+                f"{r['edge']:.1%}",
+                "W" if r["won"] else "L",
+                f"${r['pnl']:+,.0f}",
+                f"${r['cum_pnl']:+,.0f}",
+                f"${r['bankroll']:,.0f}",
+            ]
+            for j, v in enumerate(vals):
+                if j == 6:  # W/L
+                    c = GREEN if r["won"] else RED
+                elif j == 8:  # Cum P&L
+                    c = GREEN if r["cum_pnl"] > 0 else RED
+                else:
+                    c = TEXT_COLOR
+                ax.text(col_x[j], y, v, fontsize=10, color=c, va="center", family="sans-serif")
+
+        pdf.savefig(fig)
+        plt.close(fig)
 
 
 def slide_cumulative_pnl(pdf, results, bankroll_history):
@@ -613,10 +689,13 @@ def main():
         print("Slide 6: Game Trace...")
         slide_game_trace(pdf, df)
 
-        print("Slide 7: Cumulative P&L...")
+        print("Slide 7: Trade Table...")
+        slide_trade_table(pdf, results)
+
+        print("Slide 8: Cumulative P&L...")
         slide_cumulative_pnl(pdf, results, bankroll_history)
 
-        print("Slide 8: Results Summary...")
+        print("Slide 9: Results Summary...")
         slide_results_summary(pdf, results, df)
 
     print(f"\nReport saved to {OUT_PDF}")
