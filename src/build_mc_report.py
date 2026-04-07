@@ -118,7 +118,7 @@ def simulate_kelly_rebalancing(df):
             pnl = settlement - cost_basis
             bankroll += pnl
             bankroll_history.append(bankroll)
-            won = (position > 0 and home_win == 1) or (position < 0 and home_win == 0)
+            won = pnl > 0
             side = "HOME" if position > 0 else "AWAY"
             # Get last state with edge for summary
             late_states = game[game["inning"] >= 7].sort_values("game_progress")
