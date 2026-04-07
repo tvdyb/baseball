@@ -126,6 +126,13 @@ def main():
     model.fit(X_train, y_train)
     print(f"  Best CV log-loss: {study.best_value:.5f}")
 
+    # Deduplicate load_all_data output — doubleheaders create multiple rows
+    # per date+team pair. Keep first (game 1) to avoid inflated bet counts.
+    pre_dedup = len(df)
+    df = df.drop_duplicates(subset=["game_date", "home_team", "away_team"], keep="first")
+    if pre_dedup != len(df):
+        print(f"  Deduped: {pre_dedup} -> {len(df)} (removed {pre_dedup - len(df)} doubleheader dupes)")
+
     # Predict on all 2025
     df["lgb_home_prob"] = model.predict_proba(df[feat_cols])[:, 1]
 
@@ -134,32 +141,39 @@ def main():
     bets = compute_bets(test_df, "lgb_home_prob", min_edge=0.10, kelly_frac=0.25)
     print(f"\n  Test bets: {len(bets)}")
 
-    # Merge pitcher names from games data (drop_duplicates to handle doubleheaders)
+    # Merge pitcher names from games data (first game per date+teams for doubleheaders)
     games = pd.read_parquet(DATA / "games" / "games_2025.parquet")
     games["game_date"] = pd.to_datetime(games["game_date"]).dt.strftime("%Y-%m-%d")
     games_info = games[["game_date", "home_team_abbr", "away_team_abbr",
                          "home_sp_name", "away_sp_name"]].copy()
     games_info.rename(columns={"home_team_abbr": "home_team", "away_team_abbr": "away_team"}, inplace=True)
     games_info = games_info.drop_duplicates(subset=["game_date", "home_team", "away_team"], keep="first")
-
     bets = bets.merge(games_info, on=["game_date", "home_team", "away_team"], how="left")
 
-    # Merge Polymarket closing prices
-    poly_path = DATA / "polymarket" / "poly_vs_sharp_matched.parquet"
+    # Merge Polymarket closing prices from RAW cached data (full season, not just sharp-matched)
+    poly_path = DATA / "polymarket" / "poly_closing_prices.parquet"
     if poly_path.exists():
         poly = pd.read_parquet(poly_path)
-        poly = poly[(poly["poly_home_prob"] >= 0.18) & (poly["poly_home_prob"] <= 0.82)]
-        poly_slim = poly[["game_date", "home_team", "away_team", "poly_home_prob"]].copy()
-        poly_slim = poly_slim.drop_duplicates(subset=["game_date", "home_team", "away_team"], keep="first")
-        bets = bets.merge(poly_slim, on=["game_date", "home_team", "away_team"], how="left")
+        # Filter out post-game resolution prices
+        poly = poly[(poly["poly_team0_prob"] >= 0.18) & (poly["poly_team0_prob"] <= 0.82)]
+        # Align to home/away — poly has team0/team1, need to match to home_team
+        poly_rows = []
+        for _, pr in poly.iterrows():
+            t0, t1 = pr["team0"], pr["team1"]
+            p0 = pr["poly_team0_prob"]
+            # We don't know which is home from poly data, so try both orientations
+            poly_rows.append({"game_date": pr["game_date"], "home_team": t0, "away_team": t1, "poly_home_prob": round(p0, 4)})
+            poly_rows.append({"game_date": pr["game_date"], "home_team": t1, "away_team": t0, "poly_home_prob": round(1.0 - p0, 4)})
+        poly_lookup = pd.DataFrame(poly_rows)
+        poly_lookup = poly_lookup.drop_duplicates(subset=["game_date", "home_team", "away_team"], keep="first")
+        bets = bets.merge(poly_lookup, on=["game_date", "home_team", "away_team"], how="left")
     else:
         bets["poly_home_prob"] = np.nan
 
-    # Merge DK and LGB probs from test_df
+    # Merge DK and LGB probs from test_df (already deduped)
     odds_cols = test_df[["game_date", "home_team", "away_team",
                           "dk_home_prob", "lgb_home_prob",
                           "kalshi_home_prob", "home_ml_close", "away_ml_close"]].copy()
-    odds_cols = odds_cols.drop_duplicates(subset=["game_date", "home_team", "away_team"], keep="first")
     bets = bets.merge(odds_cols, on=["game_date", "home_team", "away_team"], how="left")
 
     # Build clean output
