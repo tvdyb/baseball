@@ -62,7 +62,20 @@ def setup_fig(title=None):
 # ══════════════════════════════════════════════════════════════════════════
 
 def load_ingame_data():
-    return pd.read_csv(INGAME_CSV)
+    df = pd.read_csv(INGAME_CSV)
+    # Filter out games with bad Kalshi candle matches (timestamp misalignment)
+    # Bad = price spikes >20% from both neighbors, or single jump >40%
+    df = df.sort_values(["game_pk", "game_progress"]).reset_index(drop=True)
+    df["_prev"] = df.groupby("game_pk")["kalshi_home_prob"].shift(1)
+    df["_next"] = df.groupby("game_pk")["kalshi_home_prob"].shift(-1)
+    df["_jp"] = abs(df["kalshi_home_prob"] - df["_prev"])
+    df["_jn"] = abs(df["_next"] - df["kalshi_home_prob"])
+    bad = (df["_jp"] > 0.20) & (df["_jn"] > 0.20) | (df["_jp"] > 0.40)
+    bad_games = df.loc[bad, "game_pk"].unique()
+    clean = df[~df["game_pk"].isin(bad_games)].drop(columns=["_prev", "_next", "_jp", "_jn"])
+    n_removed = df["game_pk"].nunique() - clean["game_pk"].nunique()
+    print(f"  Removed {n_removed} games with bad Kalshi candle data ({len(bad_games)} tainted)")
+    return clean.reset_index(drop=True)
 
 
 def simulate_kelly_rebalancing(df):
