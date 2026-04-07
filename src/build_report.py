@@ -100,11 +100,16 @@ def load_2025_poly_bets():
 
 
 def load_2026_bets():
-    """Match DK lines to Polymarket for 2026 regular season, apply betting logic."""
+    """Match LGB predictions to Polymarket for 2026, apply betting logic."""
+    # Load LGB predictions for 2026
+    lgb_path = BASE / "data" / "features" / "lgb_predictions_2026.parquet"
+    lgb_preds = pd.read_parquet(lgb_path)
+    lgb_preds["game_date"] = pd.to_datetime(lgb_preds["game_date"])
+    lgb_preds = lgb_preds[lgb_preds["game_date"] >= REG_SEASON_START].copy()
+
+    # Also load SBR for game results (home_score, away_score)
     dk = pd.read_parquet(SBR_2026)
     dk["game_date"] = pd.to_datetime(dk["game_date"])
-    dk = dk[dk["game_date"] >= REG_SEASON_START].copy()
-    dk = dk.dropna(subset=["dk_home_prob"])
 
     poly = pd.read_parquet(POLY_CLOSING)
     poly["game_date"] = pd.to_datetime(poly["game_date"])
@@ -113,10 +118,12 @@ def load_2026_bets():
     poly = poly[(poly["poly_team1_prob"] >= 0.18) & (poly["poly_team1_prob"] <= 0.82)]
 
     bets = []
-    for _, g in dk.iterrows():
+    for _, g in lgb_preds.iterrows():
         home = map_team(g["home_team"])
         away = map_team(g["away_team"])
         gd = g["game_date"]
+
+        # Match polymarket
         m = poly[(poly["game_date"] == gd)]
         match = m[(m["team0"] == home) & (m["team1"] == away)]
         if len(match) == 1:
@@ -134,33 +141,43 @@ def load_2026_bets():
             else:
                 continue
 
-        dk_home = g["dk_home_prob"]
-        dk_away = 1 - dk_home
-        eh = dk_home - p_home
-        ea = dk_away - p_away
+        lgb_home = g["lgb_home_prob"]
+        lgb_away = g["lgb_away_prob"]
+        eh = lgb_home - p_home
+        ea = lgb_away - p_away
 
         if eh >= EDGE_THRESHOLD or ea >= EDGE_THRESHOLD:
             if eh >= ea:
                 side = "home"
                 price = p_home
                 edge = eh
-                dk_prob = dk_home
+                signal = lgb_home
                 won = bool(home_won)
             else:
                 side = "away"
                 price = p_away
                 edge = ea
-                dk_prob = dk_away
+                signal = lgb_away
                 won = not bool(home_won)
             pnl = (1 - price - POLY_FEE) if won else (-price - POLY_FEE)
             kelly_full = edge / (1 - price) if price < 1 else 0
             kelly_quarter = kelly_full * 0.25
+
+            # Get scores from SBR for result string
+            sbr_match = dk[(dk["game_date"] == gd) & (dk["home_team"] == g["home_team"]) & (dk["away_team"] == g["away_team"])]
+            if len(sbr_match) > 0:
+                hs = int(sbr_match.iloc[0]["home_score"])
+                aws = int(sbr_match.iloc[0]["away_score"])
+                result_str = f"{g['home_team']} {hs}-{aws} {g['away_team']}"
+            else:
+                result_str = ""
+
             bets.append({
                 "date": gd, "home": g["home_team"], "away": g["away_team"],
-                "side": side, "poly_price": price, "signal_prob": dk_prob,
+                "side": side, "poly_price": price, "signal_prob": signal,
                 "edge": edge, "won": won, "pnl": pnl,
                 "kelly_full": kelly_full, "kelly_quarter": kelly_quarter,
-                "result_str": f"{g['home_team']} {int(g['home_score'])}-{int(g['away_score'])} {g['away_team']}"
+                "result_str": result_str,
             })
     return pd.DataFrame(bets)
 
