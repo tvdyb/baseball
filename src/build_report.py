@@ -785,12 +785,9 @@ def main():
         print("Slide 5: PA Matchup Model...")
         slide_pa_distribution(pdf)
 
-        # --- Section 2: Strategy & Edge Analysis ---
+        # --- Section 2: Strategy ---
         print("Slide 6: Strategy Overview...")
         slide_strategy_overview(pdf)
-
-        print("Slide 7: Edge vs Win Rate...")
-        slide_edge_winrate(pdf, bets_2025, bets_2026)
 
         # --- Section 3: Results ---
         print("Slide 9: 2025 Bet Table...")
