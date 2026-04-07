@@ -300,6 +300,8 @@ class TeamContext:
     relievers: list[RelieverInfo] = field(default_factory=list)
     # Fallback composite bullpen dists (used when no reliever data available)
     bp_outcome_dists: list[np.ndarray] = field(default_factory=list)   # vs opposing bullpen
+    # Per-game xRV history for SP (recent starts), used for day-to-day quality sampling
+    sp_game_xrv_history: np.ndarray | None = None  # shape (n_recent_starts,)
 
 
 @dataclass
@@ -543,6 +545,39 @@ def _make_no_dp_dist(probs: np.ndarray) -> np.ndarray:
     total = adjusted.sum()
     if total > 0:
         adjusted /= total
+    return adjusted
+
+
+def _apply_quality_shift(dist: np.ndarray, xrv_delta: float) -> np.ndarray:
+    """Adjust outcome distribution based on pitcher's day-to-day quality draw.
+
+    xrv_delta: sampled game xRV minus pitcher's mean xRV.
+      Positive = worse day (more run value to hitters) → shift toward offense.
+      Negative = better day → shift toward outs.
+
+    The magnitude is calibrated so that a typical game-to-game xRV std of ~0.02
+    produces meaningful but not extreme shifts (~1-2% probability mass movement).
+    Empirically, 1 unit of xRV/pitch ≈ ~50 probability points shift (scaled by
+    ~90 PA/game), so we use a sensitivity of 0.8 to convert xRV delta to shift.
+    """
+    if abs(xrv_delta) < 1e-6:
+        return dist
+    # Convert xRV delta to probability mass shift
+    # Positive xrv_delta = hitters do better = shift mass from outs to offense
+    shift = xrv_delta * 0.8  # sensitivity: 0.02 xRV std → ~0.016 shift
+    adjusted = dist.copy()
+    offense_total = sum(adjusted[i] for i in _OFFENSE_IDX)
+    out_total = sum(adjusted[i] for i in _OUT_IDX)
+    if offense_total <= 0.01 or out_total <= 0.01:
+        return dist
+    # Clamp shift to prevent extreme adjustments
+    shift = np.clip(shift, -0.04, 0.04)
+    for i in _OFFENSE_IDX:
+        adjusted[i] += shift * (adjusted[i] / offense_total)
+    for i in _OUT_IDX:
+        adjusted[i] -= shift * (adjusted[i] / out_total)
+    adjusted = np.maximum(adjusted, 1e-8)
+    adjusted /= adjusted.sum()
     return adjusted
 
 
@@ -1032,6 +1067,87 @@ def simulate_game(
     return state.home_score, state.away_score
 
 
+def _precompute_quality_variants(
+    base_dists: dict,
+    home_sp_history: np.ndarray | None,
+    away_sp_history: np.ndarray | None,
+) -> tuple:
+    """Pre-compute shifted SP distributions for each game-level xRV in history.
+
+    Returns (sp_key_set, home_variants, away_variants, home_deltas, away_deltas)
+    where variants[i] = {key: shifted_dist} for the i-th historical game.
+    Non-SP keys are not included (use base_dists for those).
+    """
+    # Identify SP distribution keys
+    # SP keys: (side, pos, "sp"), (side, pos, "sp", "no_dp"),
+    #          (side, pos, "sp", "inn1"), (side, pos, "sp", "inn1", "no_dp")
+    home_sp_keys = [k for k in base_dists if k[2] == "sp" and k[0] == "home"]
+    away_sp_keys = [k for k in base_dists if k[2] == "sp" and k[0] == "away"]
+
+    # Pre-compute deltas and shifted distributions for each historical game
+    # "home" side SP keys → adjusted by away_delta (away SP pitches to home batters)
+    # "away" side SP keys → adjusted by home_delta (home SP pitches to away batters)
+    home_variants = []  # shifts applied to "away" side keys (home SP quality)
+    away_variants = []  # shifts applied to "home" side keys (away SP quality)
+    home_deltas = np.zeros(0)
+    away_deltas = np.zeros(0)
+
+    if home_sp_history is not None and len(home_sp_history) >= 3:
+        home_mean = np.mean(home_sp_history)
+        home_deltas = home_sp_history - home_mean
+        for delta in home_deltas:
+            variant = {}
+            for k in away_sp_keys:  # home SP affects away-side distributions
+                if abs(delta) > 1e-6:
+                    variant[k] = _apply_quality_shift(base_dists[k], delta)
+                else:
+                    variant[k] = base_dists[k]
+            home_variants.append(variant)
+
+    if away_sp_history is not None and len(away_sp_history) >= 3:
+        away_mean = np.mean(away_sp_history)
+        away_deltas = away_sp_history - away_mean
+        for delta in away_deltas:
+            variant = {}
+            for k in home_sp_keys:  # away SP affects home-side distributions
+                if abs(delta) > 1e-6:
+                    variant[k] = _apply_quality_shift(base_dists[k], delta)
+                else:
+                    variant[k] = base_dists[k]
+            away_variants.append(variant)
+
+    return home_variants, away_variants
+
+
+class _QualityDists:
+    """Wrapper that overlays per-sim SP quality shifts on base distributions.
+
+    Avoids creating a full dict copy per sim. Lookups for SP keys use the
+    pre-computed shifted variant; all other keys fall through to base_dists.
+    """
+    __slots__ = ("_base", "_home_overlay", "_away_overlay")
+
+    def __init__(self, base_dists, home_overlay=None, away_overlay=None):
+        self._base = base_dists
+        self._home_overlay = home_overlay  # shifted "away"-side SP dists (home SP quality)
+        self._away_overlay = away_overlay  # shifted "home"-side SP dists (away SP quality)
+
+    def __getitem__(self, key):
+        # Check overlays first for SP keys
+        if key[2] == "sp":
+            if key[0] == "away" and self._home_overlay and key in self._home_overlay:
+                return self._home_overlay[key]
+            if key[0] == "home" and self._away_overlay and key in self._away_overlay:
+                return self._away_overlay[key]
+        return self._base[key]
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+
 def monte_carlo_win_prob(
     home_ctx: TeamContext,
     away_ctx: TeamContext,
@@ -1051,13 +1167,26 @@ def monte_carlo_win_prob(
 
     rng = np.random.default_rng(config.random_seed)
 
-    # Pre-compute all outcome distributions with calibration + park/weather
-    dists = precompute_all_distributions(
+    # Pre-compute base outcome distributions with calibration + park/weather
+    base_dists = precompute_all_distributions(
         home_ctx, away_ctx,
         calibration_shift=config.calibration_shift,
         park_factor=park_factor,
         weather=weather,
     )
+
+    # Pre-compute quality variants from SP game-level xRV histories
+    home_sp_history = home_ctx.sp_game_xrv_history
+    away_sp_history = away_ctx.sp_game_xrv_history
+    use_quality_sampling = (home_sp_history is not None and len(home_sp_history) >= 3) or \
+                           (away_sp_history is not None and len(away_sp_history) >= 3)
+
+    home_variants = []
+    away_variants = []
+    if use_quality_sampling:
+        home_variants, away_variants = _precompute_quality_variants(
+            base_dists, home_sp_history, away_sp_history
+        )
 
     home_wins = 0
     away_wins = 0
@@ -1074,6 +1203,14 @@ def monte_carlo_win_prob(
                  and initial_state.outs == 0 and not any(initial_state.bases))
 
     for _ in range(config.n_sims):
+        # Per-sim quality draw: sample each SP's game-level xRV from history
+        if use_quality_sampling:
+            h_overlay = rng.choice(home_variants) if home_variants else None
+            a_overlay = rng.choice(away_variants) if away_variants else None
+            dists = _QualityDists(base_dists, h_overlay, a_overlay)
+        else:
+            dists = base_dists
+
         if track_1st:
             hr, ar, a1, h1 = simulate_game(
                 home_ctx, away_ctx, initial_state,
@@ -1304,6 +1441,53 @@ def _compute_batter_outcome_rates(
             return milb_rates
 
     return None
+
+
+def _compute_sp_game_xrv_history(
+    idx: dict,
+    pitcher_id: int | float | None,
+    game_date: str,
+    n_starts: int = 15,
+) -> np.ndarray | None:
+    """Compute per-game average xRV for a starting pitcher's recent starts.
+
+    Returns array of per-game mean xRV values (one per start), or None if
+    insufficient data. Used to sample day-to-day quality variation in MC sims.
+
+    Only includes games where pitcher threw 40+ pitches (starter appearances).
+    """
+    if pitcher_id is None or (isinstance(pitcher_id, float) and np.isnan(pitcher_id)):
+        return None
+
+    pitcher_id = int(pitcher_id)
+    xrv_df = idx.get("xrv")
+    if xrv_df is None:
+        return None
+
+    # Get this pitcher's pitches before game_date
+    pitcher_data = xrv_df[xrv_df["pitcher"] == pitcher_id].copy()
+    if len(pitcher_data) == 0:
+        return None
+
+    pitcher_data = pitcher_data[pitcher_data["game_date"] < game_date]
+    if len(pitcher_data) < 100:
+        return None
+
+    # Aggregate per game
+    per_game = pitcher_data.groupby("game_pk").agg(
+        n_pitches=("xrv", "count"),
+        avg_xrv=("xrv", "mean"),
+    )
+    # Filter to starter appearances (40+ pitches)
+    per_game = per_game[per_game["n_pitches"] >= 40]
+    if len(per_game) < 3:
+        return None
+
+    # Take most recent n_starts
+    # Sort by game_pk (higher = more recent for MLB game_pk numbering)
+    per_game = per_game.sort_index(ascending=False).head(n_starts)
+
+    return per_game["avg_xrv"].values
 
 
 def _compute_pitcher_outcome_rates(
@@ -1921,6 +2105,10 @@ def load_simulation_context(
     away_relievers = _build_relievers(away_team, home_lineup, away_bp_rates,
                                        is_opposing_home=True)
 
+    # ── Compute per-game xRV history for SP quality sampling ──
+    home_sp_xrv_hist = _compute_sp_game_xrv_history(idx, home_sp, gdate, n_starts=15)
+    away_sp_xrv_hist = _compute_sp_game_xrv_history(idx, away_sp, gdate, n_starts=15)
+
     home_ctx = TeamContext(
         team=home_team,
         lineup=home_lineup[:9],
@@ -1928,6 +2116,7 @@ def load_simulation_context(
         sp_pitches_per_pa=home_sp_ppa,
         relievers=home_relievers,
         bp_outcome_dists=home_bp_dists,
+        sp_game_xrv_history=home_sp_xrv_hist,
     )
     away_ctx = TeamContext(
         team=away_team,
@@ -1936,6 +2125,7 @@ def load_simulation_context(
         sp_pitches_per_pa=away_sp_ppa,
         relievers=away_relievers,
         bp_outcome_dists=away_bp_dists,
+        sp_game_xrv_history=away_sp_xrv_hist,
     )
 
     return home_ctx, away_ctx

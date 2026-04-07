@@ -5,7 +5,8 @@ Unified Daily Prediction & Betting Strategy
 Combines all profitable edges into one walk-forward backtest:
 
   1. DK-vs-Kalshi ML Arbitrage  (7% edge threshold)
-  2. O/U Direct Classifier Unders  (P(under) > 0.55)
+  2. [REMOVED] O/U Classifier — proven unprofitable vs DK closing lines
+     (BSS=-0.006, permutation p=0.989, model is value-destructive)
   3. DK Away Underdog Anomaly  (blind: away dog DK implied 35-40%)
   4. Win Model Pick-em Home Bets  (DK 48-52%, model home edge > 3%)
   5. NRFI Bets  (P(NRFI) >= 0.57 at -120 odds)
@@ -617,7 +618,8 @@ def strategy_yrfi(row):
 # ═══════════════════════════════════════════════════════════════════════
 STRATEGY_FUNCS = {
     "kalshi_arb": strategy_kalshi_arb,
-    "ou_under": strategy_ou_under,
+    # "ou_under" removed — proven unprofitable vs DK closing lines
+    # (BSS=-0.006, permutation p=0.989, blind under beats model-selected under)
     "away_dog": strategy_away_dog_anomaly,
     "pickem_home": strategy_pickem_home,
     "nrfi": strategy_nrfi,
@@ -627,7 +629,6 @@ STRATEGY_FUNCS = {
 # Quarter-Kelly for each; asymmetric NRFI/YRFI sizing
 KELLY_FRACTIONS = {
     "kalshi_arb": 0.25,
-    "ou_under": 0.25,
     "away_dog": 0.25,
     "pickem_home": 0.15,  # smaller — not yet significant
     "nrfi": 0.15,         # weaker signal
