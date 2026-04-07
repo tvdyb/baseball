@@ -64,12 +64,13 @@ def setup_fig(title=None):
 # ══════════════════════════════════════════════════════════════════════════
 
 def load_2025_poly_bets():
-    """Load 2025 bet log, recompute P&L against poly prices with 3% edge threshold."""
+    """Load 2025 bet log, use LGB model prob as signal vs Polymarket."""
     df = pd.read_csv(BET_LOG_2025)
     df["date"] = pd.to_datetime(df["date"])
-    df = df.dropna(subset=["poly_home", "poly_away"]).copy()
-    df["edge_home"] = df["dk_home"] - df["poly_home"]
-    df["edge_away"] = df["dk_away"] - df["poly_away"]
+    df = df.dropna(subset=["poly_home", "poly_away", "lgb_home", "lgb_away"]).copy()
+    # LGB model prob is the signal (includes DK + pitcher matchup features)
+    df["edge_home"] = df["lgb_home"] - df["poly_home"]
+    df["edge_away"] = df["lgb_away"] - df["poly_away"]
     bets = []
     for _, r in df.iterrows():
         eh, ea = r["edge_home"], r["edge_away"]
@@ -78,21 +79,20 @@ def load_2025_poly_bets():
                 side = "home"
                 price = r["poly_home"]
                 edge = eh
-                dk_prob = r["dk_home"]
+                signal_prob = r["lgb_home"]
                 won = r["result"] == "home_win"
             else:
                 side = "away"
                 price = r["poly_away"]
                 edge = ea
-                dk_prob = r["dk_away"]
+                signal_prob = r["lgb_away"]
                 won = r["result"] == "away_win"
             pnl = (1 - price - POLY_FEE) if won else (-price - POLY_FEE)
-            # Kelly: f* = edge / (1 - price)
             kelly_full = edge / (1 - price) if price < 1 else 0
             kelly_quarter = kelly_full * 0.25
             bets.append({
                 "date": r["date"], "home": r["home"], "away": r["away"],
-                "side": side, "price": price, "dk_prob": dk_prob,
+                "side": side, "price": price, "signal_prob": signal_prob,
                 "edge": edge, "won": won, "pnl": pnl,
                 "kelly_full": kelly_full, "kelly_quarter": kelly_quarter,
             })
@@ -157,7 +157,7 @@ def load_2026_bets():
             kelly_quarter = kelly_full * 0.25
             bets.append({
                 "date": gd, "home": g["home_team"], "away": g["away_team"],
-                "side": side, "poly_price": price, "dk_prob": dk_prob,
+                "side": side, "poly_price": price, "signal_prob": dk_prob,
                 "edge": edge, "won": won, "pnl": pnl,
                 "kelly_full": kelly_full, "kelly_quarter": kelly_quarter,
                 "result_str": f"{g['home_team']} {int(g['home_score'])}-{int(g['away_score'])} {g['away_team']}"
@@ -178,7 +178,9 @@ def slide_title(pdf, bets_2025, bets_2026):
 
     total_bets = len(bets_2025) + len(bets_2026)
     total_pnl = bets_2025["pnl"].sum() + bets_2026["pnl"].sum()
-    total_wagered = bets_2025["price"].sum() + bets_2026["poly_price"].sum()
+    wag_25 = bets_2025["price"].sum() if "price" in bets_2025.columns else 0
+    wag_26 = bets_2026["poly_price"].sum() if len(bets_2026) > 0 else 0
+    total_wagered = wag_25 + wag_26
     total_wins = bets_2025["won"].sum() + bets_2026["won"].sum()
     win_rate = total_wins / total_bets * 100 if total_bets else 0
     roi = total_pnl / total_wagered * 100 if total_wagered else 0
@@ -359,9 +361,9 @@ def slide_strategy_overview(pdf):
     fig, ax = setup_fig("Betting Strategy")
 
     bullets = [
-        ("Signal", "DraftKings devigged closing moneyline probability"),
+        ("Signal", "LightGBM win prob model (pitcher matchups + DK closing line as feature)"),
         ("Market", "Polymarket MLB moneyline contracts (binary outcomes)"),
-        ("Edge", "DK implied probability - Polymarket contract price"),
+        ("Edge", "LGB model probability - Polymarket contract price"),
         ("Threshold", "Only bet when edge > 3% (filters noise, keeps high-conviction)"),
         ("Sizing", "Quarter-Kelly: f = 0.25 x edge / (1 - poly_price)"),
         ("Fees", "Polymarket charges $0.0075 per contract (0.75%)"),
@@ -399,13 +401,14 @@ def slide_strategy_overview(pdf):
 
 
 def slide_calibration(pdf):
-    """DK closing line calibration using bet_log_2025."""
+    """LGB model calibration using full 2025 test set."""
     df = pd.read_csv(BET_LOG_2025)
-    df = df.dropna(subset=["poly_home", "poly_away"])
+    df = df.dropna(subset=["lgb_home"])
     df["home_won"] = (df["result"] == "home_win").astype(int)
-    df["pred"] = df["dk_home"]
+    df["pred"] = df["lgb_home"]
 
-    df["bucket"] = pd.qcut(df["pred"], q=10, duplicates="drop")
+    # Use 5 bins for cleaner calibration with ~125 games
+    df["bucket"] = pd.qcut(df["pred"], q=5, duplicates="drop")
     cal = df.groupby("bucket", observed=True).agg(
         pred_mean=("pred", "mean"),
         actual_mean=("home_won", "mean"),
@@ -417,7 +420,7 @@ def slide_calibration(pdf):
     ax.set_facecolor(BG_COLOR)
 
     ax.plot([0, 1], [0, 1], "--", color=MUTED, linewidth=1.5, label="Perfect calibration")
-    ax.scatter(cal["pred_mean"], cal["actual_mean"], s=cal["count"] * 8,
+    ax.scatter(cal["pred_mean"], cal["actual_mean"], s=cal["count"] * 5,
                color=ACCENT, edgecolor=TEXT_COLOR, linewidth=1, zorder=5)
     ax.plot(cal["pred_mean"], cal["actual_mean"], color=ACCENT, linewidth=2, alpha=0.7)
 
@@ -426,12 +429,12 @@ def slide_calibration(pdf):
                     textcoords="offset points", xytext=(0, 12),
                     fontsize=10, color=MUTED, ha="center")
 
-    ax.set_xlabel("Predicted Win Probability (DK Closing Line)", fontsize=14, color=MUTED)
+    ax.set_xlabel("LGB Predicted Win Probability", fontsize=14, color=MUTED)
     ax.set_ylabel("Actual Win Rate", fontsize=14, color=MUTED)
-    ax.set_title("DK Closing Line Calibration -- Predicted vs Actual",
+    ax.set_title("LGB Model Calibration -- Predicted vs Actual (2025 Test Set)",
                  fontsize=24, fontweight="bold", color=TEXT_COLOR, pad=15, family="sans-serif")
-    ax.set_xlim(0.15, 0.85)
-    ax.set_ylim(0.15, 0.85)
+    ax.set_xlim(0.25, 0.75)
+    ax.set_ylim(0.25, 0.75)
     ax.tick_params(colors=MUTED, labelsize=11)
     ax.legend(fontsize=13, facecolor=CARD_COLOR, edgecolor=MUTED, labelcolor=TEXT_COLOR, loc="upper left")
     ax.spines["top"].set_visible(False)
@@ -460,7 +463,7 @@ def slide_edge_distribution(pdf, bets_2025, bets_2026):
     ax.hist(all_edges_w, bins=bins, color=GREEN, alpha=0.7, label="Wins", edgecolor="none")
     ax.hist(all_edges_l, bins=bins, color=RED, alpha=0.7, label="Losses", edgecolor="none")
 
-    ax.set_xlabel("Edge Size (DK prob - Poly price)", fontsize=14, color=MUTED)
+    ax.set_xlabel("Edge Size (Model prob - Poly price)", fontsize=14, color=MUTED)
     ax.set_ylabel("Count", fontsize=14, color=MUTED)
     ax.set_title("Distribution of Edges Taken",
                  fontsize=24, fontweight="bold", color=TEXT_COLOR, pad=15, family="sans-serif")
@@ -623,7 +626,7 @@ def slide_bet_table(pdf, bets_df, title_prefix, price_col="poly_price"):
     bets = bets_df.sort_values("date").reset_index(drop=True)
     bets["cum_pnl"] = bets["pnl"].cumsum()
 
-    headers = ["Date", "Matchup", "Side", "Poly", "DK Prob", "Edge", "Kelly", "W/L", "P&L", "Cum P&L"]
+    headers = ["Date", "Matchup", "Side", "Poly", "Model", "Edge", "Kelly", "W/L", "P&L", "Cum P&L"]
     max_rows = 16
     n_rows = len(bets)
     pages = [bets.iloc[i:i+max_rows] for i in range(0, n_rows, max_rows)]
@@ -656,7 +659,7 @@ def slide_bet_table(pdf, bets_df, title_prefix, price_col="poly_price"):
                 team_str,
                 r["side"].upper(),
                 f"{poly_val:.2f}",
-                f"{r['dk_prob']:.2f}",
+                f"{r['signal_prob']:.2f}",
                 f"{r['edge']:.1%}",
                 f"{r['kelly_quarter']:.1%}",
                 "W" if r["won"] else "L",
