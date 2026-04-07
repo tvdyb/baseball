@@ -24,7 +24,7 @@ NN_FEATURES = BASE / "data" / "features" / "nn_features_2025.parquet"
 
 # ── Constants ──────────────────────────────────────────────────────────────
 EDGE_THRESHOLD = 0.03
-POLY_FEE = 0.0075
+POLY_FEE = 0.0075 + 0.005  # taker fee + half-cent spread per contract
 FIG_SIZE = (16, 9)
 REG_SEASON_START = "2026-03-25"
 
@@ -387,7 +387,7 @@ def slide_strategy_overview(pdf):
         ("Edge", "LGB model probability - Polymarket contract price"),
         ("Threshold", "Only bet when edge > 3% (filters noise, keeps high-conviction)"),
         ("Sizing", "Quarter-Kelly: f = 0.25 x edge / (1 - poly_price)"),
-        ("Fees", "Polymarket charges $0.0075 per contract (0.75%)"),
+        ("Fees", "Polymarket fee $0.0075 + $0.005 spread per contract (1.25%)"),
     ]
 
     y = 0.80
