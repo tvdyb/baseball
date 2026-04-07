@@ -202,14 +202,18 @@ def slide_title(pdf, bets_2025, bets_2026):
     win_rate = total_wins / total_bets * 100 if total_bets else 0
     roi = total_pnl / total_wagered * 100 if total_wagered else 0
 
+    all_pnl = pd.concat([bets_2025["pnl"], bets_2026["pnl"]])
+    sharpe = all_pnl.mean() / all_pnl.std() * np.sqrt(len(all_pnl)) if all_pnl.std() > 0 else 0
+
     stats = [
         (f"{total_bets}", "Total Bets"),
         (f"{win_rate:.1f}%", "Win Rate"),
         (f"{roi:+.1f}%", "ROI"),
         (f"${total_pnl:+.2f}", "P&L (per $1)"),
+        (f"{sharpe:.2f}", "Sharpe Ratio"),
     ]
     for i, (val, label) in enumerate(stats):
-        x = 0.15 + i * 0.215
+        x = 0.10 + i * 0.175
         color = GREEN if "+" in val or float(val.replace("%","").replace("$","").replace(",","")) > 50 else TEXT_COLOR
         ax.text(x, 0.38, val, ha="center", va="center",
                 fontsize=32, fontweight="bold", color=color, family="sans-serif")
@@ -417,87 +421,61 @@ def slide_strategy_overview(pdf):
     plt.close(fig)
 
 
-def slide_calibration(pdf):
-    """LGB model calibration using full 2025 test set."""
-    df = pd.read_csv(BET_LOG_2025)
-    df = df.dropna(subset=["lgb_home"])
-    df["home_won"] = (df["result"] == "home_win").astype(int)
-    df["pred"] = df["lgb_home"]
-
-    # Use 5 bins for cleaner calibration with ~125 games
-    df["bucket"] = pd.qcut(df["pred"], q=5, duplicates="drop")
-    cal = df.groupby("bucket", observed=True).agg(
-        pred_mean=("pred", "mean"),
-        actual_mean=("home_won", "mean"),
-        count=("home_won", "count"),
+def slide_edge_winrate(pdf, bets_2025, bets_2026):
+    """Win rate and ROI by edge bucket — cleaner than overlapping histograms."""
+    all_bets = pd.concat([bets_2025, bets_2026], ignore_index=True)
+    all_bets["edge_bucket"] = pd.cut(all_bets["edge"], bins=[0, 0.05, 0.08, 0.10, 0.12, 0.15, 0.20, 1.0],
+                                      labels=["3-5%", "5-8%", "8-10%", "10-12%", "12-15%", "15-20%", "20%+"])
+    stats = all_bets.groupby("edge_bucket", observed=True).agg(
+        n=("won", "count"),
+        wins=("won", "sum"),
+        avg_pnl=("pnl", "mean"),
     ).reset_index()
+    stats["wr"] = stats["wins"] / stats["n"]
+    stats["roi"] = stats["avg_pnl"]  # per $1
 
     fig = plt.figure(figsize=FIG_SIZE, facecolor=BG_COLOR)
-    ax = fig.add_subplot(111)
-    ax.set_facecolor(BG_COLOR)
+    ax1 = fig.add_subplot(111)
+    ax1.set_facecolor(BG_COLOR)
 
-    ax.plot([0, 1], [0, 1], "--", color=MUTED, linewidth=1.5, label="Perfect calibration")
-    ax.scatter(cal["pred_mean"], cal["actual_mean"], s=cal["count"] * 5,
-               color=ACCENT, edgecolor=TEXT_COLOR, linewidth=1, zorder=5)
-    ax.plot(cal["pred_mean"], cal["actual_mean"], color=ACCENT, linewidth=2, alpha=0.7)
+    x = range(len(stats))
+    # Bar chart: win rate
+    bars = ax1.bar(x, stats["wr"] * 100, color=ACCENT, alpha=0.8, width=0.5, label="Win Rate %")
+    ax1.axhline(50, color=MUTED, linewidth=1, linestyle="--", alpha=0.5)
 
-    for _, r in cal.iterrows():
-        ax.annotate(f"n={int(r['count'])}", (r["pred_mean"], r["actual_mean"]),
-                    textcoords="offset points", xytext=(0, 12),
-                    fontsize=10, color=MUTED, ha="center")
+    # Label bars with n and WR
+    for i, (_, row) in enumerate(stats.iterrows()):
+        color = GREEN if row["wr"] > 0.5 else RED
+        ax1.text(i, row["wr"] * 100 + 1.5, f"{row['wr']:.0%}", ha="center",
+                fontsize=13, fontweight="bold", color=color)
+        ax1.text(i, row["wr"] * 100 - 3, f"n={int(row['n'])}", ha="center",
+                fontsize=10, color=MUTED)
 
-    ax.set_xlabel("LGB Predicted Win Probability", fontsize=14, color=MUTED)
-    ax.set_ylabel("Actual Win Rate", fontsize=14, color=MUTED)
-    ax.set_title("LGB Model Calibration -- Predicted vs Actual (2025 Test Set)",
+    # ROI on secondary axis
+    ax2 = ax1.twinx()
+    ax2.plot(x, stats["roi"] * 100, color=GOLD, linewidth=2.5, marker="o", markersize=8, label="Avg ROI %")
+    ax2.axhline(0, color=MUTED, linewidth=0.8, linestyle=":")
+    ax2.set_ylabel("Avg P&L per bet (cents)", fontsize=13, color=GOLD)
+    ax2.tick_params(axis="y", colors=GOLD, labelsize=11)
+    ax2.spines["right"].set_color(GOLD)
+
+    ax1.set_xticks(list(x))
+    ax1.set_xticklabels(stats["edge_bucket"], fontsize=13, color=MUTED)
+    ax1.set_xlabel("Edge Bucket (LGB prob - Poly price)", fontsize=14, color=MUTED)
+    ax1.set_ylabel("Win Rate %", fontsize=14, color=MUTED)
+    ax1.tick_params(axis="y", colors=MUTED, labelsize=11)
+    ax1.set_title("Performance by Edge Size",
                  fontsize=24, fontweight="bold", color=TEXT_COLOR, pad=15, family="sans-serif")
-    ax.set_xlim(0.25, 0.75)
-    ax.set_ylim(0.25, 0.75)
-    ax.tick_params(colors=MUTED, labelsize=11)
-    ax.legend(fontsize=13, facecolor=CARD_COLOR, edgecolor=MUTED, labelcolor=TEXT_COLOR, loc="upper left")
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    ax.spines["left"].set_color(MUTED)
-    ax.spines["bottom"].set_color(MUTED)
 
-    fig.tight_layout(rect=[0.03, 0.03, 0.97, 0.93])
-    pdf.savefig(fig)
-    plt.close(fig)
+    # Combined legend
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=12,
+               facecolor=CARD_COLOR, edgecolor=MUTED, labelcolor=TEXT_COLOR, loc="upper left")
 
-
-def slide_edge_distribution(pdf, bets_2025, bets_2026):
-    """Histogram of edge sizes, colored by W/L."""
-    all_edges_w = list(bets_2025[bets_2025["won"]]["edge"])
-    all_edges_l = list(bets_2025[~bets_2025["won"]]["edge"])
-    if len(bets_2026) > 0:
-        all_edges_w += list(bets_2026[bets_2026["won"]]["edge"])
-        all_edges_l += list(bets_2026[~bets_2026["won"]]["edge"])
-
-    fig = plt.figure(figsize=FIG_SIZE, facecolor=BG_COLOR)
-    ax = fig.add_subplot(111)
-    ax.set_facecolor(BG_COLOR)
-
-    bins = np.linspace(EDGE_THRESHOLD, max(all_edges_w + all_edges_l) + 0.01, 20)
-    ax.hist(all_edges_w, bins=bins, color=GREEN, alpha=0.7, label="Wins", edgecolor="none")
-    ax.hist(all_edges_l, bins=bins, color=RED, alpha=0.7, label="Losses", edgecolor="none")
-
-    ax.set_xlabel("Edge Size (Model prob - Poly price)", fontsize=14, color=MUTED)
-    ax.set_ylabel("Count", fontsize=14, color=MUTED)
-    ax.set_title("Distribution of Edges Taken",
-                 fontsize=24, fontweight="bold", color=TEXT_COLOR, pad=15, family="sans-serif")
-    ax.axvline(EDGE_THRESHOLD, color=GOLD, linewidth=2, linestyle="--", label=f"Threshold: {EDGE_THRESHOLD:.0%}")
-    ax.tick_params(colors=MUTED, labelsize=11)
-    ax.legend(fontsize=13, facecolor=CARD_COLOR, edgecolor=MUTED, labelcolor=TEXT_COLOR)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    ax.spines["left"].set_color(MUTED)
-    ax.spines["bottom"].set_color(MUTED)
-
-    total = len(all_edges_w) + len(all_edges_l)
-    avg_edge = np.mean(all_edges_w + all_edges_l)
-    ax.text(0.97, 0.95, f"Total bets: {total}\nAvg edge: {avg_edge:.1%}",
-            transform=ax.transAxes, ha="right", va="top", fontsize=13,
-            color=TEXT_COLOR, family="sans-serif",
-            bbox=dict(boxstyle="round,pad=0.5", facecolor=CARD_COLOR, edgecolor=MUTED))
+    for sp in ["top", "left", "bottom"]:
+        ax1.spines[sp].set_color(MUTED) if sp != "top" else ax1.spines[sp].set_visible(False)
+    ax2.spines["top"].set_visible(False)
 
     fig.tight_layout(rect=[0.03, 0.03, 0.97, 0.93])
     pdf.savefig(fig)
@@ -541,8 +519,9 @@ def slide_cumulative_pnl(pdf, bets, title_str, year_label):
     total_pnl = cum_pnl.iloc[-1]
     wagered = bets[price_col].sum()
     roi = total_pnl / wagered * 100 if wagered else 0
+    sharpe = bets["pnl"].mean() / bets["pnl"].std() * np.sqrt(n_bets) if bets["pnl"].std() > 0 else 0
 
-    ann = f"{n_bets} bets  |  {wins}W-{n_bets-wins}L  |  ROI: {roi:+.1f}%  |  P&L: ${total_pnl:+.2f}"
+    ann = f"{n_bets} bets  |  {wins}W-{n_bets-wins}L  |  ROI: {roi:+.1f}%  |  P&L: ${total_pnl:+.2f}  |  Sharpe: {sharpe:.2f}"
     ax.text(0.5, 1.06, title_str, transform=ax.transAxes, ha="center",
             fontsize=26, fontweight="bold", color=TEXT_COLOR, family="sans-serif")
     ax.text(0.5, 1.01, ann, transform=ax.transAxes, ha="center",
@@ -613,8 +592,10 @@ def slide_cumulative_pnl_kelly(pdf, bets, title_str):
 
     final_bankroll = bankrolls[-1]
     total_return = (final_bankroll / 1000 - 1) * 100
+    bet_returns = np.diff(bankrolls) / bankrolls[:-1]
+    kelly_sharpe = np.mean(bet_returns) / np.std(bet_returns) * np.sqrt(len(bet_returns)) if np.std(bet_returns) > 0 else 0
 
-    ann = f"Starting bankroll: $1,000  |  Final: ${final_bankroll:,.0f}  |  Return: {total_return:+.1f}%"
+    ann = f"$1,000 → ${final_bankroll:,.0f}  |  Return: {total_return:+.1f}%  |  Sharpe: {kelly_sharpe:.2f}"
     ax.text(0.5, 1.06, title_str, transform=ax.transAxes, ha="center",
             fontsize=26, fontweight="bold", color=TEXT_COLOR, family="sans-serif")
     ax.text(0.5, 1.01, ann, transform=ax.transAxes, ha="center",
@@ -708,6 +689,7 @@ def slide_results_summary(pdf, bets_2025, bets_2026):
     roi25 = pnl25 / wag25 * 100 if wag25 else 0
     avg_edge25 = bets_2025["edge"].mean() * 100
     avg_kelly25 = bets_2025["kelly_quarter"].mean() * 100
+    sharpe25 = bets_2025["pnl"].mean() / bets_2025["pnl"].std() * np.sqrt(n25) if bets_2025["pnl"].std() > 0 else 0
 
     # 2026 stats
     n26 = len(bets_2026)
@@ -717,6 +699,7 @@ def slide_results_summary(pdf, bets_2025, bets_2026):
     roi26 = pnl26 / wag26 * 100 if wag26 else 0
     avg_edge26 = bets_2026["edge"].mean() * 100 if n26 > 0 else 0
     avg_kelly26 = bets_2026["kelly_quarter"].mean() * 100 if n26 > 0 else 0
+    sharpe26 = bets_2026["pnl"].mean() / bets_2026["pnl"].std() * np.sqrt(n26) if n26 > 0 and bets_2026["pnl"].std() > 0 else 0
 
     # Combined
     total_bets = n25 + n26
@@ -724,15 +707,17 @@ def slide_results_summary(pdf, bets_2025, bets_2026):
     total_pnl = pnl25 + pnl26
     total_wag = wag25 + wag26
     total_roi = total_pnl / total_wag * 100 if total_wag else 0
+    all_pnl = pd.concat([bets_2025["pnl"], bets_2026["pnl"]])
+    total_sharpe = all_pnl.mean() / all_pnl.std() * np.sqrt(len(all_pnl)) if all_pnl.std() > 0 else 0
 
     # Layout: two boxes side by side + combined at bottom
     y_top = 0.78
     box_h = 0.28
     box_w = 0.40
 
-    for i, (label, color, n, w, pnl, roi, avg_e, avg_k) in enumerate([
-        ("2025 Backtest", ACCENT, n25, w25, pnl25, roi25, avg_edge25, avg_kelly25),
-        ("2026 Live", GOLD, n26, w26, pnl26, roi26, avg_edge26, avg_kelly26),
+    for i, (label, color, n, w, pnl, roi, avg_e, avg_k, sharpe) in enumerate([
+        ("2025 Backtest", ACCENT, n25, w25, pnl25, roi25, avg_edge25, avg_kelly25, sharpe25),
+        ("2026 Live", GOLD, n26, w26, pnl26, roi26, avg_edge26, avg_kelly26, sharpe26),
     ]):
         x = 0.06 + i * 0.48
         rect = FancyBboxPatch((x, y_top - box_h), box_w, box_h,
@@ -744,7 +729,7 @@ def slide_results_summary(pdf, bets_2025, bets_2026):
 
         lines = [
             f"Bets: {n}   |   Record: {w}-{n-w}   ({w/n*100:.0f}%)" if n > 0 else "No bets",
-            f"Flat P&L: ${pnl:+.2f}   |   ROI: {roi:+.1f}%",
+            f"Flat P&L: ${pnl:+.2f}   |   ROI: {roi:+.1f}%   |   Sharpe: {sharpe:.2f}",
             f"Avg Edge: {avg_e:.1f}%   |   Avg Kelly: {avg_k:.1f}%",
         ]
         for li, line in enumerate(lines):
@@ -764,7 +749,7 @@ def slide_results_summary(pdf, bets_2025, bets_2026):
             fontweight="bold", color=GREEN, family="sans-serif")
     ax.text(0.5, y_comb - 0.05,
             f"{total_bets} bets  |  {total_wins}W-{total_bets-total_wins}L  ({total_wins/total_bets*100:.0f}%)  |  "
-            f"P&L: ${total_pnl:+.2f}  |  ROI: {total_roi:+.1f}%",
+            f"P&L: ${total_pnl:+.2f}  |  ROI: {total_roi:+.1f}%  |  Sharpe: {total_sharpe:.2f}",
             ha="center", fontsize=16, color=TEXT_COLOR, family="sans-serif")
 
     pdf.savefig(fig)
@@ -800,15 +785,12 @@ def main():
         print("Slide 5: PA Matchup Model...")
         slide_pa_distribution(pdf)
 
-        # --- Section 2: Strategy & Calibration ---
+        # --- Section 2: Strategy & Edge Analysis ---
         print("Slide 6: Strategy Overview...")
         slide_strategy_overview(pdf)
 
-        print("Slide 7: DK Calibration...")
-        slide_calibration(pdf)
-
-        print("Slide 8: Edge Distribution...")
-        slide_edge_distribution(pdf, bets_2025, bets_2026)
+        print("Slide 7: Edge vs Win Rate...")
+        slide_edge_winrate(pdf, bets_2025, bets_2026)
 
         # --- Section 3: Results ---
         print("Slide 9: 2025 Bet Table...")
