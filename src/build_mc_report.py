@@ -67,7 +67,10 @@ def load_ingame_data():
 
 def simulate_kelly_rebalancing(df):
     """Simulate phase-dependent Kelly rebalancing from inning 7+."""
-    games = sorted(df["game_pk"].unique())
+    # Sort games chronologically (not by game_pk which is an arbitrary ID)
+    game_dates = df.groupby("game_pk")["game_date"].first().reset_index()
+    game_dates = game_dates.sort_values("game_date")
+    games = game_dates["game_pk"].tolist()
     game_results = []
     bankroll = BANKROLL
     bankroll_history = [bankroll]
