@@ -145,6 +145,64 @@ def american_to_prob(odds):
                     np.where(odds > 0, 100 / (odds + 100), np.nan))
 
 
+def extract_dk_lines_from_json(year: int) -> pd.DataFrame:
+    """Extract DraftKings devigged closing moneyline from mlb_odds_dataset.json."""
+    odds_path = DATA / "odds" / "mlb_odds_dataset.json"
+    if not odds_path.exists():
+        return pd.DataFrame()
+
+    import json
+    with open(odds_path) as f:
+        data = json.load(f)
+
+    # Team abbreviation normalization (SBR dataset uses shortName)
+    SBR_MAP = {
+        "TOR": "TOR", "NYY": "NYY", "NYM": "NYM", "BOS": "BOS",
+        "TB": "TB", "BAL": "BAL", "CLE": "CLE", "DET": "DET",
+        "MIN": "MIN", "CWS": "CWS", "KC": "KC", "HOU": "HOU",
+        "TEX": "TEX", "SEA": "SEA", "LAA": "LAA", "OAK": "OAK",
+        "ATL": "ATL", "PHI": "PHI", "MIA": "MIA", "WSH": "WSH",
+        "CHC": "CHC", "STL": "STL", "MIL": "MIL", "CIN": "CIN",
+        "PIT": "PIT", "LAD": "LAD", "SD": "SD", "SF": "SF",
+        "AZ": "AZ", "COL": "COL", "ARI": "AZ",
+    }
+
+    rows = []
+    for date_str, games in data.items():
+        if not date_str.startswith(str(year)):
+            continue
+        for game in games:
+            gv = game.get("gameView", {})
+            home_short = gv.get("homeTeam", {}).get("shortName", "")
+            away_short = gv.get("awayTeam", {}).get("shortName", "")
+            home_abbr = SBR_MAP.get(home_short, home_short)
+            away_abbr = SBR_MAP.get(away_short, away_short)
+
+            for book in game.get("odds", {}).get("moneyline", []):
+                if "draft" not in book.get("sportsbook", "").lower():
+                    continue
+                cl = book.get("currentLine", {})
+                home_odds = cl.get("homeOdds")
+                away_odds = cl.get("awayOdds")
+                if home_odds is None or away_odds is None:
+                    break
+
+                h_imp = abs(home_odds) / (abs(home_odds) + 100) if home_odds < 0 else 100 / (home_odds + 100)
+                a_imp = abs(away_odds) / (abs(away_odds) + 100) if away_odds < 0 else 100 / (away_odds + 100)
+                total = h_imp + a_imp
+                if total > 0:
+                    rows.append({
+                        "game_date": date_str,
+                        "home_team": home_abbr,
+                        "away_team": away_abbr,
+                        "dk_home_prob": h_imp / total,
+                        "dk_away_prob": a_imp / total,
+                    })
+                break
+
+    return pd.DataFrame(rows)
+
+
 def load_all_data():
     """Load and merge Kalshi, DK, features, and sim data."""
     # Kalshi ML
@@ -231,9 +289,11 @@ def get_feature_cols(df):
     exclude = {
         "game_pk", "game_date", "home_team", "away_team", "home_win", "home_win_feat",
         "home_score", "away_score", "is_home",
-        # Kalshi/DK prices — these are available at bet time but are SEPARATE signals
-        "kalshi_home_prob", "kalshi_away_prob", "dk_home_prob", "dk_away_prob",
+        # Kalshi prices — what we bet against, must NOT be a feature
+        "kalshi_home_prob", "kalshi_away_prob",
+        # DK raw/intermediate cols (dk_home_prob IS a feature now)
         "dk_edge_home", "dk_edge_away", "dk_home_raw", "dk_away_raw", "dk_total",
+        "dk_away_prob",  # redundant with dk_home_prob
         "home_ml_close", "away_ml_close", "volume", "event_ticker", "price_source",
         "sim_home_wp", "nn_home_prob",  # NN prediction is a separate signal, not LGB feature
     }
@@ -949,6 +1009,14 @@ def main():
         feat_2024 = pd.read_parquet(feat_2024_path)
         feat_2024["game_date"] = pd.to_datetime(feat_2024["game_date"]).dt.strftime("%Y-%m-%d")
 
+        # Merge DK closing lines into 2024 training data
+        dk_2024 = extract_dk_lines_from_json(2024)
+        if not dk_2024.empty:
+            mk = ["game_date", "home_team", "away_team"]
+            feat_2024 = feat_2024.merge(dk_2024[mk + ["dk_home_prob"]], on=mk, how="left")
+            dk_count = feat_2024["dk_home_prob"].notna().sum()
+            print(f"  2024 training: {dk_count}/{len(feat_2024)} games with DK lines")
+
         # Merge aggregated NN lineup features into 2024 training data
         nn_feat_2024_path = DATA / "features" / "nn_features_2024.parquet"
         if nn_feat_2024_path.exists():
@@ -979,6 +1047,17 @@ def main():
                 nn_agg_cols = [c for c in nn_agg_2025.columns if c.startswith("nn_") or c in mk]
                 nn_agg_2025 = nn_agg_2025[nn_agg_cols].copy()
                 feat_2025_all = feat_2025_all.merge(nn_agg_2025, on=mk, how="left")
+
+            # Merge DK closing lines into 2025 training data
+            dk_2025 = pd.read_parquet(DATA / "odds" / "sbr_mlb_2025.parquet") if (DATA / "odds" / "sbr_mlb_2025.parquet").exists() else pd.DataFrame()
+            if not dk_2025.empty:
+                dk_2025["game_date"] = pd.to_datetime(dk_2025["game_date"]).dt.strftime("%Y-%m-%d")
+                dk_2025["dk_home_raw"] = american_to_prob(dk_2025["home_ml_close"])
+                dk_2025["dk_away_raw"] = american_to_prob(dk_2025["away_ml_close"])
+                dk_2025["dk_total"] = dk_2025["dk_home_raw"] + dk_2025["dk_away_raw"]
+                dk_2025["dk_home_prob"] = dk_2025["dk_home_raw"] / dk_2025["dk_total"]
+                mk = ["game_date", "home_team", "away_team"]
+                feat_2025_all = feat_2025_all.merge(dk_2025[mk + ["dk_home_prob"]].dropna(), on=mk, how="left")
 
             feat_2025_early = feat_2025_all[feat_2025_all["game_date"] < "2025-04-16"].copy()
             train_feat = pd.concat([feat_2024, feat_2025_early], ignore_index=True)
