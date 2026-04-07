@@ -610,17 +610,17 @@ def slide_cumulative_pnl_kelly(pdf, bets, title_str):
     plt.close(fig)
 
 
-def slide_2026_table(pdf, bets_2026):
-    """Table of every 2026 bet with cumulative PnL and Kelly sizing."""
-    if len(bets_2026) == 0:
-        fig, ax = setup_fig("2026 Live Results -- Every Bet")
-        ax.text(0.5, 0.5, "No matched bets for 2026 regular season yet.",
+def slide_bet_table(pdf, bets_df, title_prefix, price_col="poly_price"):
+    """Generic table of every bet with cumulative PnL and Kelly sizing."""
+    if len(bets_df) == 0:
+        fig, ax = setup_fig(f"{title_prefix} -- Every Bet")
+        ax.text(0.5, 0.5, "No matched bets.",
                 ha="center", fontsize=20, color=MUTED)
         pdf.savefig(fig)
         plt.close(fig)
         return
 
-    bets = bets_2026.sort_values("date").reset_index(drop=True)
+    bets = bets_df.sort_values("date").reset_index(drop=True)
     bets["cum_pnl"] = bets["pnl"].cumsum()
 
     headers = ["Date", "Matchup", "Side", "Poly", "DK Prob", "Edge", "Kelly", "W/L", "P&L", "Cum P&L"]
@@ -630,7 +630,7 @@ def slide_2026_table(pdf, bets_2026):
 
     for page_idx, page_bets in enumerate(pages):
         suffix = "" if page_idx == 0 else " (cont.)"
-        fig, ax = setup_fig(f"2026 Live Results -- Every Bet{suffix}")
+        fig, ax = setup_fig(f"{title_prefix} -- Every Bet{suffix}")
 
         n = len(page_bets)
         row_h = 0.68 / (n + 1)
@@ -650,11 +650,12 @@ def slide_2026_table(pdf, bets_2026):
             ax.add_patch(rect)
 
             team_str = f"{r['away']}@{r['home']}"
+            poly_val = r.get("poly_price", r.get("price", 0))
             vals = [
                 r["date"].strftime("%m/%d"),
                 team_str,
                 r["side"].upper(),
-                f"{r['poly_price']:.2f}",
+                f"{poly_val:.2f}",
                 f"{r['dk_prob']:.2f}",
                 f"{r['edge']:.1%}",
                 f"{r['kelly_quarter']:.1%}",
@@ -790,13 +791,16 @@ def main():
         slide_edge_distribution(pdf, bets_2025, bets_2026)
 
         # --- Section 3: Results ---
-        print("Slide 9: 2025 Backtest P&L...")
+        print("Slide 9: 2025 Bet Table...")
+        slide_bet_table(pdf, bets_2025, "2025 Backtest", price_col="price")
+
+        print("Slide 10: 2025 Backtest P&L...")
         slide_cumulative_pnl(pdf, bets_2025, "2025 Backtest -- Cumulative P&L (Flat $1 Bets)", "2025")
 
-        print("Slide 10: 2026 Bet Table...")
-        slide_2026_table(pdf, bets_2026)
+        print("Slide 11: 2026 Bet Table...")
+        slide_bet_table(pdf, bets_2026, "2026 Live Results", price_col="poly_price")
 
-        print("Slide 11: 2026 Cumulative P&L (Flat)...")
+        print("Slide 12: 2026 Cumulative P&L (Flat)...")
         if len(bets_2026) > 0:
             slide_cumulative_pnl(pdf, bets_2026, "2026 Live -- Cumulative P&L (Flat $1 Bets)", "2026")
 
