@@ -145,6 +145,15 @@ def main():
     model.fit(X_train, y_train)
     print(f"  Best CV log-loss: {study.best_value:.5f}")
 
+    # Save feature importances
+    imp_df = pd.DataFrame({
+        "feature": feat_cols,
+        "importance": model.feature_importances_,
+    }).sort_values("importance", ascending=False)
+    imp_path = DATA / "features" / "lgb_feature_importances.parquet"
+    imp_df.to_parquet(imp_path, index=False)
+    print(f"  Saved feature importances to {imp_path}")
+
     # ── Predict 2026 ──
     X_2026 = feat_2026[feat_cols].copy()
     feat_2026["lgb_home_prob"] = model.predict_proba(X_2026)[:, 1]

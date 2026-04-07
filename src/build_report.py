@@ -677,6 +677,35 @@ def slide_bet_table(pdf, bets_df, title_prefix, price_col="poly_price"):
         plt.close(fig)
 
 
+def slide_feature_importance(pdf):
+    """Horizontal bar chart of top LGB feature importances."""
+    imp_path = BASE / "data" / "features" / "lgb_feature_importances.parquet"
+    imp = pd.read_parquet(imp_path).sort_values("importance", ascending=False)
+
+    top_n = 25
+    top = imp.head(top_n).sort_values("importance", ascending=True)
+
+    fig = plt.figure(figsize=FIG_SIZE, facecolor=BG_COLOR)
+    ax = fig.add_axes([0.30, 0.10, 0.62, 0.78])
+    ax.set_facecolor(BG_COLOR)
+
+    bars = ax.barh(range(len(top)), top["importance"].values, color=ACCENT, edgecolor="none")
+    ax.set_yticks(range(len(top)))
+    ax.set_yticklabels(top["feature"].values, fontsize=11, color=TEXT_COLOR, family="sans-serif")
+    ax.tick_params(axis="x", colors=MUTED, labelsize=10)
+    ax.set_xlabel("Split Count (Importance)", color=MUTED, fontsize=12, family="sans-serif")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_color(MUTED)
+    ax.spines["bottom"].set_color(MUTED)
+
+    fig.text(0.50, 0.94, "LightGBM Feature Importance (Top 25)",
+             ha="center", fontsize=28, fontweight="bold", color=TEXT_COLOR, family="sans-serif")
+
+    pdf.savefig(fig)
+    plt.close(fig)
+
+
 def slide_results_summary(pdf, bets_2025, bets_2026):
     """Combined results summary with key metrics."""
     fig, ax = setup_fig("Results Summary")
@@ -788,6 +817,9 @@ def main():
         # --- Section 2: Strategy ---
         print("Slide 6: Strategy Overview...")
         slide_strategy_overview(pdf)
+
+        print("Slide 7: Feature Importance...")
+        slide_feature_importance(pdf)
 
         # --- Section 3: Results ---
         print("Slide 9: 2025 Bet Table...")
